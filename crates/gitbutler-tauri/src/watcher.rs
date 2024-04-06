@@ -44,6 +44,7 @@ impl Watchers {
                 watchers.lock().await.insert(project_id, watcher.clone());
                 match watcher.run(&project_path, &project_id).await {
                     Ok(()) => {
+                        // Why is the watcher not removed when it stops?
                         tracing::debug!(%project_id, "watcher stopped");
                     }
                     Err(RunError::PathNotFound(path)) => {

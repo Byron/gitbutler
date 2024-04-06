@@ -43,6 +43,8 @@ impl App {
     }
 
     pub fn init_project(&self, project: &projects::Project) -> Result<()> {
+        // It also looks like it never unwatches a project, probably meaning that
+        // it really does watch all projects.
         self.watchers.watch(project).context(format!(
             "failed to start watcher for project {}",
             &project.id
@@ -54,6 +56,7 @@ impl App {
     pub fn init(&self) -> Result<()> {
         for project in self
             .projects
+            // Does this mean that it watches every known project, even though it only displays one project at a time?
             .list()
             .with_context(|| "failed to list projects")?
         {
