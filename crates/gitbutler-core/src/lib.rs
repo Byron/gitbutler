@@ -28,6 +28,7 @@ pub mod path;
 pub mod project_repository;
 pub mod projects;
 pub mod remotes;
+pub mod secret;
 pub mod serde;
 pub mod ssh;
 pub mod storage;
