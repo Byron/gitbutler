@@ -10,7 +10,7 @@ import { UpdaterService } from '$lib/backend/updater';
 import { LineManagerFactory } from '$lib/commitLines/lineManager';
 import { GitHubService } from '$lib/github/service';
 import { RemotesService } from '$lib/remotes/service';
-import { RustSecretService } from '$lib/secrets/secretsService';
+import { RustSecretService, setSecretsService } from '$lib/secrets/secretsService';
 import { UserService } from '$lib/stores/user';
 import { mockTauri } from '$lib/testing/index';
 import lscache from 'lscache';
@@ -75,6 +75,7 @@ export async function load() {
 		aiService,
 		remotesService,
 		aiPromptService,
-		lineManagerFactory
+		lineManagerFactory,
+		secretsService
 	};
 }

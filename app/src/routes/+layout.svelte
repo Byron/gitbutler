@@ -28,6 +28,7 @@
 	import type { LayoutData } from './$types';
 	import { dev } from '$app/environment';
 	import { goto } from '$app/navigation';
+	import { setSecretsService } from '$lib/secrets/secretsService';
 
 	export let data: LayoutData;
 
@@ -36,6 +37,7 @@
 	setContext(SETTINGS, userSettings);
 
 	// Setters do not need to be reactive since `data` never updates
+	setSecretsService(data.secretsService);
 	setContext(UserService, data.userService);
 	setContext(ProjectService, data.projectService);
 	setContext(UpdaterService, data.updaterService);
