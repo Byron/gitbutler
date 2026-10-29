@@ -4695,19 +4695,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "git2-hooks"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e21a2c5eee3085f2b622805d4f4c878d9519bf70fa76bed0923b82a25f24199"
-dependencies = [
- "git2",
- "gix-path 0.11.3",
- "log",
- "shellexpand",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "gitbutler-branch"
 version = "0.0.0"
 dependencies = [
@@ -4949,12 +4936,9 @@ dependencies = [
  "but-core",
  "but-ctx",
  "but-gerrit",
- "but-oxidize",
  "but-settings",
  "but-testsupport",
  "fuzzy-matcher",
- "git2",
- "git2-hooks",
  "gitbutler-project",
  "gitbutler-reference",
  "gix",
@@ -5114,7 +5098,7 @@ dependencies = [
  "gix-odb",
  "gix-pack",
  "gix-parallel",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-pathspec",
  "gix-prompt",
  "gix-protocol",
@@ -5128,12 +5112,12 @@ dependencies = [
  "gix-status",
  "gix-submodule",
  "gix-tempfile",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-transport",
  "gix-traverse",
  "gix-url",
  "gix-utils",
- "gix-validate 0.13.1",
+ "gix-validate",
  "gix-worktree",
  "gix-worktree-state",
  "gix-worktree-stream",
@@ -5165,9 +5149,9 @@ dependencies = [
  "gix-error",
  "gix-glob",
  "gix-parallel",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-quote",
- "gix-trace 0.3.1",
+ "gix-trace",
  "serde",
  "smallvec",
  "unicode-bom",
@@ -5193,7 +5177,7 @@ dependencies = [
  "gix-hash",
  "gix-object",
  "gix-revwalk",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-traverse",
  "gix-worktree",
  "smallvec",
@@ -5214,9 +5198,9 @@ source = "git+https://github.com/GitoxideLabs/gitoxide?branch=grix#fd75e045fa523
 dependencies = [
  "bstr",
  "gix-error",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-quote",
- "gix-trace 0.3.1",
+ "gix-trace",
 ]
 
 [[package]]
@@ -5243,10 +5227,10 @@ dependencies = [
  "gix-error",
  "gix-glob",
  "gix-parallel",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-ref",
  "gix-sec",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-utils",
  "smallvec",
  "unicode-bom",
@@ -5260,7 +5244,7 @@ dependencies = [
  "bitflags 2.13.0",
  "bstr",
  "gix-error",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-utils",
  "libc",
 ]
@@ -5275,11 +5259,11 @@ dependencies = [
  "gix-config-value",
  "gix-date",
  "gix-error",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-prompt",
  "gix-quote",
  "gix-sec",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-url",
  "percent-encoding",
  "serde",
@@ -5312,10 +5296,10 @@ dependencies = [
  "gix-imara-diff 0.3.3",
  "gix-index",
  "gix-object",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-pathspec",
  "gix-tempfile",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-traverse",
  "gix-worktree",
 ]
@@ -5332,9 +5316,9 @@ dependencies = [
  "gix-ignore",
  "gix-index",
  "gix-object",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-pathspec",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-utils",
  "gix-worktree",
 ]
@@ -5348,7 +5332,7 @@ dependencies = [
  "dunce",
  "gix-error",
  "gix-fs",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-ref",
  "gix-sec",
 ]
@@ -5375,9 +5359,9 @@ dependencies = [
  "gix-hash",
  "gix-object",
  "gix-packetline",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-quote",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-utils",
  "smallvec",
 ]
@@ -5390,7 +5374,7 @@ dependencies = [
  "bstr",
  "gix-error",
  "gix-parallel",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-utils",
  "libc",
  "walkdir",
@@ -5404,8 +5388,8 @@ dependencies = [
  "bitflags 2.13.0",
  "bstr",
  "gix-fs",
- "gix-path 0.14.1",
- "gix-trace 0.3.1",
+ "gix-path",
+ "gix-trace",
  "gix-utils",
  "serde",
 ]
@@ -5440,8 +5424,8 @@ source = "git+https://github.com/GitoxideLabs/gitoxide?branch=grix#fd75e045fa523
 dependencies = [
  "bstr",
  "gix-glob",
- "gix-path 0.14.1",
- "gix-trace 0.3.1",
+ "gix-path",
+ "gix-trace",
  "serde",
  "unicode-bom",
 ]
@@ -5481,10 +5465,10 @@ dependencies = [
  "gix-lock",
  "gix-object",
  "gix-parallel",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-traverse",
  "gix-utils",
- "gix-validate 0.13.1",
+ "gix-validate",
  "hashbrown 0.17.1",
  "itoa",
  "libc",
@@ -5542,12 +5526,12 @@ dependencies = [
  "gix-imara-diff 0.3.3",
  "gix-index",
  "gix-object",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-quote",
  "gix-revision",
  "gix-revwalk",
  "gix-tempfile",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-worktree",
  "nonempty",
 ]
@@ -5588,10 +5572,10 @@ dependencies = [
  "gix-error",
  "gix-hash",
  "gix-hashtable",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-tempfile",
  "gix-utils",
- "gix-validate 0.13.1",
+ "gix-validate",
  "itoa",
  "serde",
  "smallvec",
@@ -5611,9 +5595,9 @@ dependencies = [
  "gix-object",
  "gix-pack",
  "gix-parallel",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-quote",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-utils",
  "gix-zlib",
  "memmap2",
@@ -5636,9 +5620,9 @@ dependencies = [
  "gix-hashtable",
  "gix-object",
  "gix-parallel",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-tempfile",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-utils",
  "gix-zlib",
  "memmap2",
@@ -5656,7 +5640,7 @@ dependencies = [
  "bstr",
  "faster-hex",
  "gix-error",
- "gix-trace 0.3.1",
+ "gix-trace",
 ]
 
 [[package]]
@@ -5665,21 +5649,9 @@ version = "0.50.1"
 source = "git+https://github.com/GitoxideLabs/gitoxide?branch=grix#fd75e045fa5232cca1ba49c1c002348aafff7197"
 dependencies = [
  "crossbeam-channel",
- "gix-trace 0.3.1",
+ "gix-trace",
  "once_cell",
  "parking_lot",
-]
-
-[[package]]
-name = "gix-path"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8fd1fe596dc393b538e1d5492c5585971a9311475b3255f7b889023df208476"
-dependencies = [
- "bstr",
- "gix-trace 0.1.20",
- "gix-validate 0.11.2",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5689,8 +5661,8 @@ source = "git+https://github.com/GitoxideLabs/gitoxide?branch=grix#fd75e045fa523
 dependencies = [
  "bstr",
  "gix-error",
- "gix-trace 0.3.1",
- "gix-validate 0.13.1",
+ "gix-trace",
+ "gix-validate",
 ]
 
 [[package]]
@@ -5704,7 +5676,7 @@ dependencies = [
  "gix-config-value",
  "gix-error",
  "gix-glob",
- "gix-path 0.14.1",
+ "gix-path",
 ]
 
 [[package]]
@@ -5737,7 +5709,7 @@ dependencies = [
  "gix-refspec",
  "gix-revwalk",
  "gix-shallow",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-transport",
  "gix-utils",
  "nonempty",
@@ -5766,10 +5738,10 @@ dependencies = [
  "gix-lock",
  "gix-object",
  "gix-parallel",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-tempfile",
  "gix-utils",
- "gix-validate 0.13.1",
+ "gix-validate",
  "memmap2",
  "serde",
 ]
@@ -5782,7 +5754,7 @@ dependencies = [
  "bstr",
  "gix-error",
  "gix-hash",
- "gix-validate 0.13.1",
+ "gix-validate",
  "smallvec",
 ]
 
@@ -5800,7 +5772,7 @@ dependencies = [
  "gix-hashtable",
  "gix-object",
  "gix-revwalk",
- "gix-trace 0.3.1",
+ "gix-trace",
  "nonempty",
  "serde",
 ]
@@ -5825,7 +5797,7 @@ version = "0.16.1"
 source = "git+https://github.com/GitoxideLabs/gitoxide?branch=grix#fd75e045fa5232cca1ba49c1c002348aafff7197"
 dependencies = [
  "bitflags 2.13.0",
- "gix-path 0.14.1",
+ "gix-path",
  "libc",
  "serde",
  "windows-sys 0.61.2",
@@ -5860,9 +5832,9 @@ dependencies = [
  "gix-index",
  "gix-object",
  "gix-parallel",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-pathspec",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-utils",
  "gix-worktree",
  "hashbrown 0.16.1",
@@ -5877,7 +5849,7 @@ dependencies = [
  "bstr",
  "gix-config",
  "gix-error",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-pathspec",
  "gix-refspec",
  "gix-url",
@@ -5916,7 +5888,7 @@ dependencies = [
  "gix-object",
  "gix-odb",
  "gix-parallel",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-ref",
  "gix-shallow",
  "gix-tempfile",
@@ -5928,12 +5900,6 @@ dependencies = [
  "tar",
  "tempfile",
 ]
-
-[[package]]
-name = "gix-trace"
-version = "0.1.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44dc45eae785c0eb14173e0f152e6e224dcf4d45b6a6999a3aed22af541ad678"
 
 [[package]]
 name = "gix-trace"
@@ -5954,10 +5920,10 @@ dependencies = [
  "gix-credentials",
  "gix-error",
  "gix-packetline",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-quote",
  "gix-sec",
- "gix-trace 0.3.1",
+ "gix-trace",
  "gix-url",
  "gix-utils",
  "parking_lot",
@@ -5988,7 +5954,7 @@ source = "git+https://github.com/GitoxideLabs/gitoxide?branch=grix#fd75e045fa523
 dependencies = [
  "bstr",
  "gix-error",
- "gix-path 0.14.1",
+ "gix-path",
  "gix-utils",
  "percent-encoding",
  "serde",
@@ -6006,15 +5972,6 @@ dependencies = [
  "gix-error",
  "prodash",
  "unicode-normalization",
-]
-
-[[package]]
-name = "gix-validate"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bc6fc771c4063ba7cd2f47b91fb6076251c6a823b64b7fe7b8874b0fe4afae3"
-dependencies = [
- "bstr",
 ]
 
 [[package]]
@@ -6041,10 +5998,10 @@ dependencies = [
  "gix-ignore",
  "gix-index",
  "gix-object",
- "gix-path 0.14.1",
- "gix-trace 0.3.1",
+ "gix-path",
+ "gix-trace",
  "gix-utils",
- "gix-validate 0.13.1",
+ "gix-validate",
  "serde",
 ]
 
@@ -6060,8 +6017,8 @@ dependencies = [
  "gix-index",
  "gix-object",
  "gix-parallel",
- "gix-path 0.14.1",
- "gix-trace 0.3.1",
+ "gix-path",
+ "gix-trace",
  "gix-utils",
  "gix-worktree",
  "io-close",
@@ -6079,8 +6036,8 @@ dependencies = [
  "gix-hash",
  "gix-object",
  "gix-parallel",
- "gix-path 0.14.1",
- "gix-trace 0.3.1",
+ "gix-path",
+ "gix-trace",
  "gix-traverse",
  "gix-utils",
  "parking_lot",
@@ -11525,15 +11482,6 @@ name = "shell-words"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
-
-[[package]]
-name = "shellexpand"
-version = "3.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
-dependencies = [
- "dirs",
-]
 
 [[package]]
 name = "shlex"
