@@ -346,7 +346,9 @@ jobs:
           # should be called "cargo-nextest-<VERSION>-x86_64-unknown-linux-gnu.sha256"
           curl -LsSf https://get.nexte.st/0.9.143/linux -o cargo-nextest.tar.gz
           echo "66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e  cargo-nextest.tar.gz" | sha256sum -c -
-          tar -xzf cargo-nextest.tar.gz -C ${CARGO_HOME:-~/.cargo}/bin
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin"
+          tar -xzf cargo-nextest.tar.gz -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           rm cargo-nextest.tar.gz
       - name: Install cargo-nextest (macOS)
         if: runner.os == 'macOS'
@@ -355,7 +357,9 @@ jobs:
           # cargo-nextest-<VERSION>-universal-apple-darwin.sha256 artifact.
           curl -LsSf https://get.nexte.st/0.9.143/mac -o cargo-nextest.tar.gz
           echo "4830d430411148d17602a75cc880bfb4dc8dac153dea59a48a2ef4cc93577f07  cargo-nextest.tar.gz" | shasum -a 256 -c -
-          tar -xzf cargo-nextest.tar.gz -C ${CARGO_HOME:-~/.cargo}/bin
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin"
+          tar -xzf cargo-nextest.tar.gz -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
           rm cargo-nextest.tar.gz
       - name: Run workspace tests
         run: cargo nextest run $PACKAGES --profile ci -E "$NEXTEST_FILTER"
