@@ -13,6 +13,8 @@ cargo run -p but-gpui
 
 Each worktree builds into a `target` folder of its own, so a new one needs the helper too. `make run-but-gpui-without-xcode` builds it with the client.
 
+On macOS and Linux, configured `credential.helper=cache` helpers run natively through the client, without requiring Git.
+
 On Linux, GPUI also links to libxcb, libxkbcommon and fontconfig: on Debian or Ubuntu, `sudo apt install libxcb1-dev libxkbcommon-x11-dev libfontconfig-dev`.
 
 The project list comes from the app data of the build's channel, which is `dev` by default. Build with `CHANNEL=nightly` (or `release`) to see the projects of an installed GitButler.

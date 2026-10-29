@@ -14,7 +14,7 @@ use crate::RefSpec;
 /// askpass invocations by ssh/git when connecting to our process.
 const ASKPASS_SECRET_LENGTH: usize = 24;
 
-/// Higher level errors that can occur when interacting with the CLI.
+/// Errors from native Git operations and their authentication helpers.
 ///
 /// You probably don't want to use this type. Use [`Error`] instead.
 #[derive(Debug, thiserror::Error)]
@@ -23,21 +23,32 @@ pub enum RepositoryError<
     Easkpass: std::error::Error + core::fmt::Debug + Send + Sync + 'static,
     Esocket: std::error::Error + core::fmt::Debug + Send + Sync + 'static,
 > {
-    #[error("failed to execute git command: {0}")]
+    #[error("askpass system operation failed: {0}")]
     Exec(Eexec),
+    #[error(transparent)]
+    Native(#[from] gix::Error),
+    #[error("could not start native Git worker: {0}")]
+    WorkerStart(std::io::Error),
+    #[error("native Git worker stopped unexpectedly")]
+    WorkerStopped,
+    #[error("push to {destination} was rejected ({reason:?})\n{output}")]
+    PushRejected {
+        destination: String,
+        reason: gix::push::Rejection,
+        output: String,
+    },
+    #[error(
+        "push succeeded, but local tracking references could not be updated: {source}\n{output}"
+    )]
+    PushTracking {
+        #[source]
+        source: gix::Error,
+        output: String,
+    },
     #[error("failed to accept connection to askpass server: {0}")]
     AskpassServer(Easkpass),
     #[error("i/o error communicating with askpass utility: {0}")]
     AskpassIo(Esocket),
-    #[error(
-        "git command exited with non-zero exit code {status}:\n\nARGS:\n{args:?}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
-    )]
-    Failed {
-        status: usize,
-        args: Vec<String>,
-        stdout: String,
-        stderr: String,
-    },
     #[error("failed to determine path to this executable: {0}")]
     NoSelfExe(std::io::Error),
     #[error("askpass secret mismatch")]
@@ -77,45 +88,37 @@ pub enum RepositoryError<
     },
 }
 
-/// Higher level errors that can occur when interacting with the CLI.
+/// Errors from native Git operations and their authentication helpers.
 pub type Error<E> = RepositoryError<
     <E as GitExecutor>::Error,
     <<E as GitExecutor>::ServerHandle as AskpassServer>::Error,
     <<<E as GitExecutor>::ServerHandle as AskpassServer>::SocketHandle as Socket>::Error,
 >;
 
-enum HarnessEnv<P: AsRef<Path>> {
-    /// The contained P is the repository's worktree directory or its `.git` directory.
-    Repo(P),
-    /// The contained P is the path that the command should be executed in
-    Global(P),
+enum HarnessEnv<'a> {
+    /// Read configuration from this worktree directory or `.git` directory.
+    Repo(&'a Path),
+    /// Read global configuration before a clone has a repository.
+    Global,
 }
 
-#[cold]
-async fn execute_with_auth_harness<P, F, Fut, E>(
-    harness_env: HarnessEnv<P>,
+async fn with_authentication<F, Fut, E, Run, RunFuture, T>(
     executor: &E,
-    args: &[&str],
+    envs: HashMap<String, String>,
     on_prompt: Option<F>,
-) -> Result<(usize, String, String), Error<E>>
+    run: Run,
+) -> Result<T, Error<E>>
 where
-    P: AsRef<Path>,
     E: GitExecutor,
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
+    Run: FnOnce(HashMap<String, String>) -> RunFuture,
+    RunFuture: std::future::Future<Output = Result<T, Error<E>>>,
 {
-    let envs = new_env_with_git_ssh_configured(&harness_env);
-    let stall_limits = http_stall_limit_args(&harness_env);
-    let args: Vec<&str> = stall_limits
-        .iter()
-        .map(String::as_str)
-        .chain(args.iter().copied())
-        .collect();
-
     if let Some(on_prompt) = on_prompt {
-        execute_with_indirect_askpass(harness_env, executor, &args, envs, on_prompt).await
+        execute_with_indirect_askpass(executor, envs, on_prompt, run).await
     } else {
-        execute_direct(harness_env, executor, &args, envs).await
+        run(envs).await
     }
 }
 
@@ -125,16 +128,13 @@ where
 const HTTP_STALL_LIMITS: [(&str, &str); 2] =
     [("http.lowSpeedLimit", "1"), ("http.lowSpeedTime", "60")];
 
-/// Returns `-c` arguments for each of [`HTTP_STALL_LIMITS`] the user hasn't configured.
-fn http_stall_limit_args<P>(harness_env: &HarnessEnv<P>) -> Vec<String>
-where
-    P: AsRef<Path>,
-{
+/// Returns config overrides for each of [`HTTP_STALL_LIMITS`] the user has not configured.
+fn http_stall_limit_overrides(harness_env: &HarnessEnv<'_>) -> Vec<String> {
     let config = match harness_env {
-        HarnessEnv::Repo(repo_path) => gix::open(repo_path.as_ref())
+        HarnessEnv::Repo(repo_path) => gix::open(repo_path)
             .ok()
             .map(|repo| repo.config_snapshot().plumbing().clone()),
-        HarnessEnv::Global(_) => gix::config::File::from_globals().ok().map(|mut config| {
+        HarnessEnv::Global => gix::config::File::from_globals().ok().map(|mut config| {
             // Git applies `GIT_CONFIG_*` overrides on top; a repository's config has them already.
             if let Ok(overrides) = gix::config::File::from_environment_overrides() {
                 config.append(overrides).ok();
@@ -149,24 +149,23 @@ where
                 .as_ref()
                 .is_none_or(|config| config.raw_value(*key).is_err())
         })
-        .flat_map(|(key, value)| ["-c".to_owned(), format!("{key}={value}")])
+        .map(|(key, value)| format!("{key}={value}"))
         .collect()
 }
 
-/// Askpass-aware execution of Git commands, allowing the GUI to communicate with the askpass
-/// process over a pipe or socket.
-async fn execute_with_indirect_askpass<P, F, Fut, E>(
-    harness_env: HarnessEnv<P>,
+/// Run an operation while the GUI answers its helper prompts over a pipe or socket.
+async fn execute_with_indirect_askpass<F, Fut, E, Run, RunFuture, T>(
     executor: &E,
-    args: &[&str],
     mut envs: HashMap<String, String>,
     mut on_prompt: F,
-) -> Result<(usize, String, String), Error<E>>
+    run: Run,
+) -> Result<T, Error<E>>
 where
-    P: AsRef<Path>,
     E: GitExecutor,
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
+    Run: FnOnce(HashMap<String, String>) -> RunFuture,
+    RunFuture: std::future::Future<Output = Result<T, Error<E>>>,
 {
     let mut current_exe = std::env::current_exe().map_err(Error::<E>::NoSelfExe)?;
     // On Windows, we get these \\? prefix that have issues. Let's do nothing there for now,
@@ -256,17 +255,7 @@ where
     envs.insert("SSH_ASKPASS".into(), askpath_path.display().to_string());
     envs.insert("SSH_ASKPASS_REQUIRE".into(), "force".into());
 
-    let cwd = match harness_env {
-        HarnessEnv::Repo(p) | HarnessEnv::Global(p) => p,
-    };
-    let mut child_process = core::pin::pin! {
-        async {
-            executor
-                .execute(args, cwd, Some(envs))
-                .await
-                .map_err(Error::<E>::Exec)
-        }.fuse()
-    };
+    let mut child_process = core::pin::pin!(run(envs).fuse());
 
     loop {
         select! {
@@ -336,31 +325,6 @@ where
     }
 }
 
-/// Directly execute the Git command without invoking the askpass pipe machinery. This is useful
-/// for the CLI, as the child process simply inherits stdin from the parent process and therefore
-/// doesn't need the askpass mechanism.
-///
-/// It's doubly useful in the sense that the CLI then does not need the askpass binary.
-async fn execute_direct<P, E>(
-    harness_env: HarnessEnv<P>,
-    executor: &E,
-    args: &[&str],
-    envs: HashMap<String, String>,
-) -> Result<(usize, String, String), Error<E>>
-where
-    P: AsRef<Path>,
-    E: GitExecutor,
-{
-    let cwd = match harness_env {
-        HarnessEnv::Repo(p) | HarnessEnv::Global(p) => p,
-    };
-
-    executor
-        .execute(args, cwd, Some(envs))
-        .await
-        .map_err(Error::<E>::Exec)
-}
-
 /// Create an environment variable mapping that is guaranteed to have the Git SSH command configured
 /// in either GIT_SSH_COMMAND or GIT_SSH.
 ///
@@ -374,17 +338,10 @@ where
 /// Note that we never add any options to existing configuration. If the user has made explicit
 /// choices about how SSH should behave, we respect those choices and leave it to the user to deal
 /// with the consequences.
-fn new_env_with_git_ssh_configured<P>(harness_env: &HarnessEnv<P>) -> HashMap<String, String>
-where
-    P: AsRef<Path>,
-{
+fn new_env_with_git_ssh_configured(harness_env: &HarnessEnv<'_>) -> HashMap<String, String> {
     let mut envs = HashMap::new();
 
-    // Minor correctness issue: Neither GIT_SSH_COMMAND nor GIT_SSH are required to be unicode.
-    // It's entirely possible to have non-unicode byte sequences in paths, for example. This should
-    // be rewritten to use `std::env::var_os()` and the executor should be tweaked to let `envs`
-    // contain raw binary strings. This is however exceedingly unlikely to be a problem in practice
-    // so we'll keep it like this for now.
+    // These values can contain non-Unicode paths; preserving them requires an OsString environment map.
     if let Ok(Some(git_ssh_command)) = get_git_ssh_command(harness_env) {
         envs.insert("GIT_SSH_COMMAND".into(), git_ssh_command);
         return envs;
@@ -420,19 +377,14 @@ where
 
 /// Gets GIT_SSH_COMMAND from env first, config second.
 ///
-/// Correctness issue: If the command is not valid UTF8, this function returns Ok(None). When the
-/// executor is updated to be able to handle binary strings for envs, this should be rewritten
-/// accordingly.
-fn get_git_ssh_command<P>(harness_env: &HarnessEnv<P>) -> anyhow::Result<Option<String>>
-where
-    P: AsRef<Path>,
-{
+/// A non-UTF-8 command returns `Ok(None)` until the authentication environment supports `OsString`.
+fn get_git_ssh_command(harness_env: &HarnessEnv<'_>) -> anyhow::Result<Option<String>> {
     match harness_env {
-        HarnessEnv::Repo(repo_path) => Ok(gix::open(repo_path.as_ref())?
+        HarnessEnv::Repo(repo_path) => Ok(gix::open(repo_path)?
             .config_snapshot()
             .trusted_program(gix::config::tree::Core::SSH_COMMAND)?
             .and_then(|program| program.to_str().map(String::from))),
-        HarnessEnv::Global(_) => Ok(gix::config::File::from_globals()?
+        HarnessEnv::Global => Ok(gix::config::File::from_globals()?
             .string(gix::config::tree::Core::SSH_COMMAND)
             .and_then(|program| program.to_str().ok().map(String::from))),
     }
@@ -473,52 +425,98 @@ where
             source.into()
         }
     })?;
-    let mut args = vec!["fetch", "--quiet"];
+    let harness_env = HarnessEnv::Repo(repo_path);
+    let mut envs = new_env_with_git_ssh_configured(&harness_env);
+    envs.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+    envs.insert("LC_ALL".into(), "C".into());
+    let mut overrides = http_stall_limit_overrides(&harness_env);
+    overrides.push("protocol.version=2".into());
+    let repo_path = repo_path.to_owned();
+    let remote_name = remote.to_owned();
+    with_authentication(&executor, envs, on_prompt, |envs| async move {
+        run_native::<E, _>(move |interrupt| {
+            use gix::remote::fetch::{Status, refs::update::Mode};
 
-    args.push(remote);
-    args.extend(refspecs.iter().map(String::as_str));
-
-    let (status, stdout, stderr) =
-        execute_with_auth_harness(HarnessEnv::Repo(repo_path), &executor, &args, on_prompt).await?;
-
-    if status == 0 {
-        Ok(())
-    } else {
-        // Was the ref not found?
-        if let Some(refname) = stderr
-            .lines()
-            .find(|line| line.to_lowercase().contains("couldn't find remote ref"))
-            .map(|line| line.split_whitespace().last().unwrap_or_default())
-        {
-            Err(crate::Error::RefNotFound(refname.to_owned()))?
-        } else if stderr.to_lowercase().contains("permission denied") {
-            Err(crate::Error::AuthorizationFailed(Error::<E>::Failed {
-                status,
-                args: args.into_iter().map(Into::into).collect(),
-                stdout,
-                stderr,
-            }))?
-        } else {
-            Err(Error::<E>::Failed {
-                status,
-                args: args.into_iter().map(Into::into).collect(),
-                stdout,
-                stderr,
-            })?
-        }
-    }
+            let options = gix::open::Options::default().config_overrides(overrides);
+            #[cfg(unix)]
+            let options =
+                options.credential_cache_daemon(but_utils::credential_cache::daemon_command());
+            let mut repo = options.open(&repo_path)?.to_thread_local();
+            repo.committer_or_set_generic_fallback()?;
+            let environment = envs
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()));
+            let mut remote = repo
+                .find_remote(remote_name.as_str())?
+                .with_working_dir(repo_path)?
+                .with_command_environment(environment);
+            remote.replace_refspecs(&refspecs, gix::remote::Direction::Fetch)?;
+            let mut options = remote.fetch_options()?;
+            options.write_fetch_head = true;
+            // Git ignores configured pruneTags when explicit refspecs are supplied.
+            options.prune_tags = false;
+            let outcome = remote.fetch(options, gix::progress::Discard, interrupt)?;
+            let update_refs = match outcome.status {
+                Status::Change { update_refs, .. } | Status::NoPackReceived { update_refs, .. } => {
+                    update_refs
+                }
+            };
+            for (update, mapping) in update_refs.updates.iter().zip(&outcome.ref_map.mappings) {
+                match &update.mode {
+                    Mode::NoChangeNeeded
+                    | Mode::FastForward
+                    | Mode::Forced
+                    | Mode::New
+                    | Mode::ImplicitTagNotSentByRemote => {}
+                    Mode::RejectedSourceObjectNotFound { .. }
+                    | Mode::RejectedTagUpdate
+                    | Mode::RejectedNonFastForward
+                    | Mode::RejectedToReplaceWithUnborn
+                    | Mode::RejectedCurrentlyCheckedOut { .. } => {
+                        gix::error::bail!("Fetch of {:?} failed: {}", mapping.local, update.mode);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+    })
+    .await
+    .map_err(native_error::<E>)
 }
 
-fn fetch_refspecs(repo: &gix::Repository, remote: &str) -> gix::Result<Vec<String>> {
+fn native_error<E: GitExecutor>(error: Error<E>) -> crate::Error<Error<E>> {
+    if let RepositoryError::Native(source) = &error {
+        if source.is_unauthenticated() || source.is_permission_denied() {
+            return crate::Error::AuthorizationFailed(error);
+        }
+        if source.is_not_found()
+            && let Some(name) = source.metadata().find_map(|metadata| {
+                match metadata.get("ref").or_else(|| metadata.get("source")) {
+                    Some(gix::error::MetadataValue::Bytes(name)) => {
+                        Some(String::from_utf8_lossy(name).into_owned())
+                    }
+                    Some(gix::error::MetadataValue::String(name)) => Some(name.clone()),
+                    _ => None,
+                }
+            })
+        {
+            return crate::Error::RefNotFound(name);
+        }
+    }
+    crate::Error::Backend(error)
+}
+
+fn fetch_refspecs(repo: &gix::Repository, remote: &str) -> gix::Result<Vec<gix::bstr::BString>> {
     let refspecs: Vec<_> = repo
         .find_remote(remote)?
         .refspecs(gix::remote::Direction::Fetch)
         .iter()
-        .map(|spec| spec.to_ref().to_bstring().to_string())
+        .map(|spec| spec.to_ref().to_bstring())
         .collect();
 
     Ok(if refspecs.is_empty() {
-        vec![format!("+refs/heads/*:refs/remotes/{remote}/*")]
+        vec![format!("+refs/heads/*:refs/remotes/{remote}/*").into()]
     } else {
         refspecs
     })
@@ -547,79 +545,147 @@ where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
 {
-    let mut args = vec!["push", "--quiet", "--no-verify"];
-
-    let is_deletion = refspec.source.is_none();
-    let refspec = refspec.to_string();
-
-    args.push(remote);
-    args.push(&refspec);
-
-    if force {
-        if force_push_protection {
-            args.push("--force-with-lease");
-            // `--force-if-includes` verifies the remote tip was integrated into the local branch
-            // being pushed; a deletion has no local side, so the check can never pass there and
-            // the lease alone provides the compare-and-swap against our remote-tracking ref.
-            if !is_deletion {
-                args.push("--force-if-includes");
+    let repo_path = repo_path.as_ref().to_owned();
+    let harness_env = HarnessEnv::Repo(&repo_path);
+    let mut envs = new_env_with_git_ssh_configured(&harness_env);
+    envs.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+    envs.insert("LC_ALL".into(), "C".into());
+    let mut overrides = http_stall_limit_overrides(&harness_env);
+    overrides.push("protocol.version=2".into());
+    let remote_name = remote.to_owned();
+    let results = with_authentication(&executor, envs, on_prompt, |envs| async move {
+        run_native::<E, _>(move |interrupt| {
+            let options = gix::open::Options::default().config_overrides(overrides);
+            #[cfg(unix)]
+            let options =
+                options.credential_cache_daemon(but_utils::credential_cache::daemon_command());
+            let repo = options.open(&repo_path)?.to_thread_local();
+            let spec = refspec.to_string();
+            let parsed =
+                gix::refspec::parse(spec.as_str().into(), gix::refspec::parse::Operation::Push)?;
+            let mut update = gix::push::Update::from_refspec(&repo, parsed)?;
+            if force && force_push_protection {
+                update.lease = gix::push::Lease::Tracking {
+                    force_if_includes: update.new_id.is_some(),
+                };
+            } else {
+                update.force |= force;
             }
-        } else {
-            args.push("--force");
+            let remote = repo
+                .find_remote(remote_name.as_str())?
+                .with_working_dir(&repo_path)?
+                .with_command_environment(
+                    envs.into_iter()
+                        .map(|(key, value)| (key.into(), value.into())),
+                );
+            let push_options: Vec<_> = push_opts.into_iter().map(Into::into).collect();
+            let mut results = Vec::new();
+            for url in remote.urls(gix::remote::Direction::Push) {
+                let selected = remote
+                    .clone()
+                    .with_push_url_without_url_rewrite(url.clone())?;
+                let mut output = Vec::new();
+                let outcome = selected.push(
+                    [update.clone()],
+                    gix::push::Options {
+                        quiet: true,
+                        push_options: &push_options,
+                        ..Default::default()
+                    },
+                    gix::progress::Discard,
+                    |_, bytes| {
+                        output.extend_from_slice(bytes);
+                        Ok(())
+                    },
+                    interrupt,
+                );
+                let tracking_error = outcome
+                    .as_ref()
+                    .ok()
+                    .and_then(|outcome| selected.update_tracking_refs(outcome).err());
+                results.push((
+                    outcome,
+                    String::from_utf8_lossy(&output).into_owned(),
+                    tracking_error,
+                ));
+            }
+            gix::error::ensure!(
+                !results.is_empty(),
+                gix::error::message("The remote has no push URL")
+            );
+            Ok(results)
+        })
+        .await
+    })
+    .await
+    .map_err(native_error::<E>)?;
+    let mut output = String::new();
+    let mut first_error = None;
+    let mut first_tracking_error = None;
+    for (outcome, remote_output, tracking_error) in results {
+        output.push_str(&remote_output);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(source) => {
+                first_error.get_or_insert_with(|| native_error::<E>(Error::<E>::Native(source)));
+                continue;
+            }
+        };
+        if let Some((destination, reason)) =
+            outcome
+                .updates
+                .into_iter()
+                .find_map(|update| match update.status {
+                    gix::push::Status::Rejected(reason) => {
+                        Some((update.update.destination, reason))
+                    }
+                    _ => None,
+                })
+        {
+            use gix::push::Rejection;
+            let backend = Error::<E>::PushRejected {
+                destination: destination.to_string(),
+                reason: reason.clone(),
+                output: remote_output,
+            };
+            let error = match reason {
+                Rejection::StaleLease | Rejection::RemoteUpdated => {
+                    crate::Error::ForcePushProtection(backend)
+                }
+                Rejection::NonFastForward
+                | Rejection::FetchFirst
+                | Rejection::NeedsForce
+                | Rejection::AlreadyExists => crate::Error::NonFastForward(backend),
+                Rejection::Server(reason)
+                    if reason.to_ascii_lowercase().contains_str("no new changes") =>
+                {
+                    crate::Error::GerritNoNewChanges(backend)
+                }
+                Rejection::Server(reason)
+                    if reason
+                        .to_ascii_lowercase()
+                        .contains_str("permission denied") =>
+                {
+                    crate::Error::AuthorizationFailed(backend)
+                }
+                Rejection::NonCommitBranch | Rejection::Atomic | Rejection::Server(_) => {
+                    crate::Error::Backend(backend)
+                }
+            };
+            first_error.get_or_insert(error);
+        } else if let Some(source) = tracking_error {
+            first_tracking_error.get_or_insert_with(|| {
+                crate::Error::Backend(Error::<E>::PushTracking {
+                    source,
+                    output: remote_output,
+                })
+            });
         }
     }
-
-    for opt in push_opts.iter() {
-        args.push("-o");
-        args.push(opt.as_str());
+    match first_error.or(first_tracking_error) {
+        Some(error) => Err(error),
+        None => Ok(output),
     }
-
-    let (status, stdout, stderr) =
-        execute_with_auth_harness(HarnessEnv::Repo(repo_path), &executor, &args, on_prompt).await?;
-
-    if status == 0 {
-        return Ok(stderr);
-    }
-
-    let base_error = Error::<E>::Failed {
-        status,
-        args: args.into_iter().map(Into::into).collect(),
-        stdout,
-        stderr: stderr.clone(),
-    };
-
-    if status == 1 && force && force_push_protection {
-        return Err(crate::Error::ForcePushProtection(base_error));
-    }
-
-    // Check for specific error patterns in stderr
-    if let Some(refname) = stderr
-        .lines()
-        .find(|line| line.to_lowercase().contains("does not match any"))
-        .and_then(|line| line.split_whitespace().last())
-    {
-        return Err(crate::Error::RefNotFound(refname.to_owned()));
-    }
-
-    if stderr.to_lowercase().contains("permission denied") {
-        return Err(crate::Error::AuthorizationFailed(base_error));
-    }
-
-    if stderr.to_lowercase().contains("(no new changes)") {
-        return Err(crate::Error::GerritNoNewChanges(base_error));
-    }
-
-    // Detected last so the more specific typed cases above always win. A non-fast-forward
-    // rejection is recoverable: the caller can re-fetch and retry.
-    let lowercased_stderr = stderr.to_lowercase();
-    if lowercased_stderr.contains("! [rejected]")
-        || lowercased_stderr.contains("(non-fast-forward)")
-        || lowercased_stderr.contains("(fetch first)")
-    {
-        return Err(crate::Error::NonFastForward(base_error));
-    }
-
-    Err(base_error.into())
 }
 
 /// Clones the given repository URL to the target directory.
@@ -628,9 +694,6 @@ where
 /// ferry prompts and responses between the SSH process and this process. This should be used
 /// carefully as it will unceremoniously override any askpass configuration the user might have,
 /// making it unsuitable for use in e.g. the CLI. It is designed to be used with a GUI/TUI.
-///
-/// Unlike fetch/push, this function always uses the Git CLI regardless of any
-/// backend selection, as it needs to work before a repository exists.
 pub async fn clone<P, F, Fut, E>(
     repository_url: &str,
     target_dir: P,
@@ -643,48 +706,101 @@ where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
 {
-    let target_dir = target_dir.as_ref();
+    let target_dir = target_dir.as_ref().to_owned();
+    let destination = target_dir.display().to_string();
+    let repository_url = repository_url.to_owned();
+    let work_dir = target_dir.parent().unwrap_or(Path::new(".")).to_owned();
+    let harness_env = HarnessEnv::Global;
+    let mut envs = new_env_with_git_ssh_configured(&harness_env);
+    envs.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+    let overrides = http_stall_limit_overrides(&harness_env);
+    with_authentication(&executor, envs, on_prompt, |envs| async move {
+        run_native::<E, _>(move |interrupt| {
+            use gix::error::ResultExt;
+            let work_dir = std::path::absolute(work_dir).or_error()?;
+            let mut repository_url = gix::Url::try_from(repository_url.as_str())?;
+            repository_url.canonicalize(&work_dir)?;
+            let options = gix::open::Options::default().config_overrides(overrides);
+            #[cfg(unix)]
+            let options = options.credential_cache_daemon(but_utils::credential_cache::daemon_command());
+            let environment: Vec<_> = envs.into_iter().map(|(key, value)| (key.into(), value.into())).collect();
+            let mut clone = gix::clone::PrepareFetch::new(
+                repository_url,
+                &target_dir,
+                gix::create::Kind::WithWorktree,
+                Default::default(),
+                options,
+            )?.configure_remote({
+                let environment = environment.clone();
+                move |remote| Ok(remote.with_working_dir(&work_dir)?.with_command_environment(environment.clone()))
+            });
+            let (checkout, _) = clone.fetch_then_checkout(gix::progress::Discard, interrupt)?;
+            let (repo, outcome) = checkout.with_command_environment(environment.clone())
+                .main_worktree(gix::progress::Discard, interrupt)?;
+            gix::error::ensure!(
+                !interrupt.load(std::sync::atomic::Ordering::Relaxed),
+                gix::error::cancelled("Clone checkout was interrupted")
+            );
+            gix::error::ensure!(
+                outcome.errors.is_empty() && outcome.collisions.is_empty(),
+                gix::error::message!("Clone checkout failed: {:?}, collisions: {:?}", outcome.errors, outcome.collisions)
+            );
+            if let Some(head_id) = repo.head()?.try_peel_to_id()? {
+                use std::ffi::OsStr;
+                let old_head = repo.object_hash().null().to_string();
+                let new_head = head_id.to_string();
+                let environment: Vec<_> = environment.iter()
+                    .map(|(key, value)| (key.as_os_str(), value.as_os_str())).collect();
+                for output in repo.run_hook_event_serially("post-checkout", gix::hook::Options {
+                    arguments: &[OsStr::new(&old_head), OsStr::new(&new_head), OsStr::new("1")],
+                    environment: &environment,
+                    ..Default::default()
+                })? {
+                    gix::error::ensure!(output.status.success(),
+                        gix::error::message!("Post-checkout hook failed: {}{}", output.stdout.as_bstr(), output.stderr.as_bstr()));
+                }
+            }
+            Ok(())
+        }).await
+    }).await.map_err(|error| {
+        if matches!(&error, RepositoryError::Native(source) if source.is_unauthenticated() || source.is_permission_denied()) {
+            crate::Error::AuthorizationFailed(error)
+        } else if matches!(&error, RepositoryError::Native(source) if source.is_validation()
+            && source.metadata().any(|metadata| metadata.get("input")
+                == Some(&gix::error::MetadataValue::from(destination.as_bytes())))) {
+            crate::Error::RemoteExists(destination, error)
+        } else {
+            crate::Error::Backend(error)
+        }
+    })
+}
 
-    // For clone, we run from the parent directory of the target
-    let work_dir = target_dir.parent().unwrap_or(Path::new("."));
-
-    let target_dir_str = target_dir.to_string_lossy();
-    let args = vec!["clone", "--", repository_url, &target_dir_str];
-
-    let (status, stdout, stderr) =
-        execute_with_auth_harness(HarnessEnv::Global(work_dir), &executor, &args, on_prompt)
-            .await?;
-
-    if status == 0 {
-        Ok(())
-    } else if stderr.to_lowercase().contains("permission denied") {
-        Err(crate::Error::AuthorizationFailed(Error::<E>::Failed {
-            status,
-            args: args.into_iter().map(Into::into).collect(),
-            stdout,
-            stderr,
-        }))?
-    } else if stderr
-        .to_lowercase()
-        .contains("already exists and is not an empty directory")
-    {
-        Err(crate::Error::RemoteExists(
-            target_dir.display().to_string(),
-            Error::<E>::Failed {
-                status,
-                args: args.into_iter().map(Into::into).collect(),
-                stdout,
-                stderr,
-            },
-        ))?
-    } else {
-        Err(Error::<E>::Failed {
-            status,
-            args: args.into_iter().map(Into::into).collect(),
-            stdout,
-            stderr,
-        })?
+async fn run_native<E: GitExecutor, T: Send + 'static>(
+    run: impl FnOnce(&std::sync::atomic::AtomicBool) -> gix::Result<T> + Send + 'static,
+) -> Result<T, Error<E>> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct Cancel(Arc<AtomicBool>);
+    impl Drop for Cancel {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
     }
+    let cancel = Cancel(Arc::new(AtomicBool::new(false)));
+    let interrupt = Arc::clone(&cancel.0);
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    std::thread::Builder::new()
+        .name("gitbutler.git".into())
+        .spawn(move || {
+            let _ = sender.send(run(&interrupt));
+        })
+        .map_err(Error::<E>::WorkerStart)?;
+    receiver
+        .await
+        .map_err(|_| Error::<E>::WorkerStopped)?
+        .map_err(Error::<E>::Native)
 }
 
 #[cfg(test)]

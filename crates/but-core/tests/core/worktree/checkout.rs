@@ -287,6 +287,164 @@ UD x
 }
 
 #[test]
+fn allowed_text_conflicts_keep_markers_stages_and_unrelated_staged_content() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("worktree-modification-the-target-deletes");
+    let target = build_commit(
+        &repo,
+        |tree| {
+            tree.upsert("x", EntryKind::Blob, repo.write_blob(b"three\n")?)?;
+            Ok(())
+        },
+        "conflicting target",
+    )?
+    .id;
+    let staged_blob_id = repo.write_blob(b"staged\n")?.detach();
+    git_at_dir(repo.workdir().expect("non-bare"))
+        .args([
+            "update-index",
+            "--cacheinfo",
+            &format!("100644,{staged_blob_id},keep"),
+        ])
+        .run();
+
+    let out = safe_checkout_from_head(
+        target,
+        &repo,
+        checkout::Options {
+            allow_uncommitted_changes_to_conflict_with_new_head: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(
+        out.conflict_occurred,
+        "the overlapping worktree change remains unresolved"
+    );
+    snapbox::assert_data_eq!(
+        std::fs::read_to_string(repo.workdir().expect("non-bare").join("x"))?,
+        snapbox::str![[r#"
+<<<<<<< ours
+two
+=======
+three
+>>>>>>> theirs
+
+"#]]
+    );
+    let index = repo.index()?;
+    for (stage, contents) in [
+        (gix::index::entry::Stage::Base, "one\n"),
+        (gix::index::entry::Stage::Ours, "two\n"),
+        (gix::index::entry::Stage::Theirs, "three\n"),
+    ] {
+        let entry = index
+            .entry_by_path_and_stage("x".into(), stage)
+            .expect("conflict stage exists");
+        assert_eq!(
+            entry.id,
+            repo.write_blob(contents)?.detach(),
+            "the original content survives at {stage:?}"
+        );
+    }
+    assert!(
+        index
+            .entry_by_path_and_stage("x".into(), gix::index::entry::Stage::Unconflicted)
+            .is_none(),
+        "conflict markers are not staged as ordinary content"
+    );
+    assert_eq!(
+        index
+            .entry_by_path("keep".into())
+            .expect("unrelated path remains staged")
+            .id,
+        staged_blob_id,
+        "unrelated staged content survives conflict materialization"
+    );
+    Ok(())
+}
+
+#[test]
+fn allowed_text_conflicts_honor_diff3_configuration() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("worktree-modification-the-target-deletes");
+    git_at_dir(repo.workdir().expect("non-bare"))
+        .args(["config", "merge.conflictstyle", "diff3"])
+        .run();
+    let repo = open_repo(repo.git_dir())?;
+    let target = build_commit(
+        &repo,
+        |tree| {
+            tree.upsert("x", EntryKind::Blob, repo.write_blob(b"three\n")?)?;
+            Ok(())
+        },
+        "conflicting target",
+    )?
+    .id;
+    safe_checkout_from_head(
+        target,
+        &repo,
+        checkout::Options {
+            allow_uncommitted_changes_to_conflict_with_new_head: true,
+            ..Default::default()
+        },
+    )?;
+    snapbox::assert_data_eq!(
+        std::fs::read_to_string(repo.workdir().expect("non-bare").join("x"))?,
+        snapbox::str![[r#"
+<<<<<<< ours
+two
+||||||| ancestor
+one
+=======
+three
+>>>>>>> theirs
+
+"#]]
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_checkout_does_not_persist_prepared_index_deletions() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("worktree-deletion-the-target-also-makes");
+    let target = build_commit(
+        &repo,
+        |tree| {
+            tree.remove("x")?;
+            tree.upsert("blocked", EntryKind::Blob, repo.write_blob(b"target\n")?)?;
+            Ok(())
+        },
+        "remove missing file and add blocked path",
+    )?
+    .id;
+    let workdir = repo.workdir().expect("non-bare");
+    std::fs::write(workdir.join(".gitignore"), b"blocked\n")?;
+    git_at_dir(workdir).args(["init", "blocked"]).run();
+    std::fs::write(workdir.join("blocked/keep"), b"preserve\n")?;
+    let index_before = std::fs::read(repo.index_path())?;
+    let head_before = repo.head_id()?.detach();
+
+    safe_checkout_from_head(target, &repo, Default::default())
+        .expect_err("an ignored repository prevents materializing the target");
+
+    assert_eq!(
+        std::fs::read(repo.index_path())?,
+        index_before,
+        "index deletions prepared before preflight remain unpersisted on failure"
+    );
+    assert_eq!(
+        repo.head_id()?.detach(),
+        head_before,
+        "a failed checkout does not advance HEAD"
+    );
+    assert_eq!(
+        std::fs::read(workdir.join("blocked/keep"))?,
+        b"preserve\n",
+        "the obstructing file remains intact"
+    );
+    Ok(())
+}
+
+#[test]
 fn deleting_below_a_directory_the_worktree_turned_into_a_file_leaves_no_index_entry()
 -> anyhow::Result<()> {
     let (repo, _tmp) = writable_scenario("worktree-dir-turned-file-the-target-deletes");
@@ -619,10 +777,7 @@ D  to-be-deleted-in-index
         |tree| {
             let empty_blob = repo.empty_blob();
             tree.upsert("to-be-deleted/a", EntryKind::Blob, empty_blob.id)?;
-            // TODO(gix): needs `gix` impl of checkout as `git2` fails, trying to access a null object
-            //            The issue is that it should checkout a file inside of a directory, which was previously
-            //            a file that is deleted from the index and the worktree.
-            // tree.upsert("to-be-deleted-in-index/a", EntryKind::Blob, empty_blob.id)?;
+            tree.upsert("to-be-deleted-in-index/a", EntryKind::Blob, empty_blob.id)?;
             Ok(())
         },
         "turn changed file into a directory",
@@ -633,7 +788,7 @@ D  to-be-deleted-in-index
         out.to_debug(),
         snapbox::str![[r#"
 Outcome {
-    head_update: "Update refs/heads/main to Some(Object(Sha1(24f802a1250d2f84e1f49094e3b8bb1e5c0d29ad)))",
+    head_update: "Update refs/heads/main to Some(Object(Sha1(592f565e72fcaf73d619310f8b04e884825103cc)))",
 }
 
 "#]]
@@ -643,7 +798,7 @@ Outcome {
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
         snapbox::str![[r#"
-* 24f802a (HEAD -> main) turn changed file into a directory
+* 592f565 (HEAD -> main) turn changed file into a directory
 * 226d5ea init
 
 "#]]
@@ -652,17 +807,16 @@ Outcome {
         visualize_index(&*repo.index()?),
         snapbox::str![[r#"
 100644:3e75765 added-to-index
+100644:e69de29 to-be-deleted-in-index/a
 100644:e69de29 to-be-deleted/a
 
 "#]]
     );
-    // `to-be-deleted-in-index` was staged for deletion (`git rm`) and is no longer
-    // restored by the checkout — the checkout only touches `to-be-deleted` → `to-be-deleted/a`.
+    // Both deleted paths become directories while unrelated staging and untracked files remain.
     snapbox::assert_data_eq!(
         git_status(&repo)?,
         snapbox::str![[r#"
 A  added-to-index
-D  to-be-deleted-in-index
 ?? untracked
 
 "#]]
@@ -1012,13 +1166,6 @@ Outcome {
 
 #[test]
 fn checkout_handles_directory_and_file_replacements() -> anyhow::Result<()> {
-    if but_testsupport::gix_testtools::is_ci::cached() {
-        // TODO(gix): remove this once `gitoxide` unconditional reset/checkout is available.
-        // Fails on checkout on CI Linux as it can't deal with `file`.
-        // Probably the `git2` OS error code handling isn't working cross-platform?
-        eprintln!("SKIPPING TEST KNOWN TO FAIL ON CI ONLY");
-        return Ok(());
-    }
     let (repo, _tmp) = writable_scenario("merge-with-two-branches-line-offset");
     snapbox::assert_data_eq!(
         visualize_commit_graph_all(&repo)?,
@@ -1420,6 +1567,352 @@ fn cancelling_consumed_changes_keeps_a_concurrent_edit() -> anyhow::Result<()> {
         std::fs::read_to_string(&file_path)?,
         "line1\nunchanged\nadded-b\nline2\nline3\nappended\n",
         "the snapshot is taken live, so the concurrent edit survives the cancellation"
+    );
+    Ok(())
+}
+
+#[test]
+fn consuming_changes_keeps_independent_staging_even_if_already_staged() -> anyhow::Result<()> {
+    for stage_consumed in [false, true] {
+        let (repo, _tmp) = writable_scenario("adjacent-line-additions");
+        let path = repo.workdir_path("separated").unwrap();
+        let staged = if stage_consumed {
+            "line1\nadded-a\nunchanged\nline2\nline3\nstaged\n"
+        } else {
+            "line1\nunchanged\nline2\nline3\nstaged\n"
+        };
+        std::fs::write(&path, staged)?;
+        but_testsupport::git(&repo)
+            .args(["add", "separated", "file2"])
+            .run();
+        let unrelated = repo.index()?.entry_by_path("file2".into()).unwrap().id;
+        let worktree = "line1\nadded-a\nunchanged\nadded-b\nline2\nline3\nstaged\n";
+        std::fs::write(&path, worktree)?;
+        let consumed = build_commit(
+            &repo,
+            |tree| {
+                tree.upsert(
+                    "separated",
+                    EntryKind::Blob,
+                    repo.write_blob(b"line1\nadded-a\nunchanged\nline2\nline3\n")?,
+                )?;
+                Ok(())
+            },
+            "consume added-a",
+        )?;
+
+        safe_checkout_from_head(
+            consumed.id,
+            &repo,
+            checkout::Options {
+                merge_base_override: Some(consumed.tree_id()?.detach()),
+                ..Default::default()
+            },
+        )?;
+
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            worktree,
+            "no worktree change is needed"
+        );
+        let index = repo.index()?;
+        assert_eq!(
+            index.entry_by_path("file2".into()).unwrap().id,
+            unrelated,
+            "consuming a staged change must not discard staging in another file"
+        );
+        assert_eq!(
+            repo.find_blob(index.entry_by_path("separated".into()).unwrap().id)?
+                .data,
+            b"line1\nadded-a\nunchanged\nline2\nline3\nstaged\n",
+            "consumption is reflected in the index while independent staged hunks stay staged"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_failed_checkout_does_not_persist_merge_base_override_index_changes() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("adjacent-line-additions");
+    let consumed = build_commit(
+        &repo,
+        |tree| {
+            tree.upsert(
+                "separated",
+                EntryKind::Blob,
+                repo.write_blob(b"line1\nadded-a\nunchanged\nline2\nline3\n")?,
+            )?;
+            Ok(())
+        },
+        "consume added-a",
+    )?
+    .tree_id()?
+    .detach();
+    let target = build_commit(
+        &repo,
+        |tree| {
+            tree.upsert(
+                "file2",
+                EntryKind::Blob,
+                repo.write_blob(b"incompatible\n")?,
+            )?;
+            Ok(())
+        },
+        "conflict with the worktree",
+    )?
+    .id;
+    let index_before = std::fs::read(repo.index_path())?;
+    let head_before = repo.head_id()?.detach();
+
+    safe_checkout_from_head(
+        target,
+        &repo,
+        checkout::Options {
+            merge_base_override: Some(consumed),
+            ..Default::default()
+        },
+    )
+    .expect_err("the worktree change conflicts with the new HEAD");
+
+    assert_eq!(
+        std::fs::read(repo.index_path())?,
+        index_before,
+        "preparing a merge-base override does not write staging before checkout succeeds"
+    );
+    assert_eq!(
+        repo.head_id()?.detach(),
+        head_before,
+        "failed checkout leaves HEAD unchanged"
+    );
+    Ok(())
+}
+
+#[test]
+fn consuming_changes_refuses_incompatible_staging_without_writing() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("adjacent-line-additions");
+    let path = repo.workdir_path("separated").unwrap();
+    std::fs::write(&path, "staged replacement\n")?;
+    but_testsupport::git(&repo).args(["add", "separated"]).run();
+    let worktree = "line1\nadded-a\nunchanged\nadded-b\nline2\nline3\n";
+    std::fs::write(&path, worktree)?;
+    let consumed = build_commit(
+        &repo,
+        |tree| {
+            tree.upsert(
+                "separated",
+                EntryKind::Blob,
+                repo.write_blob(b"consumed replacement\n")?,
+            )?;
+            Ok(())
+        },
+        "consume an incompatible replacement",
+    )?;
+    let index_before = std::fs::read(repo.index_path())?;
+    let head_before = repo.head_id()?.detach();
+
+    let err = safe_checkout_from_head(
+        consumed.id,
+        &repo,
+        checkout::Options {
+            merge_base_override: Some(consumed.tree_id()?.detach()),
+            ..Default::default()
+        },
+    )
+    .expect_err("consumption must not overwrite incompatible staged content");
+
+    assert!(
+        err.to_string().contains("conflict with staged changes"),
+        "the staging conflict is explicit: {err}"
+    );
+    assert_eq!(
+        std::fs::read(repo.index_path())?,
+        index_before,
+        "staging is untouched"
+    );
+    assert_eq!(repo.head_id()?.detach(), head_before, "HEAD is untouched");
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        worktree,
+        "worktree is untouched"
+    );
+    Ok(())
+}
+
+#[test]
+fn consuming_changes_preserves_unrelated_conflict_stages_and_rejects_overlap() -> anyhow::Result<()>
+{
+    use but_core::index::{ConflictStage, Edit};
+
+    for conflict_path in ["file2", "separated", "separated/child"] {
+        let (repo, _tmp) = writable_scenario("adjacent-line-additions");
+        let mut index = repo.index()?.into_owned_or_cloned();
+        let mut edit = Edit::new(&mut index);
+        for (stage, content) in [
+            (ConflictStage::Base, "base\n"),
+            (ConflictStage::Ours, "ours\n"),
+            (ConflictStage::Theirs, "theirs\n"),
+        ] {
+            edit.set_conflict_stage(
+                conflict_path.into(),
+                stage,
+                gix::index::entry::Mode::FILE,
+                repo.write_blob(content)?.detach(),
+            );
+        }
+        edit.finish();
+        index.write(Default::default())?;
+        let before = std::fs::read(repo.index_path())?;
+        let consumed = build_commit(
+            &repo,
+            |tree| {
+                tree.upsert(
+                    "separated",
+                    EntryKind::Blob,
+                    repo.write_blob(b"line1\nadded-a\nunchanged\nline2\nline3\n")?,
+                )?;
+                Ok(())
+            },
+            "consume added-a",
+        )?;
+
+        let result = safe_checkout_from_head(
+            consumed.id,
+            &repo,
+            checkout::Options {
+                merge_base_override: Some(consumed.tree_id()?.detach()),
+                ..Default::default()
+            },
+        );
+
+        if conflict_path == "file2" {
+            result?;
+            let after = repo.index()?;
+            for original in index
+                .entries()
+                .iter()
+                .filter(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted)
+            {
+                let retained = after
+                    .entry_by_path_and_stage(original.path(&index), original.stage())
+                    .expect("the unrelated conflict stage remains");
+                assert_eq!(
+                    retained.id, original.id,
+                    "unrelated conflict contents are preserved"
+                );
+                assert_eq!(
+                    retained.flags, original.flags,
+                    "unrelated conflict flags are preserved"
+                );
+            }
+        } else {
+            let err =
+                result.expect_err("consumption cannot replace a conflicted path or its parent");
+            assert!(
+                err.to_string().contains("unresolved index conflict"),
+                "the unresolved conflict is identified: {err}"
+            );
+            assert_eq!(
+                std::fs::read(repo.index_path())?,
+                before,
+                "rejection preserves all conflict stages"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn skipping_index_update_materializes_consumption_without_writing_staging() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("adjacent-line-additions");
+    let path = repo.workdir_path("separated").unwrap();
+    let consumed = build_commit(
+        &repo,
+        |tree| {
+            tree.upsert(
+                "separated",
+                EntryKind::Blob,
+                repo.write_blob(b"line1\nadded-a\nunchanged\nline2\nline3\n")?,
+            )?;
+            Ok(())
+        },
+        "consume added-a",
+    )?
+    .tree_id()?
+    .detach();
+    let index_before = std::fs::read(repo.index_path())?;
+
+    let index_lock = gix::lock::File::acquire_to_update_resource(
+        repo.index_path(),
+        gix::lock::acquire::Fail::Immediately,
+        None,
+        0,
+    )?;
+
+    safe_checkout_from_head(
+        repo.head_id()?.detach(),
+        &repo,
+        checkout::Options {
+            merge_base_override: Some(consumed),
+            skip_index_update: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert_eq!(
+        std::fs::read_to_string(path)?,
+        "line1\nunchanged\nadded-b\nline2\nline3\n",
+        "consumed changes are removed from the worktree"
+    );
+    assert_eq!(
+        std::fs::read(repo.index_path())?,
+        index_before,
+        "the temporary index is never persisted"
+    );
+    assert!(
+        index_lock.lock_path().exists(),
+        "checkout leaves the caller's index lock intact"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_existing_index_lock_prevents_worktree_changes() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("adjacent-line-additions");
+    let target = build_commit(
+        &repo,
+        |tree| {
+            tree.upsert(
+                "added-by-checkout",
+                EntryKind::Blob,
+                repo.write_blob(b"target\n")?,
+            )?;
+            Ok(())
+        },
+        "add a file",
+    )?
+    .id;
+    let index_before = std::fs::read(repo.index_path())?;
+    let head_before = repo.head_id()?.detach();
+    let lock_path = repo.git_dir().join("index.lock");
+    std::fs::write(&lock_path, b"another writer\n")?;
+
+    safe_checkout_from_head(target, &repo, Default::default())
+        .expect_err("checkout must respect the existing index lock");
+
+    assert_eq!(
+        std::fs::read(repo.index_path())?,
+        index_before,
+        "the index is unchanged"
+    );
+    assert_eq!(repo.head_id()?.detach(), head_before, "HEAD is unchanged");
+    assert!(
+        !repo.workdir_path("added-by-checkout").unwrap().exists(),
+        "locking must precede worktree writes"
+    );
+    assert_eq!(
+        std::fs::read(&lock_path)?,
+        b"another writer\n",
+        "another writer's lock is preserved"
     );
     Ok(())
 }

@@ -1,5 +1,13 @@
 mod refspec;
 
+#[cfg(unix)]
+mod native_clone;
+
+#[cfg(unix)]
+mod native_fetch;
+#[cfg(unix)]
+mod native_push;
+
 /// Uses a shell script as `remote.origin.uploadpack`, so unix only.
 #[cfg(unix)]
 mod slow_fetch {
@@ -26,13 +34,13 @@ mod slow_fetch {
             git -C source commit -q --allow-empty -m init
             git clone -q --bare source origin.git
             git clone -q origin.git client
-            cat > slow-upload-pack.sh <<'EOF'
+            cat > client/slow-upload-pack.sh <<'EOF'
 #!/bin/sh
 sleep 3
 exec git upload-pack "$@"
 EOF
-            chmod +x slow-upload-pack.sh
-            git -C client config remote.origin.uploadpack "$PWD/slow-upload-pack.sh"
+            chmod +x client/slow-upload-pack.sh
+            git -C client config remote.origin.uploadpack ./slow-upload-pack.sh
             "#,
             tmp.path(),
         );
@@ -99,8 +107,8 @@ mod silent_remote {
         .expect("a fetch from a remote that never answers gives up on its own")
         .unwrap_err();
         assert!(
-            err.to_string().contains("Operation too slow"),
-            "Git aborts the stalled transfer: {err}"
+            format!("{err:?}").contains("Operation too slow"),
+            "the configured stall policy aborts the native transfer: {err}"
         );
     }
 }

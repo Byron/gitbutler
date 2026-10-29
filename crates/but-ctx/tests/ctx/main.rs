@@ -8,9 +8,51 @@ use but_core::ref_metadata::{LocalRefName, ProjectMeta};
 use but_ctx::{Context, ProjectHandle};
 use but_path::AppChannel;
 use but_testsupport::{
-    CommandExt as _, git, git_at_dir, gix_testtools::tempfile::TempDir, graph_tree, open_repo,
+    CommandExt as _, git, gix_testtools::tempfile::TempDir, graph_tree, open_repo,
     writable_scenario_slow,
 };
+
+#[cfg(unix)]
+#[test]
+fn native_credential_cache_launcher_reaches_contexts() -> anyhow::Result<()> {
+    if but_testsupport::gix_testtools::run_in_isolated_process()
+        .map_err(anyhow::Error::from_boxed)?
+    {
+        return Ok(());
+    }
+    but_testsupport::isolated_app_data_dir(|| {
+        let tmp = TempDir::new()?;
+        let repo = gix::init(tmp.path().join("repo"))?;
+        fs::write(
+            repo.git_dir().join("config"),
+            "[credential]\nhelper = cache\n",
+        )?;
+        let command = gix::credentials::program::cache::DaemonCommand {
+            executable: tmp.path().join("explicit helper"),
+            args: vec!["--credential-cache-daemon".into()],
+        };
+        but_utils::credential_cache::set_daemon(command.clone())?;
+        let ctx = Context::open(repo.path())?;
+        let discovered = but_ctx::discover_main_repo(repo.workdir().expect("non-bare"))?;
+        for repo in [&*ctx.repo.get()?, &discovered] {
+            let (cascade, _, _) = repo
+                .config_snapshot()
+                .credential_helpers("https://example.com".try_into()?)?;
+            let actual = cascade.programs[0].cache_daemon.as_ref().expect(
+                "both Context opening and CLI discovery preserve the executable-selected launcher",
+            );
+            assert_eq!(
+                actual.executable, command.executable,
+                "the host selects the executable"
+            );
+            assert_eq!(
+                actual.args, command.args,
+                "daemon arguments remain separate"
+            );
+        }
+        Ok(())
+    })
+}
 
 #[test]
 fn new_from_project_handle_uses_repo_gitdir() -> anyhow::Result<()> {
@@ -70,22 +112,6 @@ fn new_from_project_handle_keeps_repo_cached() -> anyhow::Result<()> {
         assert!(ctx.to_sync().repo.is_some());
         Ok(())
     })
-}
-
-#[test]
-fn git2_repo_finds_the_empty_tree_in_a_sha256_repository() -> anyhow::Result<()> {
-    let tmp = TempDir::new()?;
-    git_at_dir(tmp.path())
-        .args(["init", "--object-format=sha256"])
-        .run();
-    let repo = open_repo(tmp.path())?;
-    let empty_tree = repo.empty_tree().id;
-    let ctx = Context::from_repo_for_testing(repo)?;
-
-    #[expect(deprecated, reason = "the libgit2 handle is under test")]
-    let git2_repo = ctx.git2_repo.get()?;
-    git2_repo.find_tree(git2::Oid::from_bytes(empty_tree.as_bytes())?)?;
-    Ok(())
 }
 
 #[test]

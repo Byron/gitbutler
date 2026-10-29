@@ -448,15 +448,20 @@ Conflicted uncommitted files can only be marked as resolved: `but resolve <path>
 }
 
 /// Enter edit mode on branch A's commit after integrating the target of `scenario`
-/// conflicted it on submodule `sm`. Entering edit mode removes the `sm` worktree.
+/// conflicted it on submodule `sm`. Leave its worktree uninitialized for resolution.
 fn enter_edit_mode_with_submodule_conflict(scenario: &str) -> Sandbox {
     let env = Sandbox::init_scenario_with_target_and_default_settings_slow(scenario);
     env.setup_metadata_at_target(&["A"], "refs/heads/base");
     env.invoke_git("remote set-url origin .");
+    env.invoke_git("submodule deinit -f -- sm");
     env.but("pull").assert().success();
     let conflicted = env.invoke_git("rev-parse A");
     env.but(format!("resolve {conflicted}")).assert().success();
     assert_eq!(current_branch_name(&env), "gitbutler/edit");
+    let submodule = env.projects_root().join("sm");
+    if submodule.is_dir() {
+        std::fs::remove_dir(submodule).expect("checkout leaves an empty submodule directory");
+    }
     env
 }
 

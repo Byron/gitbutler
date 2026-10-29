@@ -1,8 +1,8 @@
 //! A replayable repository archive backed by a Git bundle.
 
-use std::{fmt::Write as _, io, path::Path, process::Command};
+use std::{fmt::Write as _, io, path::Path};
 
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::{Context as _, Result, ensure};
 use but_core::RepositoryExt as _;
 use gix::bstr::ByteSlice as _;
 
@@ -64,13 +64,13 @@ pub(super) fn run(
         but_core::sync::exclusive_repo_access(repo.git_dir(), Some(&project_data_dir));
     let clone_remote = clone_remote(&repo, workdir)?;
     let (head_oid, head_ref) = head(&repo)?;
-    let config = selected_local_config(workdir)?;
+    let config = selected_local_config(&repo)?;
     let (packed_refs, symrefs) = ref_manifests(&repo)?;
 
     let bundle_dir = tempfile::tempdir().context("Could not create temporary bundle directory")?;
     let bundle_path = bundle_dir.path().join("repository.bundle");
     writeln!(out, "Creating repository delta bundle")?;
-    create_bundle(workdir, &bundle_path)?;
+    create_bundle(&repo, &bundle_path)?;
     let script = installer_script(&base, &clone_remote, &head_oid, head_ref.as_deref());
 
     let progress = DumpProgress::new()?;
@@ -181,65 +181,126 @@ fn head(repo: &gix::Repository) -> Result<(String, Option<String>)> {
     Ok((oid, reference))
 }
 
-fn create_bundle(workdir: &Path, bundle_path: &Path) -> Result<()> {
-    let output = git_command(workdir)?
-        .args(["bundle", "create", "--quiet"])
-        .arg(bundle_path)
-        .args(["--all", "HEAD", "--not", "--remotes"])
-        .output()
-        .context("Could not start git bundle creation")?;
-    if !output.status.success() {
-        bail!(
-            "Could not create repository bundle: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+fn create_bundle(repo: &gix::Repository, bundle_path: &Path) -> Result<()> {
+    // Release the reference iterator's packed-ref lock before following symbolic refs.
+    let references = repo.references()?.all()?.collect::<gix::Result<Vec<_>>>()?;
+    let mut selected = Vec::with_capacity(references.len() + 1);
+    let mut excluded = Vec::new();
+    for mut reference in references {
+        let name = reference.name().to_owned();
+        let object_id = match reference.follow_to_object() {
+            Ok(id) => id.detach(),
+            Err(err)
+                if err
+                    .downcast_any_ref::<gix::refs::file::find::NotFound>()
+                    .is_some() =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if name.as_bstr().starts_with(b"refs/remotes/") {
+            excluded.push(object_id);
+        }
+        selected.push((name, object_id));
     }
+    selected.push((
+        "HEAD".try_into()?,
+        repo.find_reference("HEAD")?.follow_to_object()?.detach(),
+    ));
+    let mut output = io::BufWriter::new(
+        std::fs::File::create(bundle_path).context("Could not create repository bundle file")?,
+    );
+    repo.write_bundle(
+        selected,
+        excluded,
+        &mut output,
+        gix::progress::Discard,
+        &gix::interrupt::IS_INTERRUPTED,
+    )
+    .context("Could not create repository bundle")?;
+    io::Write::flush(&mut output).context("Could not finish repository bundle")?;
     Ok(())
 }
 
-fn selected_local_config(workdir: &Path) -> Result<Vec<u8>> {
-    let output = git_command(workdir)?
-        .args([
-            "config",
-            "--local",
-            "--includes",
-            "--null",
-            "--get-regexp",
-            r"^(gitbutler\.|remote\.|log\.excludedecoration$)",
-        ])
-        .output()
-        .context("Could not read repository-local Git configuration")?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        bail!(
-            "Could not read repository-local Git configuration: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+fn selected_local_config(repo: &gix::Repository) -> Result<Vec<u8>> {
+    use gix::config::{File, Source, file, path::interpolate};
 
-    let mut selected = Vec::with_capacity(output.stdout.len());
-    for record in output.stdout.split(|byte| *byte == 0) {
-        if record.is_empty() {
+    let git_dir = repo.current_dir().join(repo.git_dir());
+    let workdir = repo.current_dir().join(
+        repo.workdir()
+            .context("Repository installers require a non-bare repository")?,
+    );
+    let head_name = repo.head_name()?;
+    let home = gix::path::env::home_dir()
+        .and_then(|path| repo.open_options().permissions.env.home.check_opt(path));
+    let install_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_owned));
+    // Resolve includes within local scope: global remote URLs must not enable hasconfig conditions.
+    let config = File::from_paths_metadata_buf(
+        &mut [file::Metadata::from(Source::Local)
+            .at(repo.current_dir().join(repo.common_dir()).join("config"))
+            .with(repo.git_dir_trust())]
+        .into_iter(),
+        &mut Vec::new(),
+        false,
+        file::init::Options {
+            includes: file::includes::Options::follow(
+                interpolate::Context {
+                    git_install_dir: install_dir.as_deref(),
+                    home_dir: home.as_deref(),
+                    home_for_user: Some(interpolate::home_for_user),
+                },
+                file::includes::conditional::Context {
+                    git_dir: Some(&git_dir),
+                    branch_name: head_name.as_ref().map(AsRef::as_ref),
+                },
+            )
+            .strict(),
+            lossy: true,
+            ..Default::default()
+        },
+    )
+    .context("Could not read repository-local Git configuration")?
+    .unwrap_or_default();
+
+    let mut selected = Vec::new();
+    for section in config.sections() {
+        let header = section.header();
+        let section_name = header.name().to_ascii_lowercase();
+        if !matches!(section_name.as_slice(), b"gitbutler" | b"remote" | b"log") {
             continue;
         }
-        let key_end = record
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .context("Git configuration record did not contain a value")?;
-        let key = &record[..key_end];
-        if is_storage_path_key(key) {
-            continue;
+        for (mut name, value) in section.body().into_iter_implicit() {
+            name.make_ascii_lowercase();
+            if section_name == b"log"
+                && (header.subsection_name().is_some() || name != "excludedecoration")
+            {
+                continue;
+            }
+            let value = value.context("Git configuration record did not contain a value")?;
+            let mut key = section_name.clone();
+            if let Some(subsection) = header.subsection_name() {
+                key.push(b'.');
+                key.extend_from_slice(subsection);
+            }
+            key.push(b'.');
+            key.extend_from_slice(name.as_bytes());
+            if is_storage_path_key(&key) {
+                continue;
+            }
+            selected.extend_from_slice(&key);
+            selected.push(b'\n');
+            if is_remote_url_key(&key)
+                && let Some(url) = absolute_file_url(&value, &workdir)
+            {
+                selected.extend_from_slice(&url);
+            } else {
+                selected.extend_from_slice(&value);
+            }
+            selected.push(0);
         }
-        selected.extend_from_slice(key);
-        selected.push(b'\n');
-        let value = &record[key_end + 1..];
-        if is_remote_url_key(key)
-            && let Some(url) = absolute_file_url(value, workdir)
-        {
-            selected.extend_from_slice(&url);
-        } else {
-            selected.extend_from_slice(value);
-        }
-        selected.push(0);
     }
     Ok(selected)
 }
@@ -274,30 +335,6 @@ fn is_storage_path_key(key: &[u8]) -> bool {
     ]
     .iter()
     .any(|candidate| key.eq_ignore_ascii_case(candidate))
-}
-
-fn git_command(workdir: &Path) -> Result<Command> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--local-env-vars"])
-        .output()
-        .context("Could not list repository-local Git environment variables")?;
-    if !output.status.success() {
-        bail!(
-            "Could not list repository-local Git environment variables: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let mut command = Command::new("git");
-    for name in output.stdout.split(|byte| *byte == b'\n') {
-        if !name.is_empty() {
-            command.env_remove(
-                std::str::from_utf8(name).context("Git environment variable name is not UTF-8")?,
-            );
-        }
-    }
-    command.arg("-C").arg(workdir);
-    Ok(command)
 }
 
 fn ref_manifests(repo: &gix::Repository) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -491,7 +528,98 @@ fn add_project_data<W: io::Write + io::Seek>(
 
 #[cfg(test)]
 mod tests {
+    use but_testsupport::gix_testtools;
+
     use super::*;
+
+    #[test]
+    fn bundle_creation_does_not_execute_git() -> gix_testtools::TestResult {
+        if gix_testtools::run_in_isolated_process()? {
+            return Ok(());
+        }
+        let fixture =
+            gix_testtools::scripted_fixture_read_only("dump-repo-installer.sh")?.canonicalize()?;
+        let no_programs = tempfile::tempdir()?;
+        let output = tempfile::tempdir()?;
+        let _environment =
+            gix_testtools::Env::new().set("PATH", no_programs.path().display().to_string());
+        let repo = gix::open_opts(fixture.join("gitbutler"), gix::open::Options::isolated())?;
+        create_bundle(&repo, &output.path().join("repository.bundle"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn selected_config_matches_git_without_executing_git() -> gix_testtools::TestResult {
+        if gix_testtools::run_in_isolated_process()? {
+            return Ok(());
+        }
+        let fixture = gix_testtools::scripted_fixture_read_only("dump-repo-installer-config.sh")?
+            .canonicalize()?;
+        let no_programs = tempfile::tempdir()?;
+        let _environment = gix_testtools::Env::new()
+            .set(
+                "GIT_CONFIG_GLOBAL",
+                fixture.join("global.config").display().to_string(),
+            )
+            .set("PATH", no_programs.path().display().to_string());
+        let repo = gix::open(fixture.join("values"))?;
+        assert!(
+            repo.config_snapshot()
+                .strings("gitbutler.included")
+                .is_some_and(|values| values.iter().any(|value| value == "global-url")),
+            "the effective config includes values enabled by a global remote URL"
+        );
+        assert_eq!(
+            selected_local_config(&repo)?,
+            std::fs::read(fixture.join("expected-config"))?,
+            "export matches Git's local scope, include order, duplicate values, key spelling, and decoded bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_config_absolutizes_relative_fetch_urls() -> gix_testtools::TestResult {
+        let fixture = gix_testtools::scripted_fixture_read_only("dump-repo-installer-config.sh")?
+            .canonicalize()?;
+        let workdir = fixture.join("paths");
+        let mut expected = b"remote.Relative.url\n".to_vec();
+        expected.extend_from_slice(gix::path::into_bstr(workdir.join("../remote.git"))?.as_ref());
+        expected.extend_from_slice(
+            b"\0remote.Relative.pushurl\n../push.git\0remote.Absolute.url\n/absolute/remote.git\0",
+        );
+        assert_eq!(
+            selected_local_config(&gix::open_opts(&workdir, gix::open::Options::isolated())?)?,
+            expected,
+            "relative fetch paths become absolute while push URLs and existing absolute paths remain intact"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_config_rejects_implicit_values_and_accepts_no_matches() -> gix_testtools::TestResult
+    {
+        let fixture = gix_testtools::scripted_fixture_read_only("dump-repo-installer-config.sh")?
+            .canonicalize()?;
+        for name in ["implicit-first", "implicit-last", "implicit-storage"] {
+            assert!(
+                selected_local_config(&gix::open_opts(
+                    fixture.join(name),
+                    gix::open::Options::isolated()
+                )?)
+                .is_err(),
+                "{name}: implicit values cannot be replayed as explicit empty values"
+            );
+        }
+        assert!(
+            selected_local_config(&gix::open_opts(
+                fixture.join("empty"),
+                gix::open::Options::isolated()
+            )?)?
+            .is_empty(),
+            "a repository with no selected values produces an empty manifest"
+        );
+        Ok(())
+    }
 
     #[test]
     fn shell_quotes_values() {

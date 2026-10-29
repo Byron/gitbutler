@@ -173,10 +173,10 @@ pub fn discard_workspace_changes(
 }
 
 mod file {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use anyhow::{Context as _, bail};
-    use bstr::{BStr, BString, ByteSlice, ByteVec};
+    use bstr::{BStr, BString, ByteSlice};
     use but_core::ChangeState;
     use gix::{
         filter::plumbing::driver::apply::Delay, object::tree::EntryKind, prelude::ObjectIdExt,
@@ -264,59 +264,48 @@ mod file {
             }
             EntryKind::Commit => {
                 if let RestoreMode::Update = mode {
-                    // TODO(gix): actual checkout/reset functionality - it will be fine to support that fully.
-                    // Since `git2` doesn't support filters, it will save us some trouble to just use Git for that.
-                    let submodule_repo_dir = &file_path;
-                    let out = std::process::Command::try_from(
-                        gix::command::prepare(format!(
-                            "git reset --hard {id} && git clean -fxd",
-                            id = state.id
-                        ))
-                        .with_shell(),
-                    )?
-                    .current_dir(submodule_repo_dir)
-                    .output()?;
-                    if !out.status.success() {
-                        bail!(
-                            "Could not reset submodule at '{sm_dir}' to commit {id}: {err}",
-                            sm_dir = submodule_repo_dir.display(),
-                            id = state.id,
-                            err = out.stderr.as_bstr()
-                        );
-                    }
+                    let submodule = gix::open_opts(
+                        file_path.as_ref(),
+                        repo.open_options().clone().for_subrepository(),
+                    )
+                    .with_context(|| format!("Could not open submodule at '{rela_path}'"))?;
+                    submodule
+                        .reset_hard(
+                            state.id,
+                            gix::progress::Discard,
+                            &gix::interrupt::IS_INTERRUPTED,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "Could not reset submodule at '{rela_path}' to commit {}",
+                                state.id
+                            )
+                        })?;
+                    submodule
+                        .clean_worktree(
+                            std::iter::empty::<&BStr>(),
+                            &gix::interrupt::IS_INTERRUPTED,
+                            gix::worktree::clean::Options {
+                                dry_run: false,
+                                ignored: true,
+                                directories: true,
+                            },
+                        )
+                        .with_context(|| format!("Could not clean submodule at '{rela_path}'"))?;
                 } else {
-                    let sm_repo = repo
-                        .submodules()?
-                        .into_iter()
-                        .flatten()
-                        .find_map(|sm| {
-                            let is_active = sm.is_active().ok()?;
-                            is_active.then(|| -> anyhow::Result<_> {
-                                Ok(
-                                    if sm.path().ok().is_some_and(|sm_path| sm_path == rela_path) {
-                                        sm.open()?
-                                    } else {
-                                        None
-                                    },
-                                )
-                            })
-                        })
-                        .transpose()?
-                        .flatten();
-                    match sm_repo {
-                        None => {
-                            // A directory is what git creates with `git restore` even if the thing to restore is a submodule.
-                            // We are trying to be better than that if we find a submodule, hoping that this is what users expect.
-                            // We do that as baseline as there is no need to fail here.
-                        }
-                        Some(repo) => {
-                            // We will only restore the submodule if there is a local clone already available, to avoid any network
-                            // activity that would likely happen during an actual clone.
-                            // Thus, all we have to do is to check out the submodule.
-                            // TODO(gix): find a way to deal with nested submodules - they should also be checked out which
-                            //            isn't done by `gitoxide`, but probably should be an option there.
-                            checkout_repo_worktree(&wt_root, &file_path, repo)?;
-                        }
+                    let submodule = repo.submodules()?.into_iter().flatten().find(|sm| {
+                        sm.path().ok().is_some_and(|sm_path| sm_path == rela_path)
+                            && sm.is_active().unwrap_or(false)
+                    });
+                    if let Some(submodule) = submodule {
+                        submodule
+                            .restore_worktree(
+                                gix::progress::Discard,
+                                &gix::interrupt::IS_INTERRUPTED,
+                            )
+                            .with_context(|| {
+                                format!("Could not restore submodule at '{rela_path}'")
+                            })?;
                     }
                     std::fs::create_dir(&file_path).or_else(|err| {
                         if err.kind() == std::io::ErrorKind::AlreadyExists {
@@ -341,7 +330,6 @@ mod file {
                     std::fs::create_dir(&checkout_destination)?;
                     opts.destination_is_initially_empty = true;
                 }
-                // TODO(gix): make it possible to have this checkout submodules as well.
                 let out = gix::worktree::state::checkout(
                     &mut sub_index,
                     checkout_destination.as_ref(),
@@ -382,57 +370,6 @@ mod file {
         let mut buf = rela_path.to_owned();
         buf.push(b'/');
         buf
-    }
-
-    fn checkout_repo_worktree(
-        parent_worktree_dir: &Path,
-        checkout_destination: &Path,
-        mut repo: gix::Repository,
-    ) -> anyhow::Result<()> {
-        // No need to cache anything, it's just single-use for the most part.
-        repo.object_cache_size(0);
-        let mut index = repo.index_from_tree(&repo.head_tree_id_or_empty()?)?;
-        if index.entries().is_empty() {
-            // The worktree directory is created later, so we don't have to deal with it here.
-            return Ok(());
-        }
-        for entry in index.entries_mut().iter_mut().filter(|e| {
-            e.mode
-                .contains(gix::index::entry::Mode::DIR | gix::index::entry::Mode::COMMIT)
-        }) {
-            entry.flags.insert(gix::index::entry::Flags::SKIP_WORKTREE);
-        }
-
-        let mut opts =
-            repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
-        opts.destination_is_initially_empty = true;
-        opts.keep_going = true;
-
-        if !checkout_destination.exists() {
-            std::fs::create_dir(checkout_destination)?;
-        }
-        let sm_repo_dir = gix::path::relativize_with_prefix(
-            repo.path().strip_prefix(parent_worktree_dir)?,
-            checkout_destination.strip_prefix(parent_worktree_dir)?,
-        )
-        .into_owned();
-        let out = gix::worktree::state::checkout(
-            &mut index,
-            checkout_destination.to_owned(),
-            repo,
-            &gix::progress::Discard,
-            &gix::progress::Discard,
-            &gix::interrupt::IS_INTERRUPTED,
-            opts,
-        )?;
-
-        let mut buf = BString::from("gitdir: ");
-        buf.extend_from_slice(&gix::path::os_string_into_bstring(sm_repo_dir.into())?);
-        buf.push_byte(b'\n');
-        std::fs::write(checkout_destination.join(".git"), &buf)?;
-
-        tracing::debug!(directory = ?checkout_destination, outcome = ?out, "submodule checkout result");
-        Ok(())
     }
 
     /// Remove files present at `rela_path`, restore the index at that place, if possible,

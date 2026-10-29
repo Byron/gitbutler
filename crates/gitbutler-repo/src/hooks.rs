@@ -1,17 +1,12 @@
 use std::{
-    io::Write,
+    ffi::OsStr,
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
 use anyhow::{Context as _, Result};
 use bstr::ByteSlice;
 use but_ctx::Context;
-use but_oxidize::ObjectIdExt;
-use git2_hooks::{self, HookResult as H, HookRunResponse};
 use serde::Serialize;
-
-use crate::managed_hooks::get_hooks_dir;
 
 #[derive(Serialize, PartialEq, Debug, Clone)]
 pub struct MessageData {
@@ -45,54 +40,49 @@ pub enum MessageHookResult {
     Failure(ErrorData),
 }
 
-fn husky_search_paths(ctx: &Context) -> Option<&'static [&'static str]> {
-    if ctx.legacy_project.husky_hooks_enabled {
-        Some(&["../.husky"])
+pub fn commit_msg(ctx: &Context, message: String) -> Result<MessageHookResult> {
+    let repo = ctx.repo.get()?;
+    let Some(hook) = find_commit_hook(&repo, "commit-msg", ctx.legacy_project.husky_hooks_enabled)?
+    else {
+        return Ok(MessageHookResult::NotConfigured);
+    };
+    let message_path = repo
+        .current_dir()
+        .join(repo.git_dir())
+        .join("COMMIT_EDITMSG");
+    std::fs::write(&message_path, &message).context("failed to prepare commit hook message")?;
+    let output = repo.run_hook(
+        hook,
+        gix::hook::Options {
+            arguments: &[message_path.as_os_str()],
+            ..Default::default()
+        },
+    )?;
+    let edited = std::fs::read_to_string(&message_path)
+        .context("failed to read message after commit hook")?;
+    if !output.status.success() {
+        return Ok(MessageHookResult::Failure(ErrorData {
+            error: join_output(
+                output.stdout.to_str_lossy().into_owned(),
+                output.stderr.to_str_lossy().into_owned(),
+                output.status.code(),
+            ),
+        }));
+    }
+    Ok(if edited == message {
+        MessageHookResult::Success
     } else {
-        None
-    }
-}
-
-pub fn commit_msg(ctx: &Context, mut message: String) -> Result<MessageHookResult> {
-    let original_message = message.clone();
-    #[expect(deprecated, reason = "libgit2 hook adapter boundary")]
-    match git2_hooks::hooks_commit_msg(
-        &*ctx.git2_repo.get()?,
-        husky_search_paths(ctx),
-        &mut message,
-    )? {
-        H::NoHookFound => Ok(MessageHookResult::NotConfigured),
-        H::Run(HookRunResponse {
-            stdout,
-            stderr,
-            code,
-            ..
-        }) => {
-            if code == 0 {
-                match message == original_message {
-                    true => Ok(MessageHookResult::Success),
-                    false => Ok(MessageHookResult::Message(MessageData { message })),
-                }
-            } else {
-                let error = join_output(stdout, stderr, Some(code));
-                Ok(MessageHookResult::Failure(ErrorData { error }))
-            }
-        }
-    }
+        MessageHookResult::Message(MessageData { message: edited })
+    })
 }
 
 pub fn pre_commit_with_tree(ctx: &Context, tree_id: gix::ObjectId) -> Result<HookResult> {
-    #[expect(deprecated, reason = "libgit2 hook/index adapter boundary")]
-    let repo = &*ctx.git2_repo.get()?;
+    let repo = ctx.repo.get()?;
     // Back up the index file byte for byte; a round-trip through a tree would fail
     // on an index with unmerged entries (a conflict in an uncommitted file) and
     // could not bring those entries back. A sibling file copy keeps memory flat and
     // lets the restore be a single atomic rename that also keeps the permissions.
-    let index_path = repo
-        .index()?
-        .path()
-        .context("repository index has no backing file")?
-        .to_owned();
+    let index_path = repo.current_dir().join(repo.index_path());
     let backup_path = index_path.with_extension("gitbutler-hook-backup");
     let backup_tmp_path = index_path.with_extension("gitbutler-hook-backup.tmp");
     let mut transaction_lock =
@@ -139,46 +129,49 @@ pub fn pre_commit_with_tree(ctx: &Context, tree_id: gix::ObjectId) -> Result<Hoo
 
     // Panic fallback; normal restoration below can report failures to the caller.
     let guard = scopeguard::guard((), |_| {
-        if let Err(err) = restore_index(repo, &index_path, &backup_path, had_index) {
+        if let Err(err) = restore_index(&index_path, &backup_path, had_index) {
             tracing::error!("Failed to reset index: {}", err);
         }
     });
 
     let hook_result = (|| -> Result<HookResult> {
         {
-            let mut index = repo.index()?;
-            index.read_tree(&repo.find_tree(tree_id.to_git2())?)?;
-            index.write()?;
+            let previous = repo.index_or_empty()?;
+            repo.index_from_tree_with_index(&tree_id, &previous)?
+                .write(Default::default())?;
         }
-
+        let Some(hook) =
+            find_commit_hook(&repo, "pre-commit", ctx.legacy_project.husky_hooks_enabled)?
+        else {
+            return Ok(HookResult::NotConfigured);
+        };
+        let output = repo.run_hook(
+            hook,
+            gix::hook::Options {
+                environment: &[(OsStr::new("GIT_INDEX_FILE"), index_path.as_os_str())],
+                ..Default::default()
+            },
+        )?;
+        // Older GitButler hooks blocked commits on gitbutler/workspace with this marker.
         Ok(
-            match git2_hooks::hooks_pre_commit(repo, husky_search_paths(ctx))? {
-                H::NoHookFound => HookResult::NotConfigured,
-                H::Run(HookRunResponse {
-                    stdout,
-                    stderr,
-                    code,
-                    ..
-                }) => {
-                    if code == 0 {
-                        HookResult::Success
-                    } else {
-                        // If the output contains GITBUTLER_ERROR, it's the hook an older GitButler
-                        // installed to block commits on gitbutler/workspace - not a failure
-                        if stdout.contains("GITBUTLER_ERROR") || stderr.contains("GITBUTLER_ERROR")
-                        {
-                            HookResult::Success
-                        } else {
-                            let error = join_output(stdout, stderr, Some(code));
-                            HookResult::Failure(ErrorData { error })
-                        }
-                    }
-                }
+            if output.status.success()
+                || output.stdout.contains_str("GITBUTLER_ERROR")
+                || output.stderr.contains_str("GITBUTLER_ERROR")
+            {
+                HookResult::Success
+            } else {
+                HookResult::Failure(ErrorData {
+                    error: join_output(
+                        output.stdout.to_str_lossy().into_owned(),
+                        output.stderr.to_str_lossy().into_owned(),
+                        output.status.code(),
+                    ),
+                })
             },
         )
     })();
 
-    if let Err(err) = restore_index(repo, &index_path, &backup_path, had_index) {
+    if let Err(err) = restore_index(&index_path, &backup_path, had_index) {
         drop(guard); // Retry once through the fallback before returning the original error.
         return Err(err);
     }
@@ -186,18 +179,9 @@ pub fn pre_commit_with_tree(ctx: &Context, tree_id: gix::ObjectId) -> Result<Hoo
     hook_result
 }
 
-fn restore_index(
-    repo: &git2::Repository,
-    index_path: &Path,
-    backup_path: &Path,
-    had_index: bool,
-) -> Result<()> {
+fn restore_index(index_path: &Path, backup_path: &Path, had_index: bool) -> Result<()> {
     if had_index {
         std::fs::rename(backup_path, index_path).context("failed to restore pre-commit index")?;
-        // Refresh the in-memory index from the restored file.
-        repo.index()?
-            .read(true)
-            .context("failed to reload restored pre-commit index")?;
     } else {
         match std::fs::remove_file(index_path) {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
@@ -205,34 +189,59 @@ fn restore_index(
             }
             _ => {}
         }
-        repo.index()?.clear()?;
     }
     Ok(())
 }
 
 pub fn post_commit(ctx: &Context) -> Result<HookResult> {
-    #[expect(deprecated, reason = "libgit2 hook adapter boundary")]
-    match git2_hooks::hooks_post_commit(&*ctx.git2_repo.get()?, husky_search_paths(ctx))? {
-        H::NoHookFound => Ok(HookResult::NotConfigured),
-        H::Run(HookRunResponse {
-            stdout,
-            stderr,
-            code,
-            ..
-        }) => {
-            if code == 0 {
-                Ok(HookResult::Success)
-            } else {
-                let error = join_output(stdout, stderr, Some(code));
-                Ok(HookResult::Failure(ErrorData { error }))
-            }
-        }
-    }
+    let repo = ctx.repo.get()?;
+    let Some(hook) =
+        find_commit_hook(&repo, "post-commit", ctx.legacy_project.husky_hooks_enabled)?
+    else {
+        return Ok(HookResult::NotConfigured);
+    };
+    let output = repo.run_hook(hook, Default::default())?;
+    Ok(if output.status.success() {
+        HookResult::Success
+    } else {
+        HookResult::Failure(ErrorData {
+            error: join_output(
+                output.stdout.to_str_lossy().into_owned(),
+                output.stderr.to_str_lossy().into_owned(),
+                output.status.code(),
+            ),
+        })
+    })
 }
 
-// TODO: double-check this with what should happen according to Git; contribute to `git2-hooks` possibly.
-/// Since git2-hooks doesn't support pre-push yet, we implement it ourselves
-/// following the same pattern as the existing hooks
+fn find_commit_hook(
+    repo: &gix::Repository,
+    name: &str,
+    husky_enabled: bool,
+) -> Result<Option<PathBuf>> {
+    let hook = repo.find_hook(name)?;
+    if hook.is_some()
+        || !husky_enabled
+        || repo
+            .config_snapshot()
+            .plumbing()
+            .string_implicit("core.hooksPath")
+            .is_some()
+    {
+        return Ok(hook);
+    }
+    // An inactive default hook still takes precedence over the optional Husky fallback.
+    if repo.hooks_directory()?.join(name).try_exists()? {
+        return Ok(None);
+    }
+    let Some(workdir) = repo.workdir() else {
+        return Ok(None);
+    };
+    let path = repo.current_dir().join(workdir).join(".husky").join(name);
+    Ok(gix::sec::identity::is_path_executable_by_current_user(&path)?.then_some(path))
+}
+
+/// Run pre-push with refspec information inferred from a remote-tracking branch.
 /// Use `local_commit` and `remote_tracking_branch` to deduce the refspec information. Note that
 /// this isn't general, but should work for us.
 pub fn pre_push(
@@ -243,67 +252,41 @@ pub fn pre_push(
     remote_tracking_branch: &gitbutler_reference::RemoteRefname,
     run_husky_hooks: bool,
 ) -> Result<HookResult> {
-    let hooks_dir = get_hooks_dir(repo);
-    let hooks_path = hooks_dir.join("pre-push");
-    let husky_path = run_husky_hooks.then(|| {
-        repo.workdir()
-            .map(|workdir| workdir.join(".husky").join("pre-push"))
-    });
-
-    // Check for hook in .git/hooks/pre-push first, then ../.husky/pre-push
-    let hook_path = hooks_path
-        .exists()
-        .then_some(hooks_path)
-        .filter(|path| run_husky_hooks || !path_is_in_husky_dir(repo, path))
-        .or_else(|| husky_path.flatten().filter(|path| path.exists()));
+    let mut hook_path = repo
+        .find_hook("pre-push")?
+        .filter(|path| run_husky_hooks || !path_is_in_husky_dir(repo, path));
+    if hook_path.is_none()
+        && run_husky_hooks
+        && !repo.hooks_directory()?.join("pre-push").try_exists()?
+        && let Some(workdir) = repo.workdir()
+    {
+        let path = repo.current_dir().join(workdir).join(".husky/pre-push");
+        hook_path = gix::sec::identity::is_path_executable_by_current_user(&path)?.then_some(path);
+    }
 
     let Some(hook_path) = hook_path else {
         return Ok(HookResult::NotConfigured);
     };
 
-    // Execute the pre-push hook with remote name and URL as arguments
-    let mut child = std::process::Command::try_from({
-        let mut prep = gix::command::prepare(&hook_path);
-        if cfg!(windows) {
-            prep.use_shell = true;
-            prep.allow_manual_arg_splitting = false;
-            // Need unix separators for the unix bash to not swallow the backslash!
-            let with_slashes_for_bash = gix::path::to_unix_separators_on_windows(
-                gix::path::os_str_into_bstr(&prep.command)?,
-            );
-            prep.command = gix::path::from_bstring(with_slashes_for_bash.into_owned())?.into();
-        }
-        prep.arg(remote_name).arg(remote_url)
-    })?
-    .current_dir(repo.workdir().unwrap_or(repo.git_dir()))
-    .stdin(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()?;
-
-    {
-        let remote_commit = repo
-            .try_find_reference(&remote_tracking_branch.to_string())?
-            .map(|mut reference| reference.peel_to_id().map(|id| id.detach()))
-            .transpose()?
-            .unwrap_or_else(|| repo.object_hash().null());
-        // THIS IS WRONG: but is correct in the common case. This also is an issue when the ref is actually pushed,
-        // but we can fix it when moving everything to `gix`.
-        let local_tracking_branch_deduced =
-            format!("refs/heads/{}", remote_tracking_branch.branch());
-        let stdin = child.stdin.as_mut().expect("configured");
-        let refspec = format!(
-            "{local_tracking_branch_deduced} {local_commit} {remote_tracking_branch} {remote_commit}\n"
-        );
-        // Hooks may exit before reading stdin if they don't need the refspec info.
-        // The actual success/failure is determined by the exit code via wait_with_output() below.
-        if let Err(err) = stdin.write_all(refspec.as_bytes())
-            && err.kind() != std::io::ErrorKind::BrokenPipe
-        {
-            return Err(err.into());
-        }
-    }
-
-    let output = child.wait_with_output()?;
+    let remote_commit = repo
+        .try_find_reference(&remote_tracking_branch.to_string())?
+        .map(|mut reference| reference.peel_to_id().map(|id| id.detach()))
+        .transpose()?
+        .unwrap_or_else(|| repo.object_hash().null());
+    // THIS IS WRONG: but is correct in the common case. This also is an issue when the ref is actually pushed,
+    // but we can fix it when moving everything to `gix`.
+    let local_tracking_branch_deduced = format!("refs/heads/{}", remote_tracking_branch.branch());
+    let refspec = format!(
+        "{local_tracking_branch_deduced} {local_commit} {remote_tracking_branch} {remote_commit}\n"
+    );
+    let output = repo.run_hook(
+        hook_path,
+        gix::hook::Options {
+            arguments: &[OsStr::new(remote_name), OsStr::new(remote_url)],
+            stdin: Some(refspec.as_bytes()),
+            ..Default::default()
+        },
+    )?;
     if output.status.success() {
         Ok(HookResult::Success)
     } else {
@@ -321,8 +304,9 @@ fn path_is_in_husky_dir(repo: &gix::Repository, path: &Path) -> bool {
         return false;
     };
 
-    let husky_dir = canonicalize_fallback(workdir.join(".husky"), workdir);
-    let path = canonicalize_fallback(path, workdir);
+    let workdir = repo.current_dir().join(workdir);
+    let husky_dir = canonicalize_fallback(workdir.join(".husky"), &workdir);
+    let path = canonicalize_fallback(path, &workdir);
     path.starts_with(husky_dir)
 }
 

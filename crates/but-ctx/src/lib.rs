@@ -118,16 +118,6 @@ pub struct Context {
     /// Note that the standard repository comes with a decently sized object cache, but further optimization can
     /// be performed by using [`Self::clone_repo_for_merging()`].
     pub repo: OnDemand<gix::Repository>,
-    /// A lazily opened legacy `git2` repository for the project.
-    ///
-    /// Keep new uses confined to the residual `git2` boundary:
-    /// checkout/worktree materialization, staged tree/index materialization,
-    /// and deliberate compatibility adapters that still require libgit2.
-    /// Activation and read-side flows should use [`Self::repo`] instead.
-    #[deprecated(
-        note = "Boundary-only escape hatch: use Context::repo unless you are crossing the remaining libgit2 checkout/index, hook, or transport/auth adapter boundary."
-    )]
-    pub git2_repo: OnDemand<git2::Repository>,
     /// An open handle to the database. It's initialized lazily upon first access.
     /// It is also what makes this type non-Clone, which is fair.
     /// Note that the underlying ref-cell will still yield an error if the `db` is mutably borrowed more than once,
@@ -167,10 +157,6 @@ pub struct ThreadSafeContext {
 }
 
 impl From<ThreadSafeContext> for Context {
-    #[expect(
-        deprecated,
-        reason = "Context owns the deprecated boundary cache and must initialize it."
-    )]
     fn from(value: ThreadSafeContext) -> Self {
         let ThreadSafeContext {
             settings,
@@ -191,7 +177,6 @@ impl From<ThreadSafeContext> for Context {
             settings,
             repo_open_mode,
             repo: ondemand,
-            git2_repo: new_ondemand_git2_repo(gitdir.clone()),
             db: new_ondemand_db(project_data_dir.clone()),
             app_cache: new_ondemand_app_cache(app_cache_dir.clone(), cache_mode),
             gitdir,
@@ -275,10 +260,6 @@ impl Context {
 
     /// Just like [`Context::new()`], but allows controlling how the repository
     /// sources configuration via `repo_open_mode`.
-    #[expect(
-        deprecated,
-        reason = "Context owns the deprecated boundary cache and must initialize it."
-    )]
     pub fn new_with_repo_open_mode(
         gitdir: impl Into<PathBuf>,
         app_config_dir: impl AsRef<Path>,
@@ -297,9 +278,8 @@ impl Context {
                 settings,
                 cache_mode: CacheMode::Disk,
                 repo_open_mode,
-                repo: new_ondemand_repo(gitdir.clone(), repo_open_mode),
-                git2_repo: new_ondemand_git2_repo(gitdir.clone()),
-                db: new_ondemand_db(project_data_dir.clone()),
+                repo: new_ondemand_repo(gitdir, repo_open_mode),
+                db: new_ondemand_db(project_data_dir),
                 app_cache: new_ondemand_app_cache(app_cache_dir.clone(), CacheMode::Disk),
                 app_cache_dir,
                 workspace: Default::default(),
@@ -322,8 +302,7 @@ impl Context {
                 cache_mode,
                 repo_open_mode,
                 legacy_project,
-                repo: new_ondemand_repo(gitdir.clone(), repo_open_mode),
-                git2_repo: new_ondemand_git2_repo(gitdir),
+                repo: new_ondemand_repo(gitdir, repo_open_mode),
                 db: new_ondemand_db(project_data_dir),
                 app_cache: new_ondemand_app_cache(app_cache_dir.clone(), cache_mode),
                 app_cache_dir,
@@ -415,10 +394,6 @@ impl Context {
         Self::from_repo_with_legacy_support_and_channel(repo, repo_open_mode, AppChannel::new())
     }
 
-    #[expect(
-        deprecated,
-        reason = "Context owns the deprecated boundary cache and must initialize it."
-    )]
     fn from_repo_with_legacy_support_and_channel(
         repo: gix::Repository,
         repo_open_mode: RepoOpenMode,
@@ -444,8 +419,7 @@ impl Context {
                 cache_mode,
                 repo_open_mode,
                 legacy_project,
-                repo: new_ondemand_repo(gitdir.clone(), repo_open_mode),
-                git2_repo: new_ondemand_git2_repo(gitdir),
+                repo: new_ondemand_repo(gitdir, repo_open_mode),
                 db: new_ondemand_db(project_data_dir),
                 app_cache: new_ondemand_app_cache(app_cache_dir.clone(), cache_mode),
                 app_cache_dir,
@@ -464,9 +438,8 @@ impl Context {
                 settings: app_settings(but_path::app_config_dir()?)?,
                 cache_mode,
                 repo_open_mode,
-                repo: new_ondemand_repo(gitdir.clone(), repo_open_mode),
-                git2_repo: new_ondemand_git2_repo(gitdir.clone()),
-                db: new_ondemand_db(project_data_dir.clone()),
+                repo: new_ondemand_repo(gitdir, repo_open_mode),
+                db: new_ondemand_db(project_data_dir),
                 app_cache: new_ondemand_app_cache(app_cache_dir.clone(), cache_mode),
                 app_cache_dir,
                 workspace: Default::default(),
@@ -488,10 +461,6 @@ impl Context {
     /// with the given `settings`.
     ///
     /// **Note that it does not have support for legacy projects to encourage single-branch compatible code.**
-    #[expect(
-        deprecated,
-        reason = "Context owns the deprecated boundary cache and must initialize it."
-    )]
     pub fn from_repo_with_settings(
         repo: gix::Repository,
         settings: AppSettings,
@@ -515,8 +484,7 @@ impl Context {
             settings,
             cache_mode,
             repo_open_mode,
-            repo: new_ondemand_repo(gitdir.clone(), repo_open_mode),
-            git2_repo: new_ondemand_git2_repo(gitdir),
+            repo: new_ondemand_repo(gitdir, repo_open_mode),
             db: new_ondemand_db(project_data_dir),
             app_cache: new_ondemand_app_cache(app_cache_dir.clone(), cache_mode),
             app_cache_dir,
@@ -879,17 +847,12 @@ impl Context {
     }
 
     /// Take all copyable values and place them in an instance that can pass across thread boundaries.
-    #[expect(
-        deprecated,
-        reason = "Context owns the deprecated boundary cache and must move it out internally."
-    )]
     pub fn into_sync(self) -> ThreadSafeContext {
         let Context {
             settings,
             gitdir,
             project_data_dir,
             mut repo,
-            git2_repo: _,
             db: _,
             app_cache: _,
             app_cache_dir,
@@ -1003,7 +966,19 @@ fn new_ondemand_repo(gitdir: PathBuf, repo_open_mode: RepoOpenMode) -> OnDemand<
 /// Discover the Git repository containing `directory`, resolving a linked worktree to the repository
 /// of its main worktree so that callers see the same workspace no matter which checkout they run in.
 pub fn discover_main_repo(directory: impl AsRef<Path>) -> anyhow::Result<gix::Repository> {
-    let repo = gix::discover(directory)?;
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut trust = gix::sec::trust::Mapping::<gix::open::Options>::default();
+    #[cfg(unix)]
+    {
+        trust.full = trust
+            .full
+            .credential_cache_daemon(but_utils::credential_cache::daemon_command());
+        trust.reduced = trust
+            .reduced
+            .credential_cache_daemon(but_utils::credential_cache::daemon_command());
+    }
+    let repo = gix::ThreadSafeRepository::discover_opts(directory, Default::default(), trust)?
+        .to_thread_local();
     if repo.git_dir() == repo.common_dir() {
         return Ok(repo);
     }
@@ -1021,12 +996,9 @@ fn open_repo(gitdir: &Path, repo_open_mode: RepoOpenMode) -> anyhow::Result<gix:
         gix::config::tree::gitoxide::Committer::EMAIL_FALLBACK
             .validated_assignment("gitbutler@gitbutler.com".into())?,
     ]);
+    #[cfg(unix)]
+    let options = options.credential_cache_daemon(but_utils::credential_cache::daemon_command());
     Ok(gix::open_opts(gitdir, options)?)
-}
-
-#[instrument(level = "trace")]
-fn new_ondemand_git2_repo(gitdir: PathBuf) -> OnDemand<git2::Repository> {
-    OnDemand::new(move || but_oxidize::open_git2_repo(&gitdir))
 }
 
 #[instrument(level = "trace")]

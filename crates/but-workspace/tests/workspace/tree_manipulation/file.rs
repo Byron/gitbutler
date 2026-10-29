@@ -569,16 +569,8 @@ fn modified_submodule_and_embedded_repo_in_worktree() -> anyhow::Result<()> {
     )?;
     assert!(dropped.is_empty());
 
-    // The embedded repository we don't currently see due to a `gix` shortcoming - it ignores embedded repos
-    // when doing a status even though it should treat it like an 'anonymous submodule'.
-    // However, the submodule itself is reset.
-    snapbox::assert_data_eq!(
-        git_status(&repo)?,
-        snapbox::str![[r#"
- M embedded-repository
-
-"#]]
-    );
+    // Both registered submodules and embedded gitlinks are restored.
+    snapbox::assert_data_eq!(git_status(&repo)?, snapbox::str![""]);
     snapbox::assert_data_eq!(
         visualize_index(&**repo.index()?),
         snapbox::str![[r#"
@@ -607,7 +599,41 @@ fn modified_submodule_and_embedded_repo_in_worktree() -> anyhow::Result<()> {
     Ok(())
 }
 
-// See `modified_submodule_and_embedded_repo_in_worktree` for details
+#[test]
+fn deleted_submodule_is_found_after_another_active_submodule() -> anyhow::Result<()> {
+    let (mut repo, _tmp) = writable_scenario("modified-submodule-and-embedded-repo");
+    git(&repo)
+        .args([
+            "submodule",
+            "add",
+            "./embedded-repository",
+            "second-submodule",
+        ])
+        .run();
+    git(&repo).args(["commit", "-am", "second submodule"]).run();
+    repo.reload()?;
+    let path = repo
+        .workdir()
+        .expect("fixture worktree")
+        .join("second-submodule");
+    let expected = std::fs::read(path.join("file"))?;
+    std::fs::remove_dir_all(&path)?;
+
+    let dropped =
+        discard_workspace_changes(&repo, Some(file_to_spec("second-submodule")), CONTEXT_LINES)?;
+    assert!(dropped.is_empty(), "the requested deletion was restored");
+    assert!(
+        path.join("file").is_file(),
+        "the matching local clone was checked out"
+    );
+    assert_eq!(
+        std::fs::read(path.join("file"))?,
+        expected,
+        "the second submodule's content is restored"
+    );
+    Ok(())
+}
+
 #[test]
 #[cfg(unix)]
 fn modified_submodule_and_embedded_repo_in_index() -> anyhow::Result<()> {
@@ -650,6 +676,97 @@ MM submodule
 "#]]
     );
 
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn deleted_submodule_rebuilds_its_index_without_git() -> anyhow::Result<()> {
+    use but_testsupport::gix_testtools;
+
+    if gix_testtools::run_in_isolated_process().map_err(anyhow::Error::from_boxed)? {
+        return Ok(());
+    }
+    let (repo, _tmp) = writable_scenario("modified-submodule-and-embedded-repo");
+    let path = repo.workdir().expect("fixture worktree").join("submodule");
+    let submodule = gix::open_opts(&path, gix::open::Options::isolated())?;
+    let head_commit_id = submodule.head_id()?.detach();
+    let expected_index = visualize_index(&*submodule.index_from_tree(&submodule.head_tree_id()?)?);
+    std::fs::remove_dir_all(&path)?;
+    let _environment = gix_testtools::Env::new().set("PATH", "");
+
+    let dropped = discard_workspace_changes(&repo, Some(file_to_spec("submodule")), CONTEXT_LINES)?;
+    assert!(
+        dropped.is_empty(),
+        "the submodule's deleted worktree is restored"
+    );
+    let restored = gix::open_opts(&path, gix::open::Options::isolated())?;
+    assert_eq!(
+        restored.head_id()?,
+        head_commit_id,
+        "the local clone stays on its current HEAD"
+    );
+    assert_eq!(
+        visualize_index(&*restored.open_index()?),
+        expected_index,
+        "restoration replaces stale staging with the checked-out HEAD tree"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn modified_submodules_are_reset_and_cleaned_without_git() -> anyhow::Result<()> {
+    use but_testsupport::gix_testtools;
+
+    if gix_testtools::run_in_isolated_process().map_err(anyhow::Error::from_boxed)? {
+        return Ok(());
+    }
+    let (repo, _tmp) = writable_scenario("modified-submodule-and-embedded-repo");
+    let workdir = repo.workdir().expect("fixture has a worktree");
+    let submodule_dir = workdir.join("submodule");
+    let submodule = gix::open_opts(&submodule_dir, gix::open::Options::isolated())?;
+    std::fs::write(submodule.git_dir().join("info/exclude"), "ignored\n")?;
+    std::fs::write(submodule_dir.join("ignored"), "discarded\n")?;
+    std::fs::create_dir(submodule_dir.join("untracked-directory"))?;
+    std::fs::write(
+        submodule_dir.join("untracked-directory/file"),
+        "discarded\n",
+    )?;
+    git(&submodule).args(["init", "nested-repository"]).run();
+    std::fs::write(submodule_dir.join("nested-repository/keep"), "preserved\n")?;
+    git(&repo).args(["add", "."]).run();
+    let target_commit_id = repo
+        .head_tree()?
+        .lookup_entry(["submodule"])?
+        .expect("committed gitlink")
+        .object_id();
+    let changes = worktree_changes_to_discard_specs(&repo);
+    let _environment = gix_testtools::Env::new().set("PATH", "");
+
+    let dropped = discard_workspace_changes(&repo, changes, CONTEXT_LINES)?;
+    assert!(dropped.is_empty(), "both requested gitlinks were restored");
+    for name in ["submodule", "embedded-repository"] {
+        let restored = gix::open_opts(workdir.join(name), gix::open::Options::isolated())?;
+        assert_eq!(
+            restored.head_id()?,
+            target_commit_id,
+            "{name} resets to the parent tree"
+        );
+        assert_eq!(
+            std::fs::read(workdir.join(name).join("file"))?,
+            b"content\n",
+            "{name} discards its staged and unstaged contents"
+        );
+    }
+    for name in ["untracked", "ignored", "untracked-directory"] {
+        assert!(!submodule_dir.join(name).exists(), "{name} is cleaned");
+    }
+    assert_eq!(
+        std::fs::read(submodule_dir.join("nested-repository/keep"))?,
+        b"preserved\n",
+        "nested repositories retain the protection of git clean -f"
+    );
     Ok(())
 }
 

@@ -509,33 +509,18 @@ fn reset_index_to_tree(
     tree_id: gix::ObjectId,
     conflicts_tree_id: Option<gix::ObjectId>,
     previous: &gix::index::State,
+    mut index_lock: gix::lock::File,
 ) -> Result<()> {
     let repo = ctx.repo.get()?;
-    let tree = repo.find_tree(tree_id)?;
-    let mut index = repo.index_from_tree(&tree.id())?;
-    let stat_options = repo.stat_options()?;
-    for (entry, path) in index.entries_mut_with_paths() {
-        let Some(prev) = previous
-            .entry_by_path_and_stage(path, Stage::Unconflicted)
-            .filter(|prev| prev.id == entry.id && prev.mode == entry.mode)
-        else {
-            continue;
-        };
-        // A sparse checkout's files outside it stay marked, or they'd show as deleted.
-        if prev.flags.contains(Flags::SKIP_WORKTREE) {
-            entry.flags |= Flags::EXTENDED | Flags::SKIP_WORKTREE;
-        }
-        if !prev.stat.is_racy(previous.timestamp(), stat_options) {
-            entry.stat = prev.stat;
-        }
-    }
+    let mut index = repo.index_from_tree_with_index(&tree_id, previous)?;
     if let Some(conflicts_tree_id) = conflicts_tree_id {
         restore_index_conflicts(&mut index, repo.find_tree(conflicts_tree_id)?.id())?;
     }
-    index.write(Default::default())?;
-    // Keep the legacy libgit2 handle in sync with the index written through gix.
-    #[expect(deprecated, reason = "index cache compatibility boundary")]
-    ctx.git2_repo.get()?.index()?.read(true)?;
+    let mut buffered = std::io::BufWriter::new(&mut index_lock);
+    index.write_to(&mut buffered, Default::default())?;
+    std::io::Write::flush(&mut buffered)?;
+    drop(buffered);
+    index_lock.commit()?;
     Ok(())
 }
 
@@ -1304,6 +1289,14 @@ fn restore_snapshot_tree(
         .filter(|reference| reference.checked_out_elsewhere)
         .map(|reference| reference.ref_name.as_ref())
         .collect();
+    // Own the index across worktree restoration and its final replacement.
+    let index_lock = gix::lock::File::acquire_to_update_resource(
+        repo.index_path(),
+        gix::lock::acquire::Fail::Immediately,
+        None,
+        0,
+    )
+    .context("Could not lock the index for snapshot restore")?;
     let before_restore_snapshot_tree_id = prepare_snapshot_with_target_and_refs(
         ctx,
         exclusive_access.read_permission(),
@@ -1399,7 +1392,7 @@ fn restore_snapshot_tree(
     }
 
     let gix_repo = ctx.clone_repo_for_merging()?;
-    // The checkout below rewrites the index, so keep the stat it has now for the final index.
+    // Keep the current stat data for the snapshot's replacement index.
     let index_before_checkout = repo.index_or_empty()?;
 
     // Check out the snapshot's worktree while HEAD still points at the pre-restore commit:
@@ -1409,6 +1402,9 @@ fn restore_snapshot_tree(
         workdir_tree_id,
         &gix_repo,
         but_core::worktree::checkout::Options {
+            // Snapshot restore supplies the final refs and index after the worktree is ready.
+            skip_head_update: true,
+            skip_index_update: true,
             // `workdir_tree_id` is the restored snapshot's full workdir tree, so it already
             // contains the uncommitted changes captured at that point. `safe_checkout_from_head`
             // otherwise re-applies the current uncommitted changes on top via a 3-way merge whose
@@ -1490,6 +1486,7 @@ fn restore_snapshot_tree(
         index_tree_entry.id().detach(),
         index_conflicts_tree_id,
         &index_before_checkout,
+        index_lock,
     )?;
 
     if let Some(checkout) = restored_checkout {
