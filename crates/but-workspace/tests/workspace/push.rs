@@ -1,6 +1,7 @@
 use crate::utils::{r, writable_scenario_slow};
 use bstr::ByteSlice;
 use but_core::ref_metadata::ProjectMeta;
+use but_error::AnyhowContextExt;
 use but_workspace::{
     RefInfo,
     ref_info::Options,
@@ -395,11 +396,9 @@ fn force_push_protection_is_observed_when_pushing_bottom_branch() -> anyhow::Res
 
     let err = push(&repo, &meta, r("refs/heads/bottom"), true, false, true)
         .expect_err("force-with-lease should reject the stale remote branch");
-    let err = format!("{err:#}");
-    assert!(
-        err.contains("force push was blocked")
-            && err.contains("--force-with-lease")
-            && err.contains("--force-if-includes"),
+    assert_eq!(
+        err.custom_context().map(|context| context.code),
+        Some(but_error::Code::GitForcePushProtection),
         "error should come from force push protection: {err:#}"
     );
 
@@ -423,11 +422,9 @@ fn force_push_protection_is_observed_when_pushing_top_branch() -> anyhow::Result
 
     let err = push(&repo, &meta, r("refs/heads/top"), true, false, true)
         .expect_err("pushing the top branch should observe bottom branch force protection first");
-    let err = format!("{err:#}");
-    assert!(
-        err.contains("force push was blocked")
-            && err.contains("--force-with-lease")
-            && err.contains("--force-if-includes"),
+    assert_eq!(
+        err.custom_context().map(|context| context.code),
+        Some(but_error::Code::GitForcePushProtection),
         "error should come from force push protection: {err:#}"
     );
 
