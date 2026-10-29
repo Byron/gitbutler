@@ -192,15 +192,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: read
-    container:
-      image: ghcr.io/gitbutlerapp/ci-base-image@sha256:3eaeae1b07072796a53dc1e7585cdc1f462d0b11d10ecd3685c6fa8082d647dd
     env:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install native dependencies
+        run: |
+          sudo ./scripts/install-minimal-debian-dependencies.sh
+          sudo ./scripts/install-tauri-debian-dependencies.sh
+          sudo apt-get install -y --no-install-recommends libxcb1-dev libxkbcommon-x11-dev libfontconfig-dev
       - name: Rust Cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -409,7 +411,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: read
     strategy:
       fail-fast: false
       matrix:
@@ -420,8 +421,6 @@ jobs:
             cache_suffix: legacy
           - features: "--features tauri"
             cache_suffix: tauri
-    container:
-      image: ghcr.io/gitbutlerapp/ci-base-image@sha256:3eaeae1b07072796a53dc1e7585cdc1f462d0b11d10ecd3685c6fa8082d647dd
     env:
       CARGO_TERM_COLOR: always
     defaults:
@@ -431,6 +430,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install native dependencies
+        run: |
+          sudo ./scripts/install-minimal-debian-dependencies.sh
+          sudo ./scripts/install-tauri-debian-dependencies.sh
       - name: Rust Cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -445,9 +448,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: read
-    container:
-      image: ghcr.io/gitbutlerapp/ci-base-image@sha256:3eaeae1b07072796a53dc1e7585cdc1f462d0b11d10ecd3685c6fa8082d647dd
     env:
       CARGO_TERM_COLOR: always
     defaults:
@@ -457,6 +457,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install native dependencies
+        run: |
+          sudo ./scripts/install-minimal-debian-dependencies.sh
+          sudo ./scripts/install-tauri-debian-dependencies.sh
       - name: Rust Cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -766,9 +770,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: read
-    container:
-      image: ghcr.io/gitbutlerapp/ci-base-image@sha256:3eaeae1b07072796a53dc1e7585cdc1f462d0b11d10ecd3685c6fa8082d647dd
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -788,6 +789,8 @@ jobs:
           path: |
             ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-with-webkit-${{ steps.get_playwright_version.outputs.playwright-version }}
+      - name: Install Playwright system dependencies
+        run: pnpm --filter @gitbutler/ui-svelte exec playwright install-deps chromium webkit
       - run: pnpm ui:playwright:install:ct
         if: ${{ steps.playwright-cache.outputs.cache-hit != 'true' }}
       - name: run playwright tests

@@ -25,9 +25,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: read
-    container:
-      image: ghcr.io/gitbutlerapp/ci-base-image@sha256:c0ab58bb5f1cd99beb36861f460895be77515f4dd252df736c27c117a8e04a92
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -42,6 +39,11 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.event.inputs.sha }}
+      - name: Install native dependencies
+        run: |
+          sudo ./scripts/install-minimal-debian-dependencies.sh
+          sudo ./scripts/install-tauri-debian-dependencies.sh
+          sudo apt-get install -y --no-install-recommends dbus-x11 ffmpeg webkit2gtk-driver xvfb
       - name: Rust Cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -129,9 +131,6 @@ jobs:
         shard: [1, 2, 3, 4]
     permissions:
       contents: read
-      packages: read
-    container:
-      image: ghcr.io/gitbutlerapp/ci-base-image@sha256:c0ab58bb5f1cd99beb36861f460895be77515f4dd252df736c27c117a8e04a92
     timeout-minutes: 60
     env:
       DESKTOP_PORT: 3000
@@ -150,6 +149,8 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.event.inputs.sha }}
+      - name: Install native dependencies
+        run: sudo ./scripts/install-minimal-debian-dependencies.sh
       - name: Rust Cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -161,6 +162,8 @@ jobs:
           echo BUT=$PWD/target/debug/but >> $GITHUB_ENV
       - name: Setup node environment
         uses: ./.github/actions/init-env-node
+      - name: Install Playwright system dependencies
+        run: pnpm --dir e2e exec playwright install-deps webkit
       - id: get_playwright_version
         shell: bash
         run: |
