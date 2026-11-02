@@ -30,7 +30,7 @@ pub fn writable_context(script_name: &str, repo_name: &str) -> Result<(Context, 
         } else {
             gix_testtools::Creation::CopyFromReadOnly
         },
-        5,
+        6,
         move |fixture| {
             if fixture.is_uninitialized() {
                 let repo = open_repo(&fixture.path().join(&repo_name_for_post))?;
@@ -46,7 +46,7 @@ pub fn writable_context(script_name: &str, repo_name: &str) -> Result<(Context, 
 
 pub fn read_only_context(repo_name: &str) -> Result<Context> {
     let (root, _) =
-        gix_testtools::scripted_fixture_read_only_with_post("for-listing.sh", 5, |fixture| {
+        gix_testtools::scripted_fixture_read_only_with_post("for-listing.sh", 6, |fixture| {
             if fixture.is_uninitialized() {
                 for repo_name in [
                     "one-vbranch-in-workspace",
