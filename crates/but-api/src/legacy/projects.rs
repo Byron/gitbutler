@@ -65,42 +65,6 @@ pub fn add_project_best_effort(path: PathBuf) -> Result<gitbutler_project::AddPr
 
 #[but_api]
 #[instrument(err(Debug))]
-pub fn get_project(
-    project_id: ProjectHandleOrLegacyProjectId,
-    no_validation: Option<bool>,
-) -> Result<gitbutler_project::api::Project> {
-    let no_validation = no_validation.unwrap_or(false);
-    match project_id {
-        ProjectHandleOrLegacyProjectId::ProjectHandle(handle) => {
-            if no_validation {
-                let project = gitbutler_project::get_raw(
-                    ProjectHandleOrLegacyProjectId::ProjectHandle(handle),
-                )?
-                .migrated()?
-                .into();
-                Ok(project)
-            } else {
-                Ok(gitbutler_project::get_validated(
-                    ProjectHandleOrLegacyProjectId::ProjectHandle(handle),
-                )?
-                .into())
-            }
-        }
-        ProjectHandleOrLegacyProjectId::LegacyProjectId(project_id) => Ok(if no_validation {
-            gitbutler_project::get_raw(ProjectHandleOrLegacyProjectId::LegacyProjectId(project_id))?
-                .migrated()?
-                .into()
-        } else {
-            gitbutler_project::get_validated(ProjectHandleOrLegacyProjectId::LegacyProjectId(
-                project_id,
-            ))?
-            .into()
-        }),
-    }
-}
-
-#[but_api]
-#[instrument(err(Debug))]
 pub fn list_projects_stateless() -> Result<Vec<ProjectForFrontend>> {
     list_projects(vec![])
 }
@@ -196,18 +160,6 @@ fn assure_repo_ownership(repo: &gix::Repository) -> Result<()> {
         path.display()
     )
     .context(Code::RepoOwnership))
-}
-
-#[but_api]
-#[instrument(err(Debug))]
-pub fn is_gerrit(ctx: &but_ctx::Context) -> Result<bool> {
-    let repo = ctx.repo.get()?;
-    Ok(
-        gitbutler_project::gerrit::is_used_by_default_remote(&repo).unwrap_or_else(|err| {
-            tracing::debug!(?err, "Gerrit detection failed");
-            false
-        }),
-    )
 }
 
 #[derive(serde::Serialize)]

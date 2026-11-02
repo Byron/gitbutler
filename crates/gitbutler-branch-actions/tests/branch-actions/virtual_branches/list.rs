@@ -164,7 +164,7 @@ mod util {
     }
 
     pub fn project_ctx(name: &str) -> Result<Context> {
-        crate::driverless::read_only_context("for-listing.sh", name)
+        crate::driverless::read_only_context(name)
     }
 
     pub fn list_branches(

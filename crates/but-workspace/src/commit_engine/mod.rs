@@ -10,9 +10,6 @@ use but_core::{
 use but_rebase::{RebaseOutput, commit::DateMode};
 use gix::prelude::ObjectIdExt as _;
 
-/// Types for use in the frontend with serialization support.
-pub mod ui;
-
 /// The place to apply the [change-specifications](DiffSpec) to.
 ///
 /// Note that any commit this instance points to will be the basis to apply all changes to.

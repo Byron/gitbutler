@@ -75,18 +75,6 @@ pub fn git_index_size(ctx: &but_ctx::Context) -> Result<usize> {
 
 #[but_api]
 #[instrument(err(Debug))]
-pub fn delete_all_data() -> Result<()> {
-    for project in gitbutler_project::dangerously_list_projects_without_migration()
-        .context("failed to list projects")?
-    {
-        gitbutler_project::delete(project.id)
-            .map_err(|err| err.context("failed to delete project"))?;
-    }
-    Ok(())
-}
-
-#[but_api]
-#[instrument(err(Debug))]
 pub fn git_set_global_config(key: String, value: String) -> Result<String> {
     validate_gitbutler_global_key(&key)?;
     _ = edit_config(None, gix::config::Source::User, |config| {

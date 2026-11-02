@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, anyhow, bail};
-use but_error::Code;
+use anyhow::{Context as _, Result, bail};
 
 use super::{Project, storage, storage::UpdateRequest};
 use crate::{ProjectHandle, ProjectHandleOrLegacyProjectId, project::AddProjectOutcome};
@@ -277,42 +276,16 @@ impl Controller {
         self.projects_storage.update(project)
     }
 
-    pub(crate) fn get(&self, id: ProjectHandleOrLegacyProjectId) -> Result<Project> {
-        self.get_inner(id, false)
-    }
-
     /// Only get the project information. No state validation is done.
     /// This is intended to be used only when updating the path of a missing project.
     pub(crate) fn get_raw(&self, id: ProjectHandleOrLegacyProjectId) -> Result<Project> {
         self.projects_storage.get(id)
     }
 
-    /// Like [`Self::get()`], but will assure the project still exists and is valid by
-    /// opening a git repository. This should only be done for critical points in time.
-    pub(crate) fn get_validated(&self, id: ProjectHandleOrLegacyProjectId) -> Result<Project> {
-        self.get_inner(id, true)
-    }
-
-    fn get_inner(&self, id: ProjectHandleOrLegacyProjectId, validate: bool) -> Result<Project> {
+    pub(crate) fn get(&self, id: ProjectHandleOrLegacyProjectId) -> Result<Project> {
         let mut project = self.projects_storage.get(id)?;
         // BACKWARD-COMPATIBLE MIGRATION
         project.migrate()?;
-        if validate {
-            let repo = project.open_isolated_repo();
-            if repo.is_err() {
-                let suffix = if !project.worktree_dir.exists() {
-                    " as it does not exist"
-                } else {
-                    ""
-                };
-                return Err(anyhow!(
-                    "Could not open repository at '{}'{suffix}",
-                    project.worktree_dir.display()
-                )
-                .context(Code::ProjectMissing));
-            }
-        }
-
         match project.gb_dir() {
             Ok(gb_dir) => {
                 if !gb_dir.exists()

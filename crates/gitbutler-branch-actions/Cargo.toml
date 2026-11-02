@@ -39,7 +39,7 @@ gitbutler-project.workspace = true
 
 tracing.workspace = true
 anyhow.workspace = true
-gix = { workspace = true, features = ["blob-diff", "revision"] }
+gix = { workspace = true, features = ["revision"] }
 serde.workspace = true
 bstr.workspace = true
 url = { version = "2.5.4", features = ["serde"] }

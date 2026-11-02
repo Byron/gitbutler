@@ -2071,7 +2071,6 @@ dependencies = [
  "async-openai",
  "but-core",
  "but-ctx",
- "but-workspace",
  "gix",
  "serde",
  "serde_json",
@@ -4938,7 +4937,6 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "but-core",
- "but-error",
  "but-forge",
  "but-path",
  "but-project-handle",
@@ -4980,15 +4978,12 @@ dependencies = [
  "but-oxidize",
  "but-settings",
  "but-testsupport",
- "fuzzy-matcher",
  "git2",
  "git2-hooks",
  "gitbutler-project",
  "gitbutler-reference",
  "gix",
- "ignore",
  "infer",
- "itertools",
  "scopeguard",
  "serde",
  "snapbox",
@@ -5055,7 +5050,6 @@ name = "gitbutler-user"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "but-path",
  "but-schemars",
  "but-secret",
@@ -6190,19 +6184,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
-name = "globset"
-version = "0.4.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52dfc19153a48bde0cbd630453615c8151bce3a5adfac7a0aebfbf0a1e1f57e3"
-dependencies = [
- "aho-corasick",
- "bstr",
- "log",
- "regex-automata",
- "regex-syntax",
-]
-
-[[package]]
 name = "glow"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7139,22 +7120,6 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
-]
-
-[[package]]
-name = "ignore"
-version = "0.4.26"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b915661dd01db3f05050265b2477bcc6527b3792388e2749b41623cc592be67d"
-dependencies = [
- "crossbeam-deque",
- "globset",
- "log",
- "memchr",
- "regex-automata",
- "same-file",
- "walkdir",
- "winapi-util",
 ]
 
 [[package]]

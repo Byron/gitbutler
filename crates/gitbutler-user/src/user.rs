@@ -44,19 +44,4 @@ impl User {
         *self.access_token.borrow_mut() = Some(secret.clone());
         Ok(secret)
     }
-
-    /// Obtain the GitHub access token, if it is stored either on this instance or in the secrets store.
-    ///
-    /// Note that if retrieved from the secrets store, it will be cached on instance.
-    pub fn github_access_token(&self) -> Result<Option<Sensitive<String>>> {
-        if let Some(token) = self.github_access_token.borrow().as_ref() {
-            return Ok(Some(token.clone()));
-        }
-        let secret = secret::retrieve(
-            Self::GITHUB_ACCESS_TOKEN_HANDLE,
-            secret::Namespace::BuildKind,
-        )?;
-        self.github_access_token.borrow_mut().clone_from(&secret);
-        Ok(secret)
-    }
 }

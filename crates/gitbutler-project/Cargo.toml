@@ -13,7 +13,6 @@ export-schema = ["dep:schemars", "dep:but-schemars", "but-forge/export-schema"]
 doctest = false
 
 [dependencies]
-but-error.workspace = true
 but-path.workspace = true
 but-core.workspace = true
 but-utils = { workspace = true, features = ["legacy"] }

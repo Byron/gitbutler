@@ -6,16 +6,14 @@ use std::{
     vec,
 };
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use bstr::{BString, ByteSlice};
-use but_core::{
-    RepositoryExt, WORKSPACE_REF_NAME, extract_remote_name_and_short_name, ref_metadata::StackId,
-};
+use but_core::{RepositoryExt, extract_remote_name_and_short_name, ref_metadata::StackId};
 use but_ctx::Context;
 use but_serde::BStringForFrontend;
 use gitbutler_branch::{BranchIdentity, ReferenceExtGix};
 use gitbutler_reference::normalize_branch_name;
-use gix::{prelude::TreeDiffChangeExt, reference::Category};
+use gix::reference::Category;
 use serde::{Deserialize, Serialize};
 
 use crate::gravatar::gravatar_url_from_email;
@@ -179,23 +177,6 @@ pub fn list_branches(
     });
 
     Ok(branches)
-}
-
-fn configured_workspace_target(
-    ctx: &Context,
-    repo: &gix::Repository,
-) -> Result<Option<(gix::refs::FullName, gix::ObjectId)>> {
-    let Some(_workspace_ref) = repo.try_find_reference(WORKSPACE_REF_NAME)? else {
-        return Ok(None);
-    };
-    let project_meta = ctx.project_meta()?;
-    let Some(target_ref) = project_meta.target_ref.as_ref() else {
-        return Ok(None);
-    };
-    Ok(Some((
-        target_ref.as_local_full_name_ref().to_owned(),
-        project_meta.resolve_target_commit(repo)?,
-    )))
 }
 
 fn matches_all(branch: &BranchListing, filter: BranchListingFilter) -> bool {
@@ -666,238 +647,6 @@ pub struct StackReference {
 }
 #[cfg(feature = "export-schema")]
 but_schemars::register_sdk_type!(StackReference);
-
-/// Takes a list of `branch_names` (the given name, as returned by `BranchListing`) and returns
-/// a list of enriched branch data.
-// TODO(performance): this needs a redesign, around what takes the most time.
-//                    - listing all branches + heads: fast, do it in one call. reftables only helps later.
-//                    - how many commits ahead/behind? Query for a set of branches and use a Graph to accelerate the queries
-//                          - this needs better support for 'free' graph creation, not bound to a workspace.
-//                    - fill in line-changes on a per-branch basis, passing the tip and merge-base to a specialised function
-//                      that just churns out tree-diffs and blob-diffs for the line changes. It itself may spawn a thread like now,
-//                      so a multi-branch version of this might be helpful, depending on what the UI needs. It seems reasonable for it
-//                      to chunk up what's in view and, request ahead/behind information, then pass this to the long-running (but soon cached)
-//                      function compute line diffs.
-pub fn get_branch_listing_details(
-    ctx: &Context,
-    branch_names: impl IntoIterator<Item = impl TryInto<BranchIdentity>>,
-) -> Result<Vec<BranchListingDetails>> {
-    let branch_names: Vec<_> = branch_names
-        .into_iter()
-        .map(TryInto::try_into)
-        .filter_map(Result::ok)
-        .collect();
-    let repo = ctx.repo.get()?;
-    let branches = list_branches(ctx, None, Some(branch_names))?;
-
-    let (default_target_current_upstream_commit_id, default_target_seen_at_last_update) = {
-        if let Some((target_ref_name, target_base_oid)) = configured_workspace_target(ctx, &repo)? {
-            (
-                repo.find_reference(target_ref_name.as_ref())?
-                    .peel_to_commit()?
-                    .id,
-                target_base_oid,
-            )
-        } else {
-            let project_meta = ctx.project_meta()?;
-            (
-                repo.find_reference(project_meta.target_ref_or_err()?.as_local_full_name_ref())?
-                    .peel_to_commit()?
-                    .id,
-                project_meta.resolve_target_commit(&repo)?,
-            )
-        }
-    };
-
-    let mut enriched_branches = Vec::new();
-    let (diffstats, merge_bases) = {
-        let (start, start_rx) = std::sync::mpsc::channel::<(
-            std::sync::mpsc::Receiver<gix::object::tree::diff::ChangeDetached>,
-            std::sync::mpsc::Sender<(usize, usize, usize)>,
-        )>();
-        let diffstats = std::thread::Builder::new()
-            .name("gitbutler-diff-stats".into())
-            .spawn({
-                let repo = repo.clone().for_tree_diffing()?;
-                move || -> Result<()> {
-                    let mut resource_cache = repo.diff_resource_cache_for_tree_diff()?;
-                    for (change_rx, res_tx) in start_rx {
-                        let (mut number_of_files, mut lines_added, mut lines_removed) = (0, 0, 0);
-                        for change in change_rx {
-                            if let Some(counts) = change
-                                .attach(&repo, &repo)
-                                .diff(&mut resource_cache)
-                                .ok()
-                                .and_then(|mut platform| platform.line_counts().ok())
-                                .flatten()
-                            {
-                                number_of_files += 1;
-                                lines_added += counts.insertions as usize;
-                                lines_removed += counts.removals as usize;
-                            }
-                            // Let's not attempt to reuse the cache as it's only useful if we know the diff repeats
-                            // over different objects, like when doing rename tracking.
-                            resource_cache.clear_resource_cache_keep_allocation();
-                        }
-                        if res_tx
-                            .send((number_of_files, lines_added, lines_removed))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Ok(())
-                }
-            })?;
-
-        let all_other_branch_commit_ids: Vec<_> = branches
-            .iter()
-            .map(|branch| {
-                (
-                    branch
-                        .stack
-                        .as_ref()
-                        .and_then(|vb| {
-                            vb.in_workspace
-                                .then_some(default_target_seen_at_last_update)
-                        })
-                        .unwrap_or(default_target_current_upstream_commit_id),
-                    branch.head,
-                )
-            })
-            .collect();
-        let (merge_tx, merge_rx) = std::sync::mpsc::channel();
-        let parent_span = tracing::Span::current();
-        let merge_bases = std::thread::Builder::new()
-            .name("gitbutler-mergebases".into())
-            .spawn({
-                let repo = repo.clone().into_sync();
-                move || -> anyhow::Result<()> {
-                    let repo = repo.to_thread_local().for_tree_diffing()?;
-                    let cache = repo.commit_graph_if_enabled()?;
-                    let mut graph = repo.revision_graph(cache.as_ref());
-                    let _span = tracing::debug_span!(
-                        parent: &parent_span,
-                        "branch merge-bases and commits",
-                        num_branches = all_other_branch_commit_ids.len(),
-                    )
-                    .entered();
-                    for (other_branch_commit_id, branch_head) in all_other_branch_commit_ids {
-                        let base = repo
-                            .merge_base_with_graph(other_branch_commit_id, branch_head, &mut graph)
-                            .ok()
-                            .flatten()
-                            .map(gix::Id::detach);
-                        let res = match base {
-                            Some(base) => {
-                                let mut num_commits = 0;
-                                let mut authors = HashSet::new();
-                                let revwalk = repo
-                                    .rev_walk(Some(branch_head))
-                                    .with_hidden(Some(base))
-                                    .all()?;
-                                for commit_info in revwalk {
-                                    let commit_info = commit_info?;
-                                    let commit = repo.find_commit(commit_info.id)?;
-                                    authors.insert(commit.author()?.into());
-                                    num_commits += 1;
-                                }
-                                merge_tx.send(Some((base, authors, num_commits)))
-                            }
-                            None => merge_tx.send(None),
-                        };
-                        if res.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(())
-                }
-            })?;
-
-        for branch in branches {
-            let Some((base, authors, num_commits)) = merge_rx.recv()? else {
-                continue;
-            };
-
-            let branch_head = branch.head;
-            let base_commit = repo.find_object(base)?.try_into_commit()?;
-            let base_tree = base_commit.tree()?;
-            let head_tree = repo.find_object(branch_head)?.peel_to_tree()?;
-
-            let ((change_tx, change_rx), (res_tx, rex_rx)) =
-                (std::sync::mpsc::channel(), std::sync::mpsc::channel());
-            if start.send((change_rx, res_tx)).is_err() {
-                bail!("diffing-thread crashed");
-            };
-            base_tree
-                .changes()?
-                .options(|opts| {
-                    opts.track_rewrites(None);
-                })
-                // NOTE: `stats(head_tree)` is also possible, but we have a separate thread for that.
-                .for_each_to_obtain_tree(&head_tree, move |change| {
-                    change_tx.send(change.detach()).ok();
-                    Ok(std::ops::ControlFlow::Continue(()))
-                })?;
-            let (number_of_files, lines_added, lines_removed) = rex_rx.recv()?;
-
-            let branch_data = BranchListingDetails {
-                name: branch.name,
-                lines_added,
-                lines_removed,
-                number_of_files,
-                authors: authors.into_iter().collect(),
-                number_of_commits: num_commits,
-                stack: branch.stack,
-            };
-            enriched_branches.push(branch_data);
-        }
-        (diffstats, merge_bases)
-    };
-    diffstats.join().expect("no panic")?;
-    merge_bases.join().expect("no panic")?;
-    Ok(enriched_branches)
-}
-
-/// Represents a fat struct with all the data associated with a branch
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
-pub struct BranchListingDetails {
-    /// The name of the branch (e.g. `main`, `feature/branch`), excluding the remote name
-    #[cfg_attr(feature = "export-schema", schemars(with = "String"))]
-    pub name: BranchIdentity,
-    /// The number of lines added within the branch
-    /// Since the virtual branch, local branch and the remote one can have different number of lines removed,
-    /// the value from the virtual branch (if present) takes the highest precedence,
-    /// followed by the local branch and then the remote branches (taking the max if there are multiple).
-    /// If this branch has a virtual branch, lines_added does NOT include the uncommitted lines.
-    pub lines_added: usize,
-    /// The number of lines removed within the branch
-    /// Since the virtual branch, local branch and the remote one can have different number of lines removed,
-    /// the value from the virtual branch (if present) takes the highest precedence,
-    /// followed by the local branch and then the remote branches (taking the max if there are multiple)
-    /// If this branch has a virtual branch, lines_removed does NOT include the uncommitted lines.
-    pub lines_removed: usize,
-    /// The number of files that were modified within the branch
-    /// Since the virtual branch, local branch and the remote one can have different number files modified,
-    /// the value from the virtual branch (if present) takes the highest precedence,
-    /// followed by the local branch and then the remote branches (taking the max if there are multiple)
-    pub number_of_files: usize,
-    /// The number of commits associated with a branch
-    /// Since the virtual branch, local branch and the remote one can have different number of commits,
-    /// the value from the virtual branch (if present) takes the highest precedence,
-    /// followed by the local branch and then the remote branches (taking the max if there are multiple)
-    pub number_of_commits: usize,
-    /// A list of authors that have contributes commits to this branch.
-    /// In the case of multiple remote tracking branches, or branches whose commits are evaluated,
-    /// it takes the full list of unique authors, without applying a mailmap.
-    pub authors: Vec<Author>,
-    /// The branch may or may not have a virtual branch associated with it.
-    pub stack: Option<StackReference>,
-}
-#[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(BranchListingDetails);
 
 #[cfg(test)]
 mod tests {

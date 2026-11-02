@@ -9,196 +9,22 @@ use but_core::{
     sync::{RepoExclusive, RepoShared},
 };
 use but_ctx::Context;
-use but_error::bail_precondition;
 use but_oplog::legacy::{OperationKind, SnapshotDetails, Trailer};
 use but_rebase::graph_rebase::{
     Editor,
     mutate::{InsertSide, RelativeToRef},
 };
 use but_workspace::branch::unapply::WorkspaceDisposition;
-use but_workspace::legacy::ui::{StackEntryNoOpt, StackHeadInfo};
-use gitbutler_branch::{BranchCreateRequest, BranchUpdateRequest};
-use gitbutler_branch_actions::{
-    BaseBranch, BranchListing, BranchListingDetails, BranchListingFilter,
-};
+use gitbutler_branch::BranchUpdateRequest;
+use gitbutler_branch_actions::{BaseBranch, BranchListing, BranchListingFilter};
 use gitbutler_git::GitContextExt as _;
 use gitbutler_operating_modes::ensure_open_workspace_mode;
 use gitbutler_oplog::OplogExt;
 use gitbutler_project::FetchResult;
-use gitbutler_reference::{Refname, normalize_branch_name as normalize_name};
-use gix::reference::Category;
 use tracing::instrument;
-
-use crate::branch::{branch_canned_name, branch_create_with_perm, json::BranchCreatePlacement};
-use crate::commit::json::RelativeTo;
-// Parameter structs for all functions
-
-#[but_api]
-#[instrument(err(Debug))]
-pub fn normalize_branch_name(name: String) -> Result<String> {
-    normalize_name(&name)
-}
-
-#[but_api]
-#[instrument(err(Debug))]
-pub fn create_virtual_branch(
-    ctx: &mut Context,
-    branch: BranchCreateRequest,
-) -> Result<StackEntryNoOpt> {
-    let stack_entry = {
-        let branch_name = match branch.name {
-            Some(name) => normalize_name(&name)?,
-            None => branch_canned_name(ctx)?,
-        };
-        let new_ref = Category::LocalBranch
-            .to_full_name(branch_name.as_str())
-            .map_err(anyhow::Error::from)?;
-
-        let mut guard = ctx.exclusive_worktree_access();
-        let perm = guard.write_permission();
-        if gitbutler_operating_modes::in_outside_workspace_mode(ctx, perm.read_permission())? {
-            let target = ctx.project_meta()?.target_ref;
-            let checked_out_target = ctx.repo.get()?.head_name()?.filter(|head| {
-                target.is_some_and(|target| target.as_local_full_name_ref() == head.as_ref())
-            });
-            // Alone on the target, the new branch goes on top of it and is checked out, as
-            // `git checkout -b` would. Beside any other branch, both go in the workspace.
-            if let Some(target) = checked_out_target {
-                let placement = BranchCreatePlacement::Dependent {
-                    relative_to: RelativeTo::Reference(target),
-                    side: InsertSide::Above,
-                };
-                branch_create_with_perm(ctx, Some(new_ref.clone()), placement, perm)?;
-            } else {
-                switch_back_to_workspace_with_perm(ctx, perm)?;
-            }
-        }
-
-        let mut meta = ctx.meta()?;
-        let (repo, mut ws, mut db) = ctx.workspace_mut_and_db_mut_with_perm(perm)?;
-        if ws
-            .find_segment_owner_indexes_by_refname(new_ref.as_ref())
-            .is_none()
-        {
-            let editor = Editor::create(&mut ws, &mut meta, &repo, &mut db)?;
-            but_workspace::branch::create_reference(editor, new_ref.as_ref(), None, branch.order)?
-                .materialize(Default::default())?;
-        }
-        let new_ws = &ws;
-
-        let (stack_idx, segment_idx) = new_ws
-            .find_segment_owner_indexes_by_refname(new_ref.as_ref())
-            .context("BUG: didn't find a stack that was just created")?;
-        let stack = &new_ws.stacks[stack_idx];
-        let tip = stack.segments[segment_idx]
-            .tip()
-            .unwrap_or(repo.object_hash().null());
-        let review_id = stack.segments[segment_idx]
-            .metadata
-            .as_ref()
-            .and_then(|meta| meta.review.pull_request);
-
-        let out = StackEntryNoOpt {
-            id: stack
-                .id
-                .context("BUG: all new stacks are created with an ID")?,
-            heads: vec![StackHeadInfo {
-                name: new_ref.shorten().into(),
-                review_id,
-                tip,
-                is_checked_out: false,
-            }],
-            tip,
-            order: Some(stack_idx),
-            is_checked_out: false,
-        };
-
-        drop((repo, db));
-        ctx.update_workspace_cache(ws);
-        out
-    };
-    Ok(stack_entry)
-}
-
-#[but_api]
-#[instrument(err(Debug))]
-pub fn delete_local_branch(
-    ctx: &mut but_ctx::Context,
-    refname: Refname,
-    given_name: String,
-) -> Result<()> {
-    let branch_refname = local_branch_refname(refname, &given_name)?;
-    let mut guard = ctx.exclusive_worktree_access();
-    let mut meta = ctx.legacy_meta_mut(guard.write_permission())?;
-    let (mut repo, mut ws, _) = ctx.workspace_mut_and_db_mut_with_perm(guard.write_permission())?;
-
-    if ws
-        .metadata
-        .as_ref()
-        .and_then(|metadata| {
-            metadata.find_stack_with_branch(branch_refname.as_ref(), StackKind::AppliedAndUnapplied)
-        })
-        .is_some_and(|stack| stack.is_in_workspace())
-    {
-        bail_precondition!("Cannot delete a branch that is applied in workspace");
-    }
-
-    if let Some(new_ws) = but_workspace::branch::remove_reference(
-        branch_refname.as_ref(),
-        &mut repo,
-        &ws,
-        &mut meta,
-        but_workspace::branch::remove_reference::Options {
-            avoid_anonymous_stacks: false,
-            keep_metadata: false,
-        },
-    )? {
-        drop(repo);
-        drop(ws);
-        ctx.update_workspace_cache(new_ws);
-    } else {
-        but_workspace::branch::remove_reference::delete_local_branch(
-            &mut repo,
-            branch_refname.as_ref(),
-        )?;
-        meta.remove(branch_refname.as_ref())?;
-        if let Some(metadata) = &mut ws.metadata {
-            metadata.remove_segment(branch_refname.as_ref());
-        }
-    }
-
-    Ok(())
-}
-
-fn local_branch_refname(refname: Refname, given_name: &str) -> Result<gix::refs::FullName> {
-    if let Ok(refname) = gix::refs::FullName::try_from(refname.to_string())
-        && refname.as_ref().category() == Some(Category::LocalBranch)
-    {
-        return Ok(refname);
-    }
-
-    Category::LocalBranch
-        .to_full_name(given_name)
-        .map_err(anyhow::Error::from)
-}
-
-/// Switch back to the workspace branch state.
-///
-/// This acquires exclusive worktree access from `ctx` before restoring the
-/// workspace branch.
-#[but_api]
-#[instrument(err(Debug))]
-pub fn switch_back_to_workspace(ctx: &mut but_ctx::Context) -> Result<BaseBranch> {
-    let mut guard = ctx.exclusive_worktree_access();
-    switch_back_to_workspace_with_perm(ctx, guard.write_permission())
-}
 
 #[instrument(skip(perm), err(Debug))]
 /// Switch back to the workspace branch using an existing exclusive permission token.
-///
-/// This variant is more composable than [`switch_back_to_workspace`] when the caller already
-/// holds a lock, as it reuses the provided permission token instead of obtaining exclusive access
-/// itself.
 pub fn switch_back_to_workspace_with_perm(
     ctx: &mut but_ctx::Context,
     perm: &mut RepoExclusive,
@@ -234,48 +60,6 @@ pub fn get_base_branch_data(
         Err(err) if err.is::<UnresolvedLegacyTargetRefError>() => Err(err),
         Err(_) => Ok(None),
     }
-}
-
-/// Set the base branch to `branch`, optionally updating `push_remote` as well.
-///
-/// This acquires exclusive worktree access from `ctx` before updating the base
-/// branch state.
-#[but_api]
-#[instrument(err(Debug))]
-pub fn set_base_branch(
-    ctx: &mut but_ctx::Context,
-    branch: String,
-    push_remote: Option<String>,
-) -> Result<BaseBranch> {
-    let mut guard = ctx.exclusive_worktree_access();
-    set_base_branch_with_perm(ctx, branch, push_remote, guard.write_permission())
-}
-
-#[instrument(skip(perm), err(Debug))]
-/// Set the base branch using an existing exclusive permission token.
-///
-/// This variant is more composable than [`set_base_branch`] when the caller already holds a lock,
-/// as it reuses the provided permission token instead of obtaining exclusive access itself.
-pub fn set_base_branch_with_perm(
-    ctx: &mut but_ctx::Context,
-    branch: String,
-    push_remote: Option<String>,
-    perm: &mut RepoExclusive,
-) -> Result<BaseBranch> {
-    let branch_name = format!("refs/remotes/{branch}")
-        .parse()
-        .context("Invalid branch name")?;
-    let base_branch = gitbutler_branch_actions::set_base_branch(ctx, &branch_name, perm)?;
-
-    // if they also sent a different push remote, set that too
-    if let Some(push_remote) = push_remote {
-        {
-            let repo = ctx.repo.get()?;
-            but_workspace::init::set_push_remote(&repo, push_remote)?;
-        }
-        ctx.invalidate_workspace_cache()?;
-    }
-    Ok(base_branch)
 }
 
 #[but_api]
@@ -737,16 +521,6 @@ pub fn list_branches(
     filter: Option<BranchListingFilter>,
 ) -> Result<Vec<BranchListing>> {
     let branches = gitbutler_branch_actions::list_branches(ctx, filter, None)?;
-    Ok(branches)
-}
-
-#[but_api]
-#[instrument(err(Debug))]
-pub fn get_branch_listing_details(
-    ctx: &but_ctx::Context,
-    branch_names: Vec<String>,
-) -> Result<Vec<BranchListingDetails>> {
-    let branches = gitbutler_branch_actions::get_branch_listing_details(ctx, branch_names)?;
     Ok(branches)
 }
 

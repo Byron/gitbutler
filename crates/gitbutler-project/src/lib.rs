@@ -1,7 +1,6 @@
 pub mod api;
 mod controller;
 mod default_true;
-pub mod gerrit;
 mod project;
 mod storage;
 
@@ -13,18 +12,9 @@ use project::ApiProject;
 pub use project::{AddProjectOutcome, FetchResult, Project};
 pub use storage::UpdateRequest;
 
-/// The maximum size of files to automatically start tracking, i.e. untracked files we pick up for tree-creation.
-/// **Inactive for now** while it's hard to tell if it's safe *not* to pick up everything.
-pub const AUTO_TRACK_LIMIT_BYTES: u64 = 0;
-
 pub fn get(id: ProjectHandleOrLegacyProjectId) -> anyhow::Result<Project> {
     let controller = Controller::from_path(but_path::app_data_dir()?);
     controller.get(id)
-}
-
-pub fn get_validated(id: ProjectHandleOrLegacyProjectId) -> anyhow::Result<Project> {
-    let controller = Controller::from_path(but_path::app_data_dir()?);
-    controller.get_validated(id)
 }
 
 pub fn get_raw(id: ProjectHandleOrLegacyProjectId) -> anyhow::Result<Project> {
@@ -63,11 +53,6 @@ pub fn add_at_app_data_dir(
 pub fn dangerously_list_projects_without_migration() -> anyhow::Result<Vec<Project>> {
     let controller = Controller::from_path(but_path::app_data_dir()?);
     controller.list()
-}
-
-pub fn delete(id: ProjectHandleOrLegacyProjectId) -> anyhow::Result<()> {
-    let controller = Controller::from_path(but_path::app_data_dir()?);
-    controller.delete(id)
 }
 
 /// Testing purpose only.
