@@ -1,5 +1,7 @@
 use std::fs;
 
+use snapbox::IntoData as _;
+
 use crate::{
     command::util::add_dirty_worktree,
     utils::{CommandExt, Sandbox},
@@ -19,6 +21,47 @@ fn rejects_unnamed_segment_as_target() {
 Error: Cannot operate on anonymous branch 'g0'
 
 Hint: Name it with `but reword g0` first! Note that the short ID is likely to change when the branch is named.
+
+"#]]);
+}
+
+#[test]
+fn git_revision_target_hints_git_diff() {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks");
+    env.setup_metadata(&["A", "B"]);
+
+    // Git revisions and ranges are not CLI IDs, so point at the Git command that diffs them.
+    env.but("diff HEAD~1")
+        .assert()
+        .failure()
+        .stdout_eq(snapbox::str![])
+        .stderr_eq(snapbox::str![[r#"
+Error: Could not find target: 'HEAD~1'
+
+Hint: To diff it as a Git revision, run `git diff HEAD~1`. Run `but status` for applicable targets.
+
+"#]]);
+
+    env.but("diff main...HEAD")
+        .assert()
+        .failure()
+        .stdout_eq(snapbox::str![])
+        .stderr_eq(snapbox::str![[r#"
+Error: Could not find target: 'main...HEAD'
+
+Hint: To diff it as a Git revision, run `git diff main...HEAD`. Run `but status` for applicable targets.
+
+"#]]);
+
+    // Anything Git can't resolve either keeps the generic hint.
+    env.but("diff nonexistent")
+        .assert()
+        .failure()
+        .stdout_eq(snapbox::str![])
+        .stderr_eq(snapbox::str![[r#"
+Error: Could not find target: 'nonexistent'
+
+Hint: Run `but status` for applicable targets.
 
 "#]]);
 }
@@ -223,6 +266,114 @@ No diff available - file is either empty, binary, or too large
 }
 
 #[test]
+fn committed_hunk() {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("zero-stacks");
+    env.setup_metadata(&[]);
+
+    env.file("file.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
+    env.but("commit -m base").assert().success();
+    env.file("file.txt", "one\n2\n3\n4\n5\n6\n7\n8\n9\nten\n");
+    env.file("new.txt", "new\n");
+    env.but("commit -m change")
+        .assert()
+        .success()
+        .stdout_eq(snapbox::str![[r#"
+Created commit ryk on branch 'a-branch-1'
+
+"#]]);
+
+    // The commit diff prints one committed hunk ID per hunk.
+    env.but("diff ryk")
+        .assert()
+        .success()
+        .stdout_eq(snapbox::str![[r#"
+──────────────────╮
+ r:u:1 M file.txt │
+──────────────────╯
+
+@@ -1,4 +1,4 @@
+───────────────
+1 ┊   │ -1
+  ┊ 1 │ +one
+2 ┊ 2 │  2
+3 ┊ 3 │  3
+4 ┊ 4 │  4
+
+──────────────────╮
+ r:u:9 M file.txt │
+──────────────────╯
+
+@@ -7,4 +7,4 @@
+───────────────
+ 7 ┊  7 │  7
+ 8 ┊  8 │  8
+ 9 ┊  9 │  9
+10 ┊    │ -10
+   ┊ 10 │ +ten
+
+─────────────────╮
+ r:s:b A new.txt │
+─────────────────╯
+
+@@ -1,0 +1,1 @@
+───────────────
+  ┊ 1 │ +new
+
+"#]]);
+
+    // Passing one of those IDs back shows only that hunk, under the same ID.
+    env.but("diff r:u:9")
+        .assert()
+        .success()
+        .stdout_eq(snapbox::str![[r#"
+──────────────────╮
+ r:u:9 M file.txt │
+──────────────────╯
+
+@@ -7,4 +7,4 @@
+───────────────
+ 7 ┊  7 │  7
+ 8 ┊  8 │  8
+ 9 ┊  9 │  9
+10 ┊    │ -10
+   ┊ 10 │ +ten
+
+"#]]);
+    // JSON keeps the file's status.
+    env.but("diff --json r:s:b")
+        .allow_json()
+        .assert()
+        .success()
+        .stdout_eq(
+            snapbox::str![[r#"
+{
+  "changes": [
+    {
+      "id": "r:s:b",
+      "path": "new.txt",
+      "status": "added",
+      "diff": {
+        "type": "patch",
+        "hunks": [
+          {
+            "oldStart": 1,
+            "oldLines": 0,
+            "newStart": 1,
+            "newLines": 1,
+            "diff": "@@ -1,0 +1,1 @@\n+new\n"
+          }
+        ]
+      }
+    }
+  ]
+}
+
+"#]]
+            .raw(),
+        );
+}
+
+#[test]
 fn worktree() {
     let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks");
     env.setup_metadata(&["A", "B"]);
@@ -256,7 +407,7 @@ fn worktree() {
     {
       "id": "[..]",
       "path": "note.txt",
-      "status": "modified",
+      "status": "added",
       "diff": {
         "type": "patch",
         "hunks": [
@@ -306,7 +457,7 @@ fn bare_diff_in_a_linked_worktree_shows_its_changes() {
 fn bare_diff_in_an_unmanaged_worktree_is_refused() {
     let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks");
     env.setup_metadata(&["A", "B"]);
-    let wt_dir = add_dirty_worktree(&env, "wt-feature", "A");
+    let wt_dir = super::util::add_unmanaged_worktree(&env, "wt-feature");
     env.file("main.txt", "dirty in main\n");
 
     env.but("diff")

@@ -80,10 +80,7 @@ fn failed_pick_switch_to_existing_branch_rolls_back_materialization() {
         .assert()
         .failure()
         .stderr_eq(str![[r#"
-Error: Could not safely check out 'refs/heads/other' from [..] to [..]
-
-Caused by:
-    Uncommitted files would be overwritten by checkout: "first"
+Error: Uncommitted files would be overwritten by checkout: "first"
 
 "#]]);
 
@@ -159,10 +156,7 @@ fn failed_pick_switch_restores_ad_hoc_stack_refs() {
         .assert()
         .failure()
         .stderr_eq(str![[r#"
-Error: Could not safely check out 'refs/heads/bottom' from [..] to [..]
-
-Caused by:
-    Uncommitted files would be overwritten by checkout: "first.txt"
+Error: Uncommitted files would be overwritten by checkout: "first.txt"
 
 "#]]);
 
@@ -743,7 +737,7 @@ Picked d3e2ba3 onto branch 'wt-inside' to create olw
 fn pick_in_an_unmanaged_worktree_needs_a_target() {
     let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks");
     env.setup_metadata(&["A", "B"]);
-    let wt_dir = super::util::add_worktree_with_commit(&env, "wt-inside", "A");
+    let wt_dir = super::util::add_unmanaged_worktree(&env, "wt-inside");
 
     env.but("pick lrm")
         .current_dir(&wt_dir)

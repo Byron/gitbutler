@@ -13,8 +13,6 @@ mod commit_cherry_pick;
 mod commit_linked_worktree;
 mod commit_uncommit;
 #[cfg(feature = "legacy")]
-mod discard_worktree_changes;
-#[cfg(feature = "legacy")]
 mod forge_info;
 #[cfg(all(feature = "legacy", not(feature = "graph-workspace")))]
 mod forge_pr_association;

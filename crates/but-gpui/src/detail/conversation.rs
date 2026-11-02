@@ -58,7 +58,7 @@ impl Detail {
                     .tooltip(Tooltip::text(error_summary(err)))
                     .into_any_element(),
             ),
-            Some(Ok(remarks)) if remarks.is_empty() => {
+            Some(Ok(said)) if said.remarks.is_empty() => {
                 Some(quiet("No comments").into_any_element())
             }
             Some(Ok(_)) => None,
@@ -86,7 +86,7 @@ impl Detail {
         let store = self.store.read(cx);
         let github = store.workspace(project).and_then(|ws| ws.forge) == Some(Forge::GitHub);
         match store.conversation(project, number) {
-            Some(Ok(remarks)) if github => remarks.len(),
+            Some(Ok(said)) if github => said.remarks.len(),
             _ => 0,
         }
     }
@@ -100,10 +100,51 @@ impl Detail {
         theme: &Theme,
         cx: &Context<Self>,
     ) -> Option<Div> {
-        let Some(Ok(remarks)) = self.store.read(cx).conversation(project, number) else {
+        let Some(Ok(said)) = self.store.read(cx).conversation(project, number) else {
             return None;
         };
-        Some(self.remark(remarks.get(ix)?, theme, cx))
+        Some(self.remark(said.remarks.get(ix)?, theme, cx))
+    }
+
+    /// The reactions to the description of pull request `number` of `project`, as GitHub's:
+    /// a pill of each kind with how many left it, named in its tooltip.
+    pub(super) fn reactions(
+        &self,
+        project: &ProjectId,
+        number: u64,
+        theme: &Theme,
+        cx: &App,
+    ) -> Option<Div> {
+        let Some(Ok(said)) = self.store.read(cx).conversation(project, number) else {
+            return None;
+        };
+        if said.reactions.is_empty() {
+            return None;
+        }
+        let pills = said.reactions.iter().map(|reaction| {
+            let names: Vec<_> = (reaction.people.iter())
+                .map(|person| person.login.as_str())
+                .collect();
+            h_flex()
+                .id(ElementId::Name(
+                    format!("reaction-{}", reaction.emoji).into(),
+                ))
+                .h(dp(24.))
+                .px(dp(8.))
+                .gap(dp(5.))
+                .rounded_full()
+                .border_1()
+                .border_color(theme.border_2)
+                .text_size(dp(12.))
+                .child(reaction.emoji.clone())
+                .child(
+                    div()
+                        .text_color(theme.text_2)
+                        .child(reaction.count.to_string()),
+                )
+                .tooltip(Tooltip::text(names.join(", ")))
+        });
+        Some(h_flex().flex_wrap().gap(dp(6.)).children(pills))
     }
 
     /// A comment or review as Lite's card, or a thread, set in under the review that started it.
@@ -112,17 +153,23 @@ impl Detail {
         match remark {
             Remark::Comment(note) => card
                 .child(header(note, None, false, theme))
-                .child(markdown::render(&note.url, &note.body, theme)),
+                .child(self.note_body(note, theme, cx)),
             Remark::Review { verdict, note } => card
                 .child(header(note, Some(*verdict), false, theme))
                 .when(!note.body.is_empty(), |el| {
-                    el.child(markdown::render(&note.url, &note.body, theme))
+                    el.child(self.note_body(note, theme, cx))
                 }),
             // Under its review, in line with the review's words.
             Remark::Thread { thread, in_review } => div()
                 .when(*in_review, |el| el.pl(dp(14.)))
                 .child(self.thread(thread, theme, cx)),
         }
+    }
+
+    /// What `note` says, its text selectable.
+    fn note_body(&self, note: &Note, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        let select = self.note_select(&note.url, cx);
+        markdown::render(&note.url, &note.body, Some(select), theme)
     }
 
     /// A thread as Lite's: a row naming where it hangs that folds it, then the lines it's on
@@ -219,7 +266,7 @@ impl Detail {
                                         el.pt(dp(10.)).border_t_1().border_color(theme.border_3)
                                     })
                                     .child(header(note, None, true, theme))
-                                    .child(markdown::render(&note.url, &note.body, theme))
+                                    .child(self.note_body(note, theme, cx))
                             })),
                     ),
                 )

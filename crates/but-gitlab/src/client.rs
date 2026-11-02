@@ -100,13 +100,11 @@ impl GitLabClient {
             .timeout(GITLAB_REQUEST_TIMEOUT)
             .build()?;
 
-        let base_url = if host.ends_with("/api/v4") {
-            host.to_string()
-        } else if host.ends_with('/') {
-            format!("{host}api/v4")
-        } else {
-            format!("{host}/api/v4")
-        };
+        let trimmed = host.trim_end_matches('/');
+        let base_url = format!(
+            "{}/api/v4",
+            trimmed.strip_suffix("/api/v4").unwrap_or(trimmed)
+        );
         // reqwest rejects a URL without a scheme and host at request time with a
         // generic builder error; check the same rule up front so the user is told
         // what is wrong with the host they entered.
@@ -1067,7 +1065,12 @@ struct GitLabMergeRequest {
     description: Option<String>,
     author: Option<GitLabApiUser>,
     labels: Vec<String>,
-    draft: bool,
+    // GitLab 15.4 replaced `work_in_progress` with `draft`, so older
+    // instances only send the former. Either one being set means a draft.
+    #[serde(default)]
+    draft: Option<bool>,
+    #[serde(default)]
+    work_in_progress: bool,
     source_branch: String,
     target_branch: String,
     sha: Option<String>,
@@ -1106,7 +1109,7 @@ impl From<GitLabMergeRequest> for MergeRequest {
             description: mr.description,
             author,
             labels: mr.labels.into_iter().map(Into::into).collect(),
-            draft: mr.draft,
+            draft: mr.draft.unwrap_or(mr.work_in_progress),
             source_branch: mr.source_branch,
             target_branch: mr.target_branch,
             sha: mr.sha.unwrap_or_default(),
@@ -1369,7 +1372,8 @@ mod tests {
             description: None,
             author: None,
             labels: vec![],
-            draft: false,
+            draft: Some(false),
+            work_in_progress: false,
             source_branch: "feature".into(),
             target_branch: "main".into(),
             sha: Some("1234567890abcdef1234567890abcdef12345678".into()),
@@ -1429,7 +1433,8 @@ mod tests {
             description: None,
             author: None,
             labels: vec![],
-            draft: false,
+            draft: Some(false),
+            work_in_progress: false,
             source_branch: "feature".into(),
             target_branch: "main".into(),
             sha: Some("1234567890abcdef1234567890abcdef12345678".into()),
@@ -1463,7 +1468,8 @@ mod tests {
             description: None,
             author: None,
             labels: vec![],
-            draft: false,
+            draft: Some(false),
+            work_in_progress: false,
             source_branch: "feature".into(),
             target_branch: "main".into(),
             sha: Some("1234567890abcdef1234567890abcdef12345678".into()),

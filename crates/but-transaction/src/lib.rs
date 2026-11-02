@@ -34,6 +34,10 @@ use gix::{
 #[cfg(test)]
 mod tests;
 
+/// Running transactions while a branch is checked out on its own, as the CLI and the GUI do.
+#[cfg(feature = "legacy")]
+pub mod single_branch_mode;
+
 /// Run a workspace transaction.
 ///
 /// This allows chaining multiple operations and having them all succeed or fail together.
@@ -498,9 +502,16 @@ where
         })
     }
 
-    pub fn tear_off_branch(&mut self, source_branch: &FullNameRef) -> anyhow::Result<()> {
+    /// Take `source_branch` out of its stack into a stack of its own, placed among the others
+    /// at `order`, or after them all, as [`but_workspace::branch::tear_off_branch()`] says.
+    pub fn tear_off_branch(
+        &mut self,
+        source_branch: &FullNameRef,
+        order: impl Into<Option<usize>>,
+    ) -> anyhow::Result<()> {
+        let order = order.into();
         self.rebase(|editor, _| {
-            let rebase = but_workspace::branch::tear_off_branch(editor, source_branch)?;
+            let rebase = but_workspace::branch::tear_off_branch(editor, source_branch, order)?;
             Ok(((), rebase))
         })?;
 
@@ -513,6 +524,8 @@ where
     /// metadata or require it to appear in the current checkout's projection. It can be used
     /// with [`Transaction::checkout`] to prepare an independent branch before switching to it.
     /// The reference is available to subsequent operations and is removed on rollback or dry run.
+    /// Like [`Transaction::create_reference`], it refuses a name that's taken locally or by a
+    /// remote's branch, or that nests with another branch's.
     pub fn create_reference_at_commit(
         &mut self,
         ref_name: &FullNameRef,
@@ -522,6 +535,12 @@ where
             ref_name.category() == Some(gix::refs::Category::LocalBranch),
             "Can only create local branches under refs/heads"
         );
+        // As `create_reference` refuses: a name a remote's branch has, which the new branch would
+        // take as its own, or one nesting with another, which a ref edit doesn't notice packed.
+        if but_core::branch::find_unique_refname(self.repo(), ref_name)?.as_ref() != ref_name {
+            but_error::bail_precondition!("Reference '{}' already exists", ref_name.shorten());
+        }
+        but_core::branch::refuse_colliding_refname(self.repo(), ref_name, None)?;
         let commit_id = self.inner.commit_mappings.map(commit_id);
         self.repo().reference(
             ref_name,

@@ -22,7 +22,7 @@ const types: Array<MetaCountType> = [
 ];
 
 const meta = preview.meta({
-	title: "Sidebar/MetaCount",
+	title: "Content & status/MetaCount",
 	id: "components-metacount",
 	component: MetaCount,
 	parameters: {

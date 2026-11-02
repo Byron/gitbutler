@@ -4,17 +4,20 @@
 //! is. Only whether an open one can merge is asked as the tab shows it, as the cache doesn't
 //! keep that.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Div, Hsla, MouseButton, Role,
-    ScrollHandle, SharedString, Stateful, Toggled, Window, div, list, prelude::*,
+    ScrollHandle, SharedString, Stateful, Toggled, Window, div, list, prelude::*, relative,
 };
 
-use super::panes::measured;
-use super::resolve::{banner_action, warn_banner};
+use super::diff_view::pressed;
+use super::panes::{editable_title, measured, reword_editor};
 use super::{Detail, PageFold};
 use crate::backend::reviews::MergeMethod;
-use crate::backend::{CheckRun, Forge, FullName, Review, ReviewState};
-use crate::overlays::MenuItem;
+use crate::backend::{CheckRun, CheckState, Forge, FullName, Remark, Review, ReviewState};
+use crate::overlays::{MenuItem, has_keys};
 use crate::pr::{Mergeability, Offer};
 use crate::state::{ProjectId, Selection, snack};
 use crate::theme::Theme;
@@ -24,9 +27,9 @@ use crate::ui::person::forge_avatar;
 use crate::ui::review as ui_review;
 use crate::ui::scrollbar::{Scroll, scrolled};
 use crate::ui::{
-    ButtonStyle, Icon, Tooltip, ago, button, count_badge, dot, dp, dropdown_button, duration,
-    h_flex, icon, keep_focus_on_press, local_time, muted, now, plural, relative_time, shortcut,
-    small_icon, switch_grounds, switch_spring, tab_stop, v_flex,
+    ButtonStyle, Icon, TextPoint, Tooltip, ago, button, count_badge, dot, dp, dropdown_button,
+    duration, h_flex, icon, icon_button, keep_focus_on_press, local_time, now, relative_time,
+    shortcut, small_icon, switch_grounds, switch_spring, tab_stop, v_flex,
 };
 
 /// How tall the tabs over the diff beside a list are.
@@ -39,7 +42,7 @@ const STALE_AFTER: i64 = 30 * 60;
 impl Detail {
     /// The selected branch's pull request, if it has one: the branch page's, the Branches
     /// page's, or the one the target commit selected, on the project page or in the
-    /// navigator, landed.
+    /// navigator, merged.
     pub(super) fn selected_review<'a>(&'a self, cx: &'a App) -> Option<&'a Review> {
         let store = self.store.read(cx);
         match &self.selection(cx)? {
@@ -78,10 +81,84 @@ impl Detail {
         }
     }
 
-    fn set_review_tab(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// Show the pull request's tab, or the changes'. The tabs keep the keys when they have
+    /// them; from anywhere else the keys go to what the tab shows.
+    pub(crate) fn set_review_tab(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.review_tab = on;
-        self.focus_files(window, cx);
+        match self.tabs_focus.is_focused(window) {
+            true => cx.notify(),
+            false => self.focus_files(window, cx),
+        }
         self.ask_forge(cx);
+    }
+
+    /// Whether the tabs have the keys.
+    pub(crate) fn tabs_focused(&self, window: &Window) -> bool {
+        self.tabs_focus.is_focused(window)
+    }
+
+    /// Give the keys to the tabs. Whether the page keeps them for coming back from the left
+    /// is up to how the keys next leave.
+    pub(crate) fn focus_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tabs_kept = false;
+        window.focus(&self.tabs_focus, cx);
+        cx.notify();
+    }
+
+    /// Whether coming back from the left lands on the tabs, as the keys last went left out of
+    /// them on this page.
+    pub(crate) fn tabs_kept(&self, cx: &App) -> bool {
+        self.tabs_kept && self.selected_review(cx).is_some()
+    }
+
+    /// Keep the tabs for coming back from the left, or forget them.
+    pub(crate) fn keep_tabs(&mut self, kept: bool) {
+        self.tabs_kept = kept;
+    }
+
+    /// ← or → on the tabs: the tab on that side, if there is one. Says whether there was.
+    pub(crate) fn step_tab(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // The pull request's tab is the right one.
+        if self.review_tab == forward {
+            return false;
+        }
+        self.set_review_tab(forward, window, cx);
+        true
+    }
+
+    /// ↑ on the tabs stays there, and from the top of the files under them goes up to them,
+    /// as it does from the top of the diff. Says whether it did either.
+    pub(super) fn up_to_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.tabs_focus.is_focused(window) {
+            return true;
+        }
+        let top = (self.listed_files(cx).first()).is_none_or(|&file| file == self.current_file());
+        let up = self.files_focus.is_focused(window) && top && self.selected_review(cx).is_some();
+        if up {
+            self.focus_tabs(window, cx);
+        }
+        up
+    }
+
+    /// ↓ from the tabs: down to the files under Changes, the file list or the files beside a
+    /// list page's list, or the diff while they're hidden. The pull request's tab has nothing
+    /// under it to take the keys. Says whether the tabs had them.
+    pub(super) fn down_from_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.tabs_focus.is_focused(window) {
+            return false;
+        }
+        match (self.review_tab, self.list_page(cx)) {
+            (true, _) => {}
+            (false, true) if self.beside_files_shown(cx) => self.focus_beside_files(window, cx),
+            (false, true) => self.focus(window, cx),
+            (false, false) => self.focus_files(window, cx),
+        }
+        true
     }
 
     /// The selected branch and its pull request, while the tab shows it open: what the merge
@@ -142,13 +219,87 @@ impl Detail {
         });
     }
 
+    /// What the pointer does to the text of the description or comment drawn as `id`, and
+    /// what of it is selected. A press selects as on the diff, and the drag goes on until the
+    /// button comes up anywhere on the tab.
+    pub(super) fn note_select(&self, id: &str, cx: &Context<Self>) -> markdown::Select {
+        let held = self.selecting && (self.note_selection.as_ref()).is_some_and(|(of, _)| of == id);
+        let (down, drag) = (cx.entity().downgrade(), cx.entity().downgrade());
+        let (down_id, drag_id) = (id.to_owned(), id.to_owned());
+        markdown::Select {
+            range: (self.note_range())
+                .filter(|(of, _)| *of == id)
+                .map(|(_, range)| range),
+            held,
+            down: Rc::new(move |at, text, event, _, cx| {
+                let (clicks, extend) = (event.click_count, event.modifiers.shift);
+                (down.update(cx, |this, cx| {
+                    let old = (this.note_selection.take())
+                        .filter(|(of, _)| *of == down_id)
+                        .map(|(_, range)| range);
+                    let range = pressed(old, at, text, clicks, extend);
+                    this.note_selection = Some((down_id.clone(), range));
+                    this.selecting = true;
+                    cx.notify();
+                }))
+                .ok();
+            }),
+            drag: Rc::new(move |at, _, cx| {
+                (drag.update(cx, |this, cx| {
+                    if let (true, Some((of, (_, head)))) =
+                        (this.selecting, &mut this.note_selection)
+                        && *of == drag_id
+                        && *head != at
+                    {
+                        *head = at;
+                        cx.notify();
+                    }
+                }))
+                .ok();
+            }),
+        }
+    }
+
+    /// The text selected in the description or a comment: which, by its id, and from where to
+    /// where, in order. None while it's empty.
+    pub(super) fn note_range(&self) -> Option<(&str, (TextPoint, TextPoint))> {
+        let (id, (anchor, head)) = self.note_selection.as_ref()?;
+        (anchor != head).then(|| (id.as_str(), (*anchor.min(head), *anchor.max(head))))
+    }
+
+    /// The text selected in the pull request's description or one of its comments.
+    pub(super) fn selected_note_text(&self, cx: &App) -> Option<String> {
+        let (id, range) = self.note_range()?;
+        let review = self.selected_review(cx)?;
+        let text = match id == description_id(review) {
+            true => markdown::selected_text(&markdown::parse(&review.body), range),
+            false => {
+                let project = self.selected_project(cx)?;
+                let store = self.store.read(cx);
+                let Some(Ok(said)) = store.conversation(&project, review.number) else {
+                    return None;
+                };
+                let note = (said.remarks.iter())
+                    .flat_map(|remark| match remark {
+                        Remark::Comment(note) | Remark::Review { note, .. } => {
+                            std::slice::from_ref(note)
+                        }
+                        Remark::Thread { thread, .. } => &thread.comments[..],
+                    })
+                    .find(|note| note.url == id)?;
+                markdown::selected_text(&note.body, range)
+            }
+        };
+        (!text.is_empty()).then_some(text)
+    }
+
     /// Merging, as Lite's Merge section: auto-merge as a switch and Merge with its method, each
     /// saying in its tooltip why it can't be pressed when GitHub's merge box wouldn't offer it.
     fn merge_section(&self, theme: &Theme, cx: &Context<Self>) -> Option<Div> {
         let (project, branch, review) = self.merge_box_review(cx)?;
         let store = self.store.read(cx);
         let merge = crate::pr::mergeability(store, project, review);
-        let (title, ..) = headline(&merge, theme);
+        let title = headline(&merge);
         let offer = merge.offer();
         // Turning auto-merge on or off shows at once, until the forge has it.
         let waiting = (store.auto_merge_on(project, review) != review.auto_merge)
@@ -231,16 +382,20 @@ impl Detail {
     }
 
     /// A branch or commit's tabs: its changes, with how many files, and its pull request,
-    /// with a glyph while its checks fail or run.
+    /// with a glyph while its checks fail or run. They take the keys as the panes do.
     pub(super) fn review_tabs(
         &self,
         review: &Review,
         theme: &Theme,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let files = (self.shown_diff().map(|diff| diff.files.len())).filter(|n| *n > 0);
         let checks = review.checks.filter(|c| c.failed > 0 || c.running > 0);
+        let solid = has_keys(&self.tabs_focus, window, cx);
         h_flex()
+            .track_focus(&self.tabs_focus)
+            .key_context("Tabs")
             // The first tab's label, not its hover ground, lines up with the text above.
             .ml(dp(-8.))
             .child(
@@ -249,6 +404,7 @@ impl Detail {
                     Icon::Diff,
                     "Changes",
                     !self.review_tab,
+                    solid,
                     theme,
                 )
                 .children(files.map(|n| count_badge(n, theme)))
@@ -266,6 +422,7 @@ impl Detail {
                         _ => format!("PR #{}", review.number),
                     },
                     self.review_tab,
+                    solid,
                     theme,
                 )
                 .children(checks.map(|checks| {
@@ -275,6 +432,19 @@ impl Detail {
                 .on_click(cx.listener(|this, _, window, cx| this.set_review_tab(true, window, cx))),
             )
             .into_any_element()
+    }
+
+    /// How wide the pull request tab was last drawn on a page like this one: beside a list
+    /// page's list, or on a branch's page. Kept apart, as the list makes them differ, so going
+    /// from one to the other lays the tab out for its width from the first frame. Not the
+    /// list page's own `beside_width`, which starts at nothing: the first tab drawn there would
+    /// take a frame to find room for its panel.
+    fn review_width(&self, cx: &App) -> &Rc<Cell<f32>> {
+        let [branch_page, list_page] = &self.review_width;
+        match self.list_page(cx) {
+            true => list_page,
+            false => branch_page,
+        }
     }
 
     /// How tall the tabs beside a list are, which the diff starts below: nothing when the
@@ -299,7 +469,7 @@ impl Detail {
         let Some(review) = self.selected_review(cx) else {
             return div().into_any_element();
         };
-        let two_columns = self.review_width.get() >= TWO_COLUMNS;
+        let two_columns = self.review_width(cx).get() >= TWO_COLUMNS;
         let (rows, drawn) = (
             LEAD + self.remarks_shown(project, review.number, cx),
             self.review_list.item_count(),
@@ -324,32 +494,56 @@ impl Detail {
         )
         .h_full();
         // Side by side, each scrolls on its own, so neither a long description nor a long
-        // list of checks takes the other out of sight. Narrow, the panel goes between the
-        // title and the description, so the page still opens on what the pull request is.
+        // list of checks takes the other out of sight. The panel is a pane of its own along
+        // the right edge, grey and edged as the navigator is, its cards under the header's
+        // actions, so the room the column leaves reads as margin. Narrow, the panel goes
+        // between the title and the description, so the page still opens on what the pull
+        // request is.
         let page = match two_columns {
-            true => h_flex()
-                .size_full()
-                .max_w(dp(1000. + 2. * 24.))
-                .child(column.min_w_0())
-                .child(
-                    scrolling(
-                        "review-side",
-                        "review-side-scrollbar",
-                        self.side(project, review, theme, cx)
-                            .pl(dp(12.))
-                            .pr(dp(24.)),
-                        &self.review_side_scroll,
-                        theme,
-                    )
-                    .flex_none()
-                    .w(dp(12. + PANEL_WIDTH + 24.)),
-                ),
+            true => h_flex().size_full().child(column.min_w_0()).child(
+                scrolling(
+                    "review-side",
+                    "review-side-scrollbar",
+                    div()
+                        .px(dp(PANEL_INSET))
+                        .child(self.side(project, review, theme, cx)),
+                    &self.review_side_scroll,
+                    theme,
+                )
+                .flex_none()
+                // Narrower in a narrower pane, so the column keeps its room and the panel stays
+                // beside it longer. Flex sizes it, so it's right on the frame the pane changes.
+                .w(relative(0.3))
+                .min_w(dp(PANEL_INSET + PANEL_MIN_WIDTH + PANEL_INSET))
+                .max_w(dp(PANEL_INSET + PANEL_WIDTH + PANEL_INSET))
+                .bg(theme.bg_2)
+                .border_l_1()
+                .border_color(theme.border_3),
+            ),
             false => column,
         };
-        let width = measured(&self.review_width, &self.app, |bounds| {
+        let width = measured(self.review_width(cx), &self.app, |bounds| {
             bounds.size.width.into()
         });
+        // A press on a note's text selects there before this sees it, and one anywhere else on
+        // the tab drops the selection. Letting go ends a drag, as on the diff's ground.
         (div().relative().flex_1().min_h_0().w_full())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if !this.selecting && this.note_selection.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.let_go(cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.let_go(cx)),
+            )
             .child(page)
             .child(width)
             .into_any_element()
@@ -363,7 +557,7 @@ impl Detail {
             return div().into_any_element();
         };
         let theme = Theme::get(cx);
-        let two_columns = self.review_width.get() >= TWO_COLUMNS;
+        let two_columns = self.review_width(cx).get() >= TWO_COLUMNS;
         // Each row's content and the room above it. The list ignores a row's own margins, so
         // the room and the column's sides go on a row of its own around the content.
         let (above, content) = match ix {
@@ -372,9 +566,16 @@ impl Detail {
                 20.,
                 (!two_columns).then(|| self.side(&project, review, theme, cx)),
             ),
+            // While it's edited, the editor above holds it.
             2 => (
                 if two_columns { 12. } else { 20. },
-                Some(description(review, theme)),
+                (self.shown_review_edit(&project, review, cx).is_none()).then(|| {
+                    let select = self.note_select(&description_id(review), cx);
+                    v_flex()
+                        .gap(dp(10.))
+                        .child(description(review, select, theme))
+                        .children(self.reactions(&project, review.number, theme, cx))
+                }),
             ),
             3 => (24., self.conversation(&project, review, theme, cx)),
             _ => (
@@ -393,54 +594,56 @@ impl Detail {
         }
         .pt(dp(above))
         .when(last, |el| el.pb(dp(24.)))
-        .child(content)
+        // Capped by a wrapper, so the description's wash still reaches past its text.
+        .child(div().max_w(dp(COLUMN_MAX_WIDTH)).child(content))
         .into_any_element()
     }
 
-    /// The tab's title, who opened it and when it last changed, under a banner when what it
-    /// shows has aged since the forge last answered.
-    fn head(&self, project: &ProjectId, review: &Review, theme: &Theme, cx: &App) -> Div {
-        let (_, stale) = self.freshness(project, review, theme, cx);
+    /// The tab's title, who opened it and when it last changed. A click on the title edits it
+    /// and the description in its place, on the forges the app can edit them on.
+    fn head(&self, project: &ProjectId, review: &Review, theme: &Theme, cx: &Context<Self>) -> Div {
         let title = match review.title.as_str() {
             "" => format!("Pull request #{}", review.number),
             title => title.to_owned(),
         };
+        let forge = (self.store.read(cx).workspace(project)).and_then(|ws| ws.forge);
+        let title = match (self.shown_review_edit(project, review, cx), forge) {
+            (Some((edit, saving)), _) => reword_editor(&edit.input, saving, theme),
+            (None, Some(Forge::GitHub | Forge::GitLab | Forge::Bitbucket)) => editable_title(
+                "review-title",
+                title,
+                "Edit title and description",
+                None,
+                theme,
+            )
+            .text_size(dp(18.))
+            .line_height(dp(24.))
+            .on_click(cx.listener(|this, _, window, cx| this.start_review_edit(window, cx)))
+            .into_any_element(),
+            (None, Some(Forge::Azure) | None) => div()
+                .text_size(dp(18.))
+                .line_height(dp(24.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child(title)
+                .into_any_element(),
+        };
         v_flex()
             .gap(dp(12.))
-            .children(stale)
-            .child(
-                div()
-                    .text_size(dp(18.))
-                    .line_height(dp(24.))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(title),
-            )
+            .child(title)
             .children(byline(review, theme))
     }
 
-    /// The panel of where the pull request stands: its checklist over its card of facts.
-    fn side(&self, project: &ProjectId, review: &Review, theme: &Theme, cx: &Context<Self>) -> Div {
-        let store = self.store.read(cx);
-        let forge =
-            (store.workspace(project).and_then(|ws| ws.forge)).map_or("the forge", Forge::name);
-        let state = store.review_state(project, review);
-        let (fresh, _) = self.freshness(project, review, theme, cx);
-        v_flex()
-            .gap(dp(12.))
-            .children(self.checklist(project, review, state, fresh, theme, cx))
-            .child(self.side_sections(project, review, state, forge, theme, cx))
-    }
-
-    /// How fresh what the tab shows is: a button that asks the forge again, saying when it
-    /// last answered, or once a failed ask has let what shows age, a banner saying so. Neither
-    /// for a merged or closed one, which is settled.
+    /// How fresh what the tab shows is: the button to ask the forge again, its tooltip saying
+    /// when it last answered, and once a failed ask has let what shows age, how old it is beside
+    /// it. Both sit on one line, so the warning coming and going moves nothing else. None for a
+    /// merged or closed one, which is settled.
     fn freshness(
         &self,
         project: &ProjectId,
         review: &Review,
         theme: &Theme,
         cx: &App,
-    ) -> (Option<crate::ui::Button>, Option<Stateful<Div>>) {
+    ) -> Option<Div> {
         let store = self.store.read(cx);
         let forge =
             (store.workspace(project).and_then(|ws| ws.forge)).map_or("the forge", Forge::name);
@@ -451,7 +654,7 @@ impl Detail {
             store.review_state(project, review),
             ReviewState::Merged | ReviewState::Closed
         ) {
-            return (None, None);
+            return None;
         }
         let ask = {
             let (store, project) = (self.store.clone(), project.clone());
@@ -461,174 +664,39 @@ impl Detail {
         };
         // A failed refresh is worth a warning only once what shows has aged; until then the
         // button to check again is enough.
-        if failed && synced.is_none_or(|at| now() - at > STALE_AFTER) {
-            let banner = warn_banner(
-                match synced {
-                    Some(at) => format!("Showing what {forge} said {}", ago(at)),
-                    None => format!("Showing what {forge} said last"),
-                },
-                format!("Couldn't update from {forge} just now."),
-                Some(
-                    banner_action("review-retry", "Try again", theme)
-                        .disabled_because(checking.then_some("Asking already"))
-                        .on_click(ask)
-                        .into_any_element(),
-                ),
-                theme,
-            );
-            return (None, Some(banner));
-        }
-        let fresh = button(
-            "review-check",
-            match synced {
-                _ if checking => "Checking…".to_owned(),
-                Some(at) => format!("Checked {}", ago(at)),
-                None => format!("Check {forge}"),
-            },
-        )
-        .icon(Icon::Refresh)
-        .small()
-        .style(ButtonStyle::Ghost)
-        .tooltip(format!("Ask {forge} again"))
-        .disabled_because(checking.then_some("Asking already"))
-        .on_click(ask);
-        (Some(fresh), None)
-    }
-
-    /// What stands between the pull request and merging, as Lite's checklist: where an open
-    /// one stands, over a row for each thing the forge has said about it. Its heading says
-    /// how fresh that is with `fresh`, the button to ask again.
-    fn checklist(
-        &self,
-        project: &ProjectId,
-        review: &Review,
-        state: ReviewState,
-        fresh: Option<impl IntoElement>,
-        theme: &Theme,
-        cx: &Context<Self>,
-    ) -> Option<Div> {
-        let store = self.store.read(cx);
-        let headline = (self.merge_box_review(cx)).map(|(project, _, review)| {
-            headline(&crate::pr::mergeability(store, project, review), theme)
-        });
-        // Waiting on reviewers or conflicts is news only while it's open.
-        let open = matches!(state, ReviewState::Open | ReviewState::Draft);
-        let mut rows: Vec<(String, Option<Hsla>)> = Vec::new();
-        if let Some(checks) = review.checks {
-            rows.push(match checks {
-                _ if checks.failed > 0 => ("Checks failed".into(), Some(theme.danger)),
-                _ if checks.running > 0 => ("Checks running".into(), Some(theme.warn)),
-                _ => ("Checks passed".into(), Some(theme.safe)),
-            });
-        }
-        // GitHub lists only the reviewers who haven't answered; the others keep everyone.
-        let github = store.workspace(project).and_then(|ws| ws.forge) == Some(Forge::GitHub);
-        if open && github && !review.reviewers.is_empty() {
-            let pending = plural(review.reviewers.len(), "review");
-            rows.push((format!("{pending} pending"), None));
-        }
-        let status = (store.merge_status(project, review.number))
-            .and_then(|status| status.as_ref().ok())
-            .filter(|_| open);
-        match status.and_then(|status| status.mergeable_state.as_deref()) {
-            Some("dirty" | "cannot_be_merged") => {
-                rows.push(("Merge conflicts".into(), Some(theme.warn)))
-            }
-            Some("clean" | "unstable" | "has_hooks" | "can_be_merged") => {
-                rows.push(("No conflicts".into(), Some(theme.safe)))
-            }
-            _ => {}
-        }
-        if headline.is_none() && rows.is_empty() && fresh.is_none() {
-            return None;
-        }
-        let clear = rows
-            .iter()
-            .filter(|(_, tone)| *tone == Some(theme.safe))
-            .count();
-        let mono = |text: String, color: Hsla| {
-            div()
-                .font_family(theme.mono_font.clone())
-                .text_size(dp(10.))
-                .text_color(color)
-                .child(text)
+        let stale = failed && synced.is_none_or(|at| now() - at > STALE_AFTER);
+        let tip = match synced {
+            _ if stale => format!("Couldn't update from {forge}. Try again"),
+            Some(at) => format!("Checked {}. Ask {forge} again", ago(at)),
+            None => format!("Ask {forge}"),
         };
-        Some(
-            card(theme)
-                .p(dp(14.))
-                .gap(dp(8.))
-                .child(
-                    // As tall as its words, with the button overhanging, so the rows below
-                    // stay put as it comes and goes.
-                    h_flex()
-                        .h(dp(14.))
-                        .gap(dp(8.))
-                        .child(mono("CHECKLIST".into(), theme.text_2))
-                        .when(!rows.is_empty(), |el| {
-                            el.child(mono(
-                                format!("{clear} of {} checks", rows.len()),
-                                theme.text_3,
-                            ))
-                        })
-                        .children(fresh.map(|fresh| div().ml_auto().mr(dp(-6.)).child(fresh))),
-                )
-                .children(headline.map(|(title, color, note)| {
-                    v_flex()
-                        .pb(dp(2.))
-                        .child(
-                            div()
-                                .text_size(dp(14.))
-                                .line_height(dp(18.))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(color)
-                                .child(title),
-                        )
-                        // An error can run long; its whole text is on hover.
-                        .children(note.map(|note| {
-                            muted(note.clone(), theme)
-                                .id("merge-note")
-                                .line_clamp(2)
-                                .text_ellipsis()
-                                .tooltip(Tooltip::text(note))
-                        }))
-                }))
-                .child(
-                    v_flex()
-                        .gap(dp(7.))
-                        .children(rows.into_iter().map(|(label, tone)| {
-                            let dot = match tone {
-                                Some(color) => dot(color),
-                                None => dot(gpui::transparent_black())
-                                    .border_1()
-                                    .border_color(theme.text_3),
-                            };
-                            h_flex()
-                                .gap(dp(8.))
-                                .text_size(dp(12.))
-                                .child(dot)
-                                .child(label)
-                        })),
-                ),
-        )
+        let button = icon_button("review-check", Icon::Refresh)
+            .small()
+            .tooltip(tip)
+            .disabled_because(checking.then(|| format!("Asking {forge}…")))
+            .on_click(ask);
+        let age = stale.then(|| {
+            div().text_color(theme.warn).child(match synced {
+                Some(at) => format!("{} old", relative_time(at)),
+                None => "Out of date".to_owned(),
+            })
+        });
+        Some(h_flex().gap(dp(6.)).children(age).child(button))
     }
 
-    /// The panel's card of facts, as Lite's: merging, the state and a link to it, the
-    /// checks, who's asked to review, labels, branches and when it was opened.
-    fn side_sections(
-        &self,
-        project: &ProjectId,
-        review: &Review,
-        state: ReviewState,
-        forge: &str,
-        theme: &Theme,
-        cx: &Context<Self>,
-    ) -> Div {
+    /// The panel of where the pull request stands, a card of facts as Lite's: merging, the
+    /// state and a link to it, the checks, who's asked to review, labels, branches and when it
+    /// was opened.
+    fn side(&self, project: &ProjectId, review: &Review, theme: &Theme, cx: &Context<Self>) -> Div {
         let store = self.store.read(cx);
-        let github = store.workspace(project).and_then(|ws| ws.forge) == Some(Forge::GitHub);
+        let forge = store.workspace(project).and_then(|ws| ws.forge);
+        let state = store.review_state(project, review);
+        let github = forge == Some(Forge::GitHub);
+        let forge = forge.map_or("the forge", Forge::name);
         let sections = [
             self.merge_section(theme, cx),
             Some(status_section(review, state, forge, theme)),
-            (!review.check_runs.is_empty()).then(|| self.checks_section(review, theme, cx)),
+            self.checks_section(project, review, theme, cx),
             reviewers_section(review, github, theme),
             labels_section(review, theme),
             self.branches_section(review, theme),
@@ -648,21 +716,67 @@ impl Detail {
         )
     }
 
-    /// The checks, as Lite's: a bar of how they stand and what that comes to, then those that
-    /// failed or still run, the news, with the rest folded under the heading.
-    fn checks_section(&self, review: &Review, theme: &Theme, cx: &Context<Self>) -> Div {
+    /// The checks, as GitHub's merge box has them: a bar of how they stand and what that comes
+    /// to, over every check, failed first, folded under it. A click anywhere on the bar and its
+    /// counts folds them. A pull request's open by themselves once any failed, the news, and stay
+    /// open, through a rerun too, until the reader folds them. The button to ask the forge again
+    /// sits by the heading, which shows on its own while the forge reports no checks.
+    fn checks_section(
+        &self,
+        project: &ProjectId,
+        review: &Review,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> Option<Div> {
         let runs = &review.check_runs;
-        let failed = runs.iter().filter(|run| run.failed == Some(true)).count();
-        let running = runs.iter().filter(|run| run.failed.is_none()).count();
-        let skipped = (runs.iter())
-            .filter(|run| run.failed == Some(false) && run.status == "Skipped")
-            .count();
-        let passed = runs.len() - failed - running - skipped;
+        // Overhanging the heading's line, so the rows below stay put as it comes and goes. It
+        // sits on what folds the checks, so a click on it, even while it's disabled, stops here.
+        let fresh = (self.freshness(project, review, theme, cx)).map(|fresh| {
+            div()
+                .id("checks-fresh")
+                .ml_auto()
+                .mr(dp(-6.))
+                .my(dp(-2.))
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(fresh)
+        });
+        let heading = || {
+            h_flex()
+                .min_h(dp(20.))
+                .gap(dp(4.))
+                .text_size(dp(12.))
+                .text_color(theme.text_2)
+        };
+        let section = || v_flex().gap(dp(8.)).pl(dp(14.)).pr(dp(12.)).py(dp(12.));
+        if runs.is_empty() {
+            let fresh = fresh?;
+            return Some(
+                // As the status row is: the heading, and opposite it what there is.
+                section().child(
+                    heading().justify_between().child("Checks").child(
+                        h_flex()
+                            .gap(dp(8.))
+                            .child(div().text_color(theme.text_3).child("None"))
+                            .child(fresh),
+                    ),
+                ),
+            );
+        }
+        let count = |states: &[CheckState]| {
+            (runs.iter())
+                .filter(|run| states.contains(&run.state))
+                .count()
+        };
+        let failed = count(&[CheckState::Failed, CheckState::Cancelled]);
+        let running = count(&[CheckState::Running]);
+        let queued = count(&[CheckState::Queued]);
+        let passed = count(&[CheckState::Passed]);
+        let skipped = count(&[CheckState::Skipped]);
         // Skipped ones ran nothing, so they're counted but take no room on the bar.
         let bar = h_flex().h(dp(6.)).gap(dp(2.)).children(
             [
                 (failed, theme.danger),
-                (running, theme.text_3),
+                (running + queued, theme.warn),
                 (passed, theme.safe),
             ]
             .into_iter()
@@ -681,8 +795,11 @@ impl Detail {
             .gap(dp(8.))
             .text_size(dp(12.))
             .children(
+                // In the bar's order.
                 [
                     (failed, format!("{failed} failed"), theme.danger),
+                    (running, format!("{running} running"), theme.warn),
+                    (queued, format!("{queued} queued"), theme.warn),
                     (
                         passed,
                         match passed == runs.len() {
@@ -691,66 +808,59 @@ impl Detail {
                         },
                         theme.safe,
                     ),
-                    (running, format!("{running} running"), theme.text_2),
                     (skipped, format!("{skipped} skipped"), theme.text_3),
                 ]
                 .into_iter()
                 .filter(|(n, ..)| *n > 0)
                 .map(|(_, text, color)| div().text_color(color).child(text)),
             );
-        let (live, rest): (Vec<_>, Vec<_>) =
-            (runs.iter().enumerate()).partition(|(_, run)| run.failed != Some(false));
-        let open = self.passed_checks_open;
-        let heading = h_flex()
-            .id("passed-checks")
-            .gap(dp(4.))
-            .ml(dp(-4.))
-            .text_size(dp(12.))
-            .text_color(theme.text_2)
-            .when(!rest.is_empty(), |el| {
-                let tip = match open {
-                    true => "Fold the checks that passed",
-                    false => "List the checks that passed",
-                };
-                el.role(Role::Button)
-                    .aria_label(tip)
-                    .child(fold::chevron("fold", open, theme.text_3))
-                    .tooltip(Tooltip::text(tip))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.passed_checks_open = !this.passed_checks_open;
-                        let open = this.passed_checks_open;
-                        this.page_folds.start(PageFold::PassedChecks, open, cx);
-                        cx.notify();
-                    }))
-            })
-            .child("Checks");
-        v_flex()
+        let key = (project.clone(), review.number);
+        // Opening by itself counts as the reader's choice, so a rerun that takes the failure
+        // back to queued doesn't fold the list away while they watch it.
+        let open = {
+            let mut opened = self.checks_open.borrow_mut();
+            match opened.get(&key) {
+                Some(&open) => open,
+                None if failed > 0 => {
+                    opened.insert(key.clone(), true);
+                    true
+                }
+                None => false,
+            }
+        };
+        let tip = match open {
+            true => "Fold the checks",
+            false => "List the checks",
+        };
+        let summary = v_flex()
+            .id("checks-fold")
+            .role(Role::Button)
+            .aria_label(tip)
             .gap(dp(8.))
-            .pl(dp(14.))
-            .pr(dp(12.))
-            .py(dp(12.))
-            .child(h_flex().min_h(dp(20.)).child(heading))
+            .child(
+                heading()
+                    .ml(dp(-4.))
+                    .child(fold::chevron("fold", open, theme.text_3))
+                    .child("Checks")
+                    .children(fresh),
+            )
             .child(bar)
             .child(counts)
-            .map(|el| {
-                let checks = |runs: &[(usize, &CheckRun)]| {
-                    (runs.iter().map(|(ix, run)| check_row(*ix, run, theme))).collect::<Vec<_>>()
-                };
-                // Alone under the counts, the gap above them folds with them.
-                let alone = live.is_empty();
-                let passed = (self.page_folds.shows(&PageFold::PassedChecks, open)).then(|| {
-                    let rows = v_flex().when(alone, |el| el.pt(dp(8.)));
-                    (self.page_folds).reveal(&PageFold::PassedChecks, rows.children(checks(&rest)))
-                });
-                el.when(!alone || passed.is_some(), |el| {
-                    el.child(
-                        v_flex()
-                            .when(alone, |el| el.mt(dp(-8.)))
-                            .children(checks(&live))
-                            .children(passed),
-                    )
-                })
-            })
+            .tooltip(Tooltip::text(tip))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.checks_open.borrow_mut().insert(key.clone(), !open);
+                this.page_folds.start(PageFold::Checks, !open, cx);
+                cx.notify();
+            }));
+        // The gap above the list folds with it.
+        let list = (self.page_folds.shows(&PageFold::Checks, open)).then(|| {
+            let rows = (runs.iter().enumerate()).map(|(ix, run)| check_row(ix, run, theme));
+            let rows = v_flex().pt(dp(8.)).children(rows);
+            div()
+                .mt(dp(-8.))
+                .child(self.page_folds.reveal(&PageFold::Checks, rows))
+        });
+        Some(section().child(summary).children(list))
     }
 
     /// The branch it merges from, a click copying its name, and the one it merges into.
@@ -803,11 +913,22 @@ impl Detail {
 }
 
 /// How wide, in design pixels, the pull request tab must be for its panel to sit beside the
-/// description, as Lite's breakpoint.
-pub(super) const TWO_COLUMNS: f32 = 720.;
+/// description: where the column, beside the narrowest panel, would get under about 300.
+pub(super) const TWO_COLUMNS: f32 = 640.;
 
-/// How wide the panel beside the description is, as Lite's.
+/// How wide the panel beside the description gets, as Lite's.
 const PANEL_WIDTH: f32 = 315.;
+
+/// How narrow the panel beside the description gets in a narrow pane: as narrow as the merge
+/// row fits on one line.
+const PANEL_MIN_WIDTH: f32 = 272.;
+
+/// The room on each side of the panel's cards: the header's, so they line up under its actions.
+const PANEL_INSET: f32 = 16.;
+
+/// How wide the column's content gets, so a description's lines stay short enough to read and
+/// 120 columns of code still fit.
+const COLUMN_MAX_WIDTH: f32 = 840.;
 
 /// The rows of the tab's column before what's been said: the title, the panel, empty while it's
 /// beside the column so a change of layout adds or takes no row, the description and the
@@ -823,26 +944,14 @@ fn merge_label(method: Option<MergeMethod>) -> &'static str {
     }
 }
 
-/// Where an open pull request stands on merging, in a few words and a colour, with more
-/// when there's more to say.
-fn headline(merge: &Mergeability, theme: &Theme) -> (SharedString, Hsla, Option<SharedString>) {
+/// Where an open pull request stands on merging, in a few words.
+fn headline(merge: &Mergeability) -> SharedString {
     match merge {
-        Mergeability::AutoMerging => (
-            "Auto-merge is on".into(),
-            theme.safe,
-            Some("It merges once its required checks and reviews pass".into()),
-        ),
-        Mergeability::Ready(note) => ("Ready to merge".into(), theme.safe, note.map(Into::into)),
-        Mergeability::Waiting(why) => (why.clone().into(), theme.warn, None),
-        Mergeability::Blocked(why) => (why.clone().into(), theme.warn, None),
-        Mergeability::Unknown(None) => {
-            ("Checking whether it can merge…".into(), theme.text_3, None)
-        }
-        Mergeability::Unknown(Some(err)) => (
-            "Couldn't ask whether it can merge".into(),
-            theme.warn,
-            Some(err.clone().into()),
-        ),
+        Mergeability::AutoMerging => "Auto-merge is on".into(),
+        Mergeability::Ready(_) => "Ready to merge".into(),
+        Mergeability::Waiting(why) | Mergeability::Blocked(why) => why.clone().into(),
+        Mergeability::Unknown(None) => "Checking whether it can merge…".into(),
+        Mergeability::Unknown(Some(_)) => "Couldn't ask whether it can merge".into(),
     }
 }
 
@@ -953,8 +1062,13 @@ fn byline(review: &Review, theme: &Theme) -> Option<Div> {
     Some(row)
 }
 
+/// The id the description of `review` is drawn with.
+fn description_id(review: &Review) -> String {
+    format!("review-{}", review.number)
+}
+
 /// The description, on a wash just wider than its text, as Lite's card; or that there's none.
-fn description(review: &Review, theme: &Theme) -> Div {
+fn description(review: &Review, select: markdown::Select, theme: &Theme) -> Div {
     let body = markdown::parse(&review.body);
     if body.is_empty() {
         return div()
@@ -970,8 +1084,9 @@ fn description(review: &Review, theme: &Theme) -> Div {
         // Halfway from the page to the first grey step, as Lite's: a passage, not a panel.
         .bg(theme.bg_1.blend(theme.bg_2.opacity(0.5)))
         .child(markdown::render(
-            &format!("review-{}", review.number),
+            &description_id(review),
             &body,
+            Some(select),
             theme,
         ))
 }
@@ -1131,63 +1246,105 @@ fn labels_section(review: &Review, theme: &Theme) -> Option<Div> {
     Some(side_section("Labels", None, theme).child(h_flex().flex_wrap().gap(dp(4.)).children(tags)))
 }
 
-/// A check, as Lite's: a dot for how it stands, its name over how it finished and how long
-/// it took; a click opens its log.
+/// A check on one line, as GitHub lists them: a cross for one that failed, grey once
+/// cancelled, a dot while it runs, a ring while it waits for a runner, a tick, or a dash for
+/// one skipped or neutral; its name, keeping the end that tells a matrix's jobs apart; and how
+/// long it took or has run, or what became of it when that says more. A click opens its log,
+/// as the arrow in place of the time says on hover.
 fn check_row(ix: usize, run: &CheckRun, theme: &Theme) -> Stateful<Div> {
-    let color = match run.failed {
-        Some(true) => theme.danger,
-        None => theme.warn,
-        Some(false) if run.status == "Skipped" => theme.text_3,
-        Some(false) => theme.safe,
+    let glyph =
+        |glyph, color| (small_icon(glyph).size(dp(14.)).text_color(color)).into_any_element();
+    let took =
+        (run.started_at.zip(run.completed_at)).map(|(start, end)| duration((end - start).max(0)));
+    let mark = match run.state {
+        CheckState::Failed => glyph(Icon::Cross, theme.danger),
+        CheckState::Cancelled => glyph(Icon::Cross, theme.text_3),
+        CheckState::Running => dot(theme.warn).size(dp(8.)).into_any_element(),
+        CheckState::Queued => (dot(gpui::transparent_black()).size(dp(8.)).border_1())
+            .border_color(theme.warn)
+            .into_any_element(),
+        CheckState::Passed => glyph(Icon::Tick, theme.safe),
+        CheckState::Skipped => glyph(Icon::Minus, theme.text_3),
     };
-    let status = match (run.started_at, run.completed_at) {
-        (Some(start), Some(end)) => format!("{} · {}", run.status, duration((end - start).max(0))),
-        // How long it's run so far.
-        (Some(start), None) => format!("{} · {}", run.status, relative_time(start)),
-        (None, _) => run.status.clone(),
+    let aside = match (run.note, run.state) {
+        (Some(note), _) => Some(note.to_owned()),
+        (None, CheckState::Running) => run.started_at.map(relative_time),
+        (None, _) => took,
     };
-    let url = run.url.clone();
+    // A matrix job's name ends in what tells it from its siblings, "(macos)", so that end
+    // stays in sight while the start gives way.
+    let (start, end) = match run.name.rsplit_once(" (") {
+        Some((start, end)) if end.ends_with(')') => (start.to_owned(), Some(format!("({end}"))),
+        _ => (run.name.clone(), None),
+    };
+    let name = h_flex()
+        .id(("check-name", ix))
+        .flex_grow(1.)
+        .min_w_0()
+        // A space's width, which a space in the text would add to what truncating leaves.
+        .gap(dp(3.))
+        .child(div().min_w_0().flex_shrink(1000.).truncate().child(start))
+        .children(end.map(|end| div().min_w_0().truncate().child(end)))
+        .tooltip(Tooltip::text(run.name.clone()));
+    let link = !run.url.is_empty();
     let group = SharedString::from("check-row");
+    let aside = div()
+        .flex_none()
+        .relative()
+        .min_w(dp(12.))
+        .text_color(theme.text_3)
+        .child(
+            div()
+                .when(link, |el| {
+                    el.group_hover(group.clone(), |el| el.opacity(0.))
+                })
+                .children(aside),
+        )
+        .when(link, |el| {
+            el.child(
+                h_flex()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .opacity(0.)
+                    .group_hover(group.clone(), |el| el.opacity(1.))
+                    .child(small_icon(Icon::ArrowUpRight).text_color(theme.text_3)),
+            )
+        });
+    let hover = theme.hover();
     h_flex()
         .id(("check", ix))
-        .group(group.clone())
+        .group(group)
         .mx(dp(-6.))
         .px(dp(6.))
-        .py(dp(4.))
+        .py(dp(3.))
         .gap(dp(8.))
         .rounded(dp(4.))
         .text_size(dp(12.))
-        .hover(|el| el.bg(theme.hover()))
-        .child(dot(color).size(dp(8.)))
-        .child(
-            v_flex()
-                .flex_grow(1.)
-                .min_w_0()
-                .child(div().truncate().child(run.name.clone()))
-                .child(div().text_color(theme.text_3).child(status)),
-        )
-        .when(!url.is_empty(), |el| {
-            el.child(
-                small_icon(Icon::ArrowUpRight)
-                    .text_color(theme.text_3)
-                    .opacity(0.)
-                    .group_hover(group, |el| el.opacity(1.)),
-            )
-            // The arrow says where a click goes, as Lite's rows do, so no tooltip covers the
-            // next row.
-            .role(Role::Link)
-            .aria_label(format!("Open the log of {}", run.name))
-            .on_click(move |_, _, cx| cx.open_url(&url))
+        .line_height(dp(18.))
+        .child(h_flex().flex_none().w(dp(14.)).justify_center().child(mark))
+        .child(name)
+        .child(aside)
+        .when(link, |el| {
+            let url = run.url.clone();
+            // The arrow says where a click goes, as Lite's rows do.
+            el.hover(move |el| el.bg(hover))
+                .role(Role::Link)
+                .aria_label(format!("Open the log of {}", run.name))
+                .on_click(move |_, _, cx| cx.open_url(&url))
         })
 }
 
 /// A tab of a page's header, as ui-react's and but.dev's: its glyph, its label faded unless
-/// it's selected or under the pointer, and under the selected one a bar along the header's edge.
+/// it's selected or under the pointer, and under the selected one a bar along the header's edge,
+/// solid while the tabs have the keys, as a list's selected row is.
 fn tab(
     id: &'static str,
     glyph: Icon,
     label: impl Into<SharedString>,
     selected: bool,
+    solid: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
     let hover = theme.hover();
@@ -1221,7 +1378,10 @@ fn tab(
                     .left(dp(8.))
                     .right(dp(8.))
                     .h(dp(4.))
-                    .bg(theme.fill_gray),
+                    .bg(match solid {
+                        true => theme.fill_gray,
+                        false => theme.selected_unfocused(),
+                    }),
             )
         })
 }

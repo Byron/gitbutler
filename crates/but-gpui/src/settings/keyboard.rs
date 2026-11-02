@@ -97,18 +97,23 @@ fn command_row(
                 .child(ui::keycap(key, theme))
                 .when(ix + 1 < keys.len(), |el| el.child(ui::muted(",", theme)))
         }));
-    // Found by its keys as written (⌘B), and as typed (cmd b) or bound (secondary-b).
+    // Found by its keys as written (⌘B), and as typed (cmd b) or bound (secondary-b), and by
+    // what else ⌘K finds it by.
+    let aliases = (crate::commands::COMMANDS.iter())
+        .find(|command| command.name() == name)
+        .map_or(&[][..], |command| command.aliases());
     let words: Vec<String> = (bindings.iter())
         .map(|(key, _)| format!("{key} {}", ui::keys_text(key)))
         .chain(std::iter::once(name.replace("::", " ")))
+        .chain(aliases.iter().map(|alias| alias.to_string()))
         .collect();
     Row::new(title, description, control).with_keywords(words.join(" "))
 }
 /// The commands the page lists: the palette's, then every other action a key runs, named after
 /// its own name.
 fn commands(cx: &App) -> Vec<(SharedString, Box<dyn Action>)> {
-    let mut listed: Vec<(SharedString, Box<dyn Action>)> = (crate::palette::COMMANDS.iter())
-        .map(|(title, action)| (SharedString::from(*title), action.boxed_clone()))
+    let mut listed: Vec<(SharedString, Box<dyn Action>)> = (crate::commands::COMMANDS.iter())
+        .map(|command| (SharedString::from(command.title()), command.boxed_clone()))
         .collect();
     let mut names: HashSet<&'static str> = listed.iter().map(|(_, a)| a.name()).collect();
     let keymap = cx.key_bindings();
@@ -125,8 +130,8 @@ fn commands(cx: &App) -> Vec<(SharedString, Box<dyn Action>)> {
 /// What the palette calls the action named `name`, or its name in words: `navigator::SelectNext`
 /// is "Select next".
 fn title_of(name: &str) -> String {
-    if let Some((title, _)) = (crate::palette::COMMANDS.iter()).find(|(_, a)| a.name() == name) {
-        return (*title).to_owned();
+    if let Some(command) = (crate::commands::COMMANDS.iter()).find(|c| c.name() == name) {
+        return command.title().to_owned();
     }
     let last = name.rsplit("::").next().unwrap_or(name);
     let mut words = String::new();
@@ -164,13 +169,16 @@ fn place(context: &str) -> Option<&'static str> {
     Some(match context {
         "Workspace" => "Main window",
         "Navigator" => "Navigator",
+        "Moving" => "While moving",
+        "Squashing" => "While squashing",
         "Diff" => "Diff",
         "Files" => "File list",
         "List" => "Branches and Operations history",
-        "Composer" => "While committing",
+        "Composer" | "Committing" => "While committing",
         "Conflicts" | "Picked" => "Conflicts",
         "FindBar" => "Find bar",
         "Palette" => "Palette",
+        "Settings" => "Settings",
         _ => return None,
     })
 }
@@ -195,8 +203,8 @@ mod tests {
             "words from the name"
         );
         assert_eq!(
-            title_of("remote::Push"),
-            "Push branch",
+            title_of("remote::UpdateFromTarget"),
+            "Update workspace and worktrees",
             "the palette's own title first"
         );
     }

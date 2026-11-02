@@ -22,6 +22,8 @@
 mod app;
 #[expect(clippy::disallowed_methods, reason = "its work runs off the UI thread")]
 mod backend;
+mod clock;
+mod commands;
 mod detail;
 #[cfg(feature = "dev-script")]
 #[expect(
@@ -43,26 +45,13 @@ mod rebuild;
 mod settings;
 mod state;
 mod status_bar;
+#[cfg(feature = "stories")]
+mod stories;
+mod terminal;
 mod theme;
 mod transfer;
 mod ui;
 mod whats_new;
-
-/// Draw text as GitButler's web apps do, with `-webkit-font-smoothing: antialiased`. Unless the
-/// app's `AppleFontSmoothing` says otherwise, GPUI thickens glyph strokes the way macOS font
-/// smoothing would, lighter text more, so the same fonts read heavier here than in but.dev.
-/// A registered default lives in memory only and is never written to the app's preferences.
-#[cfg(target_os = "macos")]
-fn draw_text_unsmoothed() {
-    use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
-
-    let key = NSString::from_str("AppleFontSmoothing");
-    let off = NSNumber::numberWithInt(0);
-    let defaults =
-        NSDictionary::<NSString, objc2::runtime::AnyObject>::from_slices(&[&*key], &[off.as_ref()]);
-    // SAFETY: the dictionary maps strings to objects, as `registerDefaults:` takes.
-    unsafe { NSUserDefaults::standardUserDefaults().registerDefaults(&defaults) };
-}
 
 /// What the desktop app's binary gives the client when it starts it instead of its web one.
 #[derive(Clone)]
@@ -86,6 +75,11 @@ pub const WEB_APP_ONCE: &str = "GITBUTLER_WEB_APP_ONCE";
 /// that run opens no window, installs it with the web app's updater, and writes how much it
 /// has downloaded, in percent, a line each time it changes.
 pub const INSTALL_UPDATE: &str = "GITBUTLER_INSTALL_UPDATE";
+
+/// How small the window can be made, in logical pixels, but for its width while it's narrowed
+/// to the navigator.
+const LEAST_WINDOW_WIDTH: f32 = 900.;
+const LEAST_WINDOW_HEIGHT: f32 = 500.;
 
 /// The desktop app's binary, to start again. On Linux an AppImage's own file: this one is
 /// inside it, from a mount that goes once this process ends.
@@ -173,6 +167,9 @@ fn set_dock_icon() {
 /// before its own setup for the client, which logs too.
 pub use backend::logs::init as init_logging;
 
+#[cfg(feature = "stories")]
+pub use stories::run as run_stories;
+
 /// Run the app until it quits: open its window on this thread, which must be the process's
 /// main thread, as macOS draws windows from there. `embedded` when the desktop app's binary
 /// starts it. Call [`init_logging`] first.
@@ -196,8 +193,10 @@ pub fn run(embedded: Option<Embedded>) {
         os = std::env::consts::OS,
         "starting the GPUI client"
     );
-    #[cfg(target_os = "macos")]
-    draw_text_unsmoothed();
+
+    // Before anything starts a process that would inherit their masters.
+    #[cfg(unix)]
+    let handed = but_tty::handed();
 
     gpui_platform::application()
         .with_assets(ui::Assets)
@@ -229,6 +228,9 @@ pub fn run(embedded: Option<Embedded>) {
                 #[cfg(not(target_os = "macos"))]
                 None => {}
             }
+            if let Some(rebuild) = backend::rebuild::Rebuild::detect() {
+                cx.set_global(rebuild);
+            }
             // GPUI has no alerts of its own on Linux, and its stand-in cuts long text off.
             #[cfg(target_os = "linux")]
             cx.set_prompt_builder(ui::alert::alert);
@@ -242,12 +244,12 @@ pub fn run(embedded: Option<Embedded>) {
             let set_menus = move |cx: &mut App| {
                 let mut app_menu = vec![MenuItem::action("About GitButler", help::About)];
                 if has_update_feed {
-                    app_menu.push(MenuItem::action("Check for Updates…", app::CheckForUpdates));
+                    app_menu.push(MenuItem::action("Check for Updates", app::CheckForUpdates));
                 }
                 cx.set_menus([
                     Menu::new("GitButler").items(app_menu.into_iter().chain([
                         MenuItem::separator(),
-                        MenuItem::action("Settings…", settings::OpenSettings),
+                        MenuItem::action("Settings", settings::OpenSettings),
                         MenuItem::separator(),
                         MenuItem::os_submenu("Services", SystemMenuType::Services),
                         MenuItem::separator(),
@@ -258,8 +260,9 @@ pub fn run(embedded: Option<Embedded>) {
                         MenuItem::action("Quit GitButler", app::Quit),
                     ])),
                     Menu::new("File").items([
-                        MenuItem::action("Add Project…", app::AddProject),
-                        MenuItem::action("Clone Repository…", projects::CloneRepository),
+                        MenuItem::action("Add Project", app::AddProject),
+                        MenuItem::action("Clone Repository", projects::CloneRepository),
+                        MenuItem::action("New Terminal", terminal::NewTerminal),
                         MenuItem::separator(),
                         MenuItem::action("Close Window", app::CloseWindow),
                     ]),
@@ -277,7 +280,7 @@ pub fn run(embedded: Option<Embedded>) {
                         MenuItem::action("What's New", help::OpenReleaseNotes),
                         MenuItem::action("Keyboard Shortcuts", settings::OpenKeyboardShortcuts),
                         MenuItem::separator(),
-                        MenuItem::action("Report an Issue…", help::ReportIssue),
+                        MenuItem::action("Report an Issue", help::ReportIssue),
                         MenuItem::action("Show Settings Folder", help::ShowConfigFolder),
                         MenuItem::action("Show Logs Folder", help::ShowLogsFolder),
                     ]),
@@ -292,6 +295,8 @@ pub fn run(embedded: Option<Embedded>) {
             }
             // Before the window, which opens where the saved state says.
             let store = cx.new(state::Store::new);
+            #[cfg(unix)]
+            store.update(cx, |store, cx| store.adopt_terminals(handed, cx));
             keymap::bind(&store, set_menus, cx);
             let default_size = size(fixed(1360.), fixed(860.));
             let (display_id, bounds) = match store.read(cx).window_place(cx) {
@@ -319,7 +324,10 @@ pub fn run(embedded: Option<Embedded>) {
                         appears_transparent: true,
                         traffic_light_position: Some(point(fixed(14.), fixed(15.))),
                     }),
-                    window_min_size: Some(size(fixed(900.), fixed(500.))),
+                    window_min_size: Some(size(
+                        fixed(LEAST_WINDOW_WIDTH),
+                        fixed(LEAST_WINDOW_HEIGHT),
+                    )),
                     focus: !scripted,
                     show: !scripted,
                     // macOS only. The headers drag the window and take its title bar's double

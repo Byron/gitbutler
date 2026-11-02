@@ -1,4 +1,7 @@
-use super::util::{add_dirty_worktree, find_branch, status_json, status_json_with_files};
+use super::util::{
+    add_dirty_detached_worktree, add_dirty_worktree, find_branch, status_json,
+    status_json_with_files,
+};
 use crate::utils::{CommandExt as _, Sandbox};
 
 mod unborn;
@@ -969,6 +972,61 @@ Hint: to apply these changes, create bar stacked on top of foo and try again:
 }
 
 #[test]
+fn rejected_specs_on_an_unnamed_new_branch_suggest_no_branch() {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("zero-stacks");
+    env.setup_metadata(&[]);
+
+    env.file("first", "Some text");
+
+    env.but("commit -m 'add first' -b foo").assert().success();
+
+    env.file("first", "changes");
+
+    // The made-up name the new branch would have had went with the rollback, so no command
+    // can name it.
+    env.but("commit -b -m 'add first'")
+        .assert()
+        .failure()
+        .stderr_eq(snapbox::str![[r#"
+Error: Cannot commit: 1 change could not be applied:
+  first
+    line 1 depends on foo (xsz)
+
+"#]]);
+}
+
+#[test]
+fn commit_switch_with_head_detached_is_refused_and_keeps_the_changes() {
+    let env = Sandbox::open_with_default_settings("single-branch-mode");
+    env.file("first", "Some text\n");
+    env.but("commit -b foo -m 'add first'").assert().success();
+    env.invoke_git("checkout --detach");
+    env.file("first", "changes\n");
+    env.file("new.txt", "new content\n");
+
+    // Without a branch checked out there's no workspace to set up, nor the checkpoint that
+    // takes a failed switch back, so it doesn't start.
+    env.but("commit --switch -b bar -m test sy")
+        .assert()
+        .failure()
+        .stderr_eq(snapbox::str![[r#"
+Error: --switch needs a branch checked out (HEAD is detached)
+
+"#]]);
+
+    // No bar is made.
+    snapbox::assert_data_eq!(env.invoke_git("branch --list bar"), snapbox::str![]);
+    // Both changes stay uncommitted.
+    snapbox::assert_data_eq!(
+        env.invoke_git("status --porcelain"),
+        snapbox::str![[r#"
+M first
+?? new.txt
+"#]]
+    );
+}
+
+#[test]
 fn failed_commit_switch_preserves_selected_changes_in_single_branch_mode() {
     let env = Sandbox::open_with_default_settings("single-branch-mode");
     env.file("first", "Some text\n");
@@ -977,11 +1035,11 @@ fn failed_commit_switch_preserves_selected_changes_in_single_branch_mode() {
     env.file("new.txt", "new content\n");
 
     // sy selects only new.txt; the modification to foo's file blocks checkout.
-    env.but("commit --switch -b bar -m test sy").assert().failure().stderr_eq(snapbox::str![[r#"
-Error: Could not safely check out 'refs/heads/bar' from 4db633b4a785a1a47a416e428f82b57e1e4708dc to 87d6a1a51a0607ab42894ed0af2df2a2c1a0a6f6
-
-Caused by:
-    Uncommitted files would be overwritten by checkout: "first"
+    env.but("commit --switch -b bar -m test sy")
+        .assert()
+        .failure()
+        .stderr_eq(snapbox::str![[r#"
+Error: Uncommitted files would be overwritten by checkout: "first"
 
 "#]]);
 
@@ -1047,11 +1105,11 @@ fn failed_commit_switch_preserves_selected_changes_in_workspace_mode() {
     env.file("new.txt", "new content\n");
 
     // sy selects only new.txt; the modification to foo's file blocks checkout.
-    env.but("commit --switch -b bar -m test sy").assert().failure().stderr_eq(snapbox::str![[r#"
-Error: Could not safely check out 'refs/heads/bar' from 54743c4a9f97bd3ab109061a5a6c95fbe855ea9d to 87d6a1a51a0607ab42894ed0af2df2a2c1a0a6f6
-
-Caused by:
-    Uncommitted files would be overwritten by checkout: "first"
+    env.but("commit --switch -b bar -m test sy")
+        .assert()
+        .failure()
+        .stderr_eq(snapbox::str![[r#"
+Error: Uncommitted files would be overwritten by checkout: "first"
 
 "#]]);
 
@@ -1127,10 +1185,7 @@ fn failed_commit_switch_to_existing_branch_rolls_back_materialization() {
         .assert()
         .failure()
         .stderr_eq(snapbox::str![[r#"
-Error: Could not safely check out 'refs/heads/other' from [..] to [..]
-
-Caused by:
-    Uncommitted files would be overwritten by checkout: "first"
+Error: Uncommitted files would be overwritten by checkout: "first"
 
 "#]]);
 
@@ -1211,10 +1266,7 @@ fn failed_commit_switch_restores_ad_hoc_stack_refs() {
         .assert()
         .failure()
         .stderr_eq(snapbox::str![[r#"
-Error: Could not safely check out 'refs/heads/bottom' from [..] to [..]
-
-Caused by:
-    Uncommitted files would be overwritten by checkout: "first.txt"
+Error: Uncommitted files would be overwritten by checkout: "first.txt"
 
 "#]]);
 
@@ -3877,7 +3929,7 @@ Hint: run `but help` for all commands
 fn bare_commit_in_an_unmanaged_worktree_is_refused() {
     let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks");
     env.setup_metadata(&["A", "B"]);
-    let wt_dir = add_dirty_worktree(&env, "wt-feature", "A");
+    let wt_dir = super::util::add_unmanaged_worktree(&env, "wt-feature");
     env.file("main-file.txt", "main change");
 
     env.but("commit -m 'not from here'")
@@ -3897,7 +3949,7 @@ Hint: Run `but worktree list` to see the worktrees GitButler manages
 fn empty_commit_with_a_target_works_from_an_unmanaged_worktree() {
     let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks");
     env.setup_metadata(&["A", "B"]);
-    let wt_dir = add_dirty_worktree(&env, "wt-feature", "A");
+    let wt_dir = super::util::add_unmanaged_worktree(&env, "wt-feature");
 
     env.but("commit --empty -b B -m 'placeholder'")
         .current_dir(&wt_dir)
@@ -3957,17 +4009,7 @@ fn commit_from_a_detached_worktree_is_refused() {
     let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks");
     env.setup_metadata(&["A", "B"]);
     env.but("status").assert().success();
-    let wt = env.app_data_dir().join("worktrees");
-    but_testsupport::invoke_bash_at_dir(
-        &format!(
-            r#"
-        git worktree add -q --detach "{wt}/wt-detached" B
-        (cd "{wt}/wt-detached" && echo dirty >note.txt)
-        "#,
-            wt = wt.display()
-        ),
-        env.projects_root(),
-    );
+    add_dirty_detached_worktree(&env, "wt-detached", "B");
 
     env.but("commit wt-detached:@ -m 'nowhere to go'")
         .assert()
@@ -3975,6 +4017,104 @@ fn commit_from_a_detached_worktree_is_refused() {
         .stdout_eq(snapbox::str![])
         .stderr_eq(snapbox::str![[r#"
 Error: Worktree wt-detached has a detached HEAD, so there is no branch to commit to
+
+Hint: Run `but commit -b <new-branch>` inside that worktree to commit on a new branch at its HEAD
+
+"#]]);
+}
+
+/// Inside a detached worktree, `-b` names the branch it lacks: the branch starts at `HEAD`,
+/// is checked out there, and takes the commit, like `git switch -c` followed by a commit.
+#[test]
+fn commit_to_a_new_branch_in_a_detached_worktree_checks_it_out_there() {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks");
+    env.setup_metadata(&["A", "B"]);
+    env.but("status").assert().success();
+    let wt_dir = add_dirty_detached_worktree(&env, "wt-detached", "B");
+
+    env.but("commit -b fresh -m 'from wt'")
+        .current_dir(&wt_dir)
+        .assert()
+        .success()
+        .stderr_eq(snapbox::str![])
+        .stdout_eq(snapbox::str![[r#"
+Created commit ulz on new branch 'fresh'
+
+"#]]);
+
+    // The worktree now has `fresh` checked out, holding the commit, with nothing left uncommitted.
+    env.but("status -f")
+        .assert()
+        .success()
+        .stderr_eq(snapbox::str![])
+        .stdout_eq(snapbox::str![[r#"
+╭┄ @ [uncommitted] (no changes)
+┊
+┊╭┄ g0 [A]
+┊●   tpm add A
+┊│     tpm:t A A
+├╯
+┊
+┊╭┄ h0 [B]
+┊┊
+┊┊╭┄ fr:@ [uncommitted] {wt-detached} (no changes)
+┊┊├┄ fr [fresh]
+┊┊●   ulz from wt
+┊┊│     ulz:u A note.txt
+┊├╯
+┊●   lrm add B
+┊│     lrm:p A B
+├╯
+┊
+┴ 0dc3733 (common base, main, origin/main) 2000-01-02 add M
+
+Hint: run `but help` for all commands
+
+"#]]);
+
+    // Undo can't detach the worktree again, so it refuses rather than claim a restore.
+    env.but("undo")
+        .assert()
+        .failure()
+        .stdout_eq(snapbox::str![])
+        .stderr_eq(snapbox::str![[r#"
+Error: Cannot restore branch 'fresh' because it is checked out in worktrees: [..]
+
+"#]]);
+}
+
+/// A worktree detached at the workspace commit has every applied branch below its `HEAD`, so a
+/// branch started there would carry them all and is refused.
+#[test]
+fn commit_to_a_new_branch_in_a_worktree_detached_at_the_workspace_commit_is_refused() {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks");
+    env.setup_metadata(&["A", "B"]);
+    env.but("status").assert().success();
+    let wt_dir = add_dirty_detached_worktree(&env, "wt-detached", "gitbutler/workspace");
+
+    env.but("commit -b fresh -m 'from wt'")
+        .current_dir(&wt_dir)
+        .assert()
+        .failure()
+        .stdout_eq(snapbox::str![])
+        .stderr_eq(snapbox::str![[r#"
+Error: Worktree wt-detached is detached at a GitButler workspace commit, so a new branch there would contain every applied branch
+
+Hint: Run `but -C [..] commit wt-detached:@ -b <new-branch>` to commit its changes to a new branch in the workspace instead
+
+"#]]);
+    assert!(
+        env.invoke_git("branch --list fresh").is_empty(),
+        "no branch is created"
+    );
+
+    // The hinted command, run in the main worktree, puts the changes on a new workspace branch.
+    env.but("commit wt-detached:@ -b fresh -m 'from wt'")
+        .assert()
+        .success()
+        .stderr_eq(snapbox::str![])
+        .stdout_eq(snapbox::str![[r#"
+Created commit xol on new branch 'fresh'
 
 "#]]);
 }

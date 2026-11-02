@@ -116,6 +116,7 @@ impl Store {
         }
         prefs.project_icons.retain(|id, _| listed(id));
         prefs.merge_methods.retain(|id, _| listed(id));
+        prefs.worktree_order.retain(|id, _| listed(id));
     }
 
     pub fn runs_hooks(&self, project: &super::ProjectId) -> bool {
@@ -151,6 +152,18 @@ impl Store {
         update(&mut self.prefs);
         self.save_soon(cx);
         cx.notify();
+    }
+
+    /// Count worktrees as inactive `after`, which can empty the heading selected.
+    pub fn set_inactive_after(
+        &mut self,
+        after: crate::backend::InactiveAfter,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_prefs(|prefs| prefs.inactive_after = after, cx);
+        if let Some(project) = self.selection.as_ref().map(|s| s.project().clone()) {
+            self.validate_selection(&project, cx);
+        }
     }
 
     /// Change what only the diff shows. The detail redraws its diff itself, and telling the
@@ -284,6 +297,16 @@ pub(super) struct Restored {
     pub(super) fresh: bool,
 }
 
+/// How file lists show their files, as but.dev's can.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileView {
+    /// As a tree of their folders.
+    #[default]
+    Tree,
+    /// Flat, each with its folder beside its name.
+    List,
+}
+
 /// The order file lists show files in, as but.dev's do.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileSort {
@@ -294,10 +317,20 @@ pub enum FileSort {
     Modified,
 }
 
+/// What the app's own terminals start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalRuns {
+    /// The user's login shell, at its prompt.
+    #[default]
+    LoginShell,
+    /// [`Prefs::terminal_command`], through the login shell.
+    Command,
+}
+
 /// The order the navigator's watched projects go in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WatchedOrder {
-    /// As the user put them, by dragging their cards or Move up and Move down.
+    /// As the user put them, by dragging their cards.
     #[default]
     Manual,
     Name,
@@ -372,21 +405,39 @@ pub(super) struct SavedActivity {
 #[serde(default)]
 pub struct Prefs {
     pub appearance: Appearance,
+    pub color_scheme: crate::theme::ColorScheme,
     /// The editor files open in, by program id. Asked for the first time it's needed.
     pub editor: Option<String>,
     /// The terminal the project opens in, by id.
     pub terminal: Option<String>,
-    /// File lists show their files as a tree of folders rather than flat.
-    pub file_tree: bool,
+    /// How file lists show their files.
+    pub file_view: FileView,
     /// The order file lists show files in.
     pub file_sort: FileSort,
+    /// A file tree's folders always show the lines their files add and remove, rather than
+    /// only under the pointer.
+    pub folder_line_counts: bool,
     /// Long diff lines wrap instead of running off the edge.
     pub wrap: bool,
     /// Diffs show the old side beside the new rather than one above the other.
     pub split: bool,
     /// Changed lines go without their green and red ground, keeping the bar beside them.
     pub plain_lines: bool,
+    /// Diffs show only the cursor's file rather than every file one after another. Off unless
+    /// picked, as the desktop app's all-in-one diff is on.
+    pub one_file_diff: bool,
     pub code_size: crate::theme::CodeSize,
+    /// The family code in diffs shows in, or `None` for the app's own.
+    pub diff_font: Option<String>,
+    /// The size text shows in the app's own terminals, or `None` for Ghostty's.
+    pub terminal_text: Option<u8>,
+    /// The family the app's own terminals show in, or `None` for Ghostty's.
+    pub terminal_font: Option<String>,
+    /// What the app's own terminals start.
+    pub terminal_runs: TerminalRuns,
+    /// The command they run with [`TerminalRuns::Command`], kept while the login shell is
+    /// picked.
+    pub terminal_command: String,
     /// How large the whole interface draws, as ⌘+ and ⌘− set it.
     pub ui_scale: crate::theme::UiScale,
     /// The keys the app binds, as Settings › Keyboard picks them.
@@ -424,8 +475,13 @@ pub struct Prefs {
     /// Watched projects, by id, whose inactive worktrees show under their heading; it starts
     /// folded.
     pub shown_inactive: HashSet<String>,
+    /// How long a linked worktree with nothing uncommitted stays active after it last moved.
+    pub inactive_after: crate::backend::InactiveAfter,
     /// The order the watched projects go in.
     pub watched_order: WatchedOrder,
+    /// Each project's linked worktrees by name, archived ones too, by project id, in the
+    /// order the navigator lists them: as the user moved them, with new ones last.
+    pub worktree_order: HashMap<String, Vec<String>>,
     /// The Branches page leaves out the branches only a remote has.
     pub branches_local_only: bool,
     /// Which branches the Branches page lists by their pull request.
@@ -445,6 +501,15 @@ pub struct Prefs {
 }
 
 impl Prefs {
+    /// What a new terminal runs in place of the login shell's prompt: the command, while it's
+    /// picked and there is one.
+    pub fn terminal_run(&self) -> Option<&str> {
+        match self.terminal_runs {
+            TerminalRuns::LoginShell => None,
+            TerminalRuns::Command => Some(self.terminal_command.trim()).filter(|c| !c.is_empty()),
+        }
+    }
+
     /// The most unchanged lines a hunk's scope adds around it, `None` with semantic context
     /// off.
     pub fn scope_lines(&self) -> Option<usize> {

@@ -275,6 +275,47 @@ mod util {
         wt.join(name)
     }
 
+    /// Like [`add_dirty_worktree()`], but with a detached `HEAD` at `start_point`, the way
+    /// Codex and Cursor create worktrees.
+    pub fn add_dirty_detached_worktree(
+        env: &Sandbox,
+        name: &str,
+        start_point: &str,
+    ) -> std::path::PathBuf {
+        let wt = env.app_data_dir().join("worktrees");
+        but_testsupport::invoke_bash_at_dir(
+            &format!(
+                r#"
+        git worktree add -q --detach "{wt}/{name}" {start_point}
+        (cd "{wt}/{name}" && echo dirty >note.txt)
+        "#,
+                wt = wt.display()
+            ),
+            env.projects_root(),
+        );
+        wt.join(name)
+    }
+
+    /// Add a linked worktree named `name` on an unborn branch of the same name, with
+    /// `note.txt` in it, then return the worktree's directory.
+    ///
+    /// With no commit checked out, the worktree has no lane in the workspace, so GitButler
+    /// can't manage it, archived or not.
+    pub fn add_unmanaged_worktree(env: &Sandbox, name: &str) -> std::path::PathBuf {
+        let wt = env.app_data_dir().join("worktrees");
+        but_testsupport::invoke_bash_at_dir(
+            &format!(
+                r#"
+        git worktree add -q --orphan -b {name} "{wt}/{name}"
+        (cd "{wt}/{name}" && echo dirty >note.txt)
+        "#,
+                wt = wt.display()
+            ),
+            env.projects_root(),
+        );
+        wt.join(name)
+    }
+
     /// Add a linked worktree named `name` on a new branch of the same name at
     /// `start_point`, with a commit of its own adding `wt-file.txt` and a clean
     /// checkout, then return the worktree's directory.

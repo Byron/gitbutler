@@ -4,8 +4,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash as _, Hasher as _};
 
 use gpui::{
-    AnyElement, AnyWindowHandle, App, Context, Focusable as _, Toggled, WeakEntity, Window, div,
-    prelude::*,
+    AnyElement, AnyWindowHandle, App, Context, Entity, Focusable as _, Toggled, WeakEntity, Window,
+    div, prelude::*,
 };
 
 use super::{ChecksChanged, Detail, DiffKey, PickCommitTarget};
@@ -16,15 +16,13 @@ use crate::backend::{
 use crate::palette::Choice;
 use crate::state::{Cut, NewAt, Overlay, ProjectId, Selection, Store, snack};
 use crate::theme::Theme;
-use crate::ui::text_input::{InputEvent, TextInput};
+use crate::transfer::{Move, Moving, Op, Stop};
+use crate::ui::message_editor::{COMMIT_PLACEHOLDERS, MessageEditor, MessageSize};
+use crate::ui::text_input::InputEvent;
 use crate::ui::{
-    ButtonStyle, Icon, Tooltip, button, dp, faint, field, h_flex, icon_button, plural, shortcut,
+    ButtonStyle, Icon, Tooltip, button, dp, faint, h_flex, icon_button, plural, shortcut,
     small_icon, v_flex,
 };
-
-/// Why the commit box, opened on changes something else committed since, as an agent can,
-/// doesn't make an empty commit instead.
-const COMMITTED_MEANWHILE: &str = "What was here to commit was committed meanwhile";
 
 /// What the next commit leaves out of the uncommitted changes; the rest goes in.
 #[derive(Default)]
@@ -253,6 +251,7 @@ impl Detail {
         worktree: Checkout,
         cx: &mut Context<Self>,
     ) {
+        self.stop_committing(cx);
         let left = (self.checks_project.take(), self.checks_worktree.clone());
         let next = (self.other_checks)
             .remove(&(project.clone(), worktree.clone()))
@@ -288,6 +287,8 @@ impl Detail {
     }
 
     pub(super) fn close_composer(&mut self, cx: &mut Context<Self>) {
+        self.stop_committing(cx);
+        self.new_branch_name = None;
         self.composing = false;
         // A message still being written would land in whatever the box shows next.
         if let Some((_, notes)) = self.writing.take() {
@@ -389,27 +390,34 @@ impl Detail {
         self.composing && self.checks_diff().is_some()
     }
 
-    /// Check or uncheck, as a click on its checkbox does, the file under the cursor in the
-    /// file list, or in the diff the hunk under it, else its file.
-    pub(super) fn toggle_cursor_check(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let Some(file) = self
-            .checks_diff()
-            .and_then(|diff| diff.files.get(self.cursor.file))
-        else {
+    /// Check or uncheck, as a click on its checkbox does, the current file in the file list, or
+    /// in the diff the hunk under the cursor, else the current file, and go on to the next one,
+    /// so holding the key checks or unchecks them all. Not files picked together, which go
+    /// at once.
+    pub(super) fn toggle_cursor_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let in_list = self.files_focus.is_focused(window);
+        let hunk = (self.cursor.at.near()).filter(|_| !in_list);
+        let at = match hunk {
+            Some(_) => self.cursor.file,
+            None => self.current_file(),
+        };
+        let Some(file) = self.checks_diff().and_then(|diff| diff.files.get(at)) else {
             return;
         };
         let path = file.file.path.clone();
-        let hunk = (self.cursor.at.near())
-            .filter(|_| !self.files_focus.is_focused(window))
-            .and_then(|hunk| Some(file.hunks().get(hunk)?.key));
+        let hunk = hunk.and_then(|hunk| Some(file.hunks().get(hunk)?.key));
         match hunk {
             Some(key) => self.toggle_hunk(&path, key, cx),
             // The files selected with it go as it goes.
             None if self.file_picks.contains(&path) => {
                 let check = self.checks.file_check(&path) == Toggled::False;
-                self.set_checked(self.file_picks.to_vec(), check, cx)
+                return self.set_checked(self.file_picks.to_vec(), check, cx);
             }
             None => self.toggle_checked(&path, cx),
+        }
+        match in_list {
+            true => self.move_file(1, cx),
+            false => self.move_past(cx),
         }
     }
 
@@ -484,12 +492,164 @@ impl Detail {
     }
 
     pub fn focus_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.compose(true, window, cx)
+        self.compose(true, true, window, cx)
+    }
+
+    /// Open the composer, leaving the keys where they are, as the navigator places the commit,
+    /// saying whether it opened: not while a commit is being edited, say.
+    pub fn open_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.compose(true, false, window, cx);
+        self.composing
+    }
+
+    /// The commit the navigator is placing, with the keys, for the checkout the composer's on,
+    /// while one is.
+    pub(super) fn committing(&self, cx: &App) -> Option<Move> {
+        let (project, worktree) = (self.checks_project.as_ref(), &self.checks_worktree);
+        (self.store.read(cx).moving.clone()).filter(|moving| places(moving, project, worktree))
+    }
+
+    /// Change the commit the navigator is placing for the checkout the composer's on, if it's
+    /// placing one, once the update under way ends, as the composer closes as one lands.
+    fn change_committing(&self, change: impl FnOnce(&mut Store) + 'static, cx: &mut App) {
+        let (store, project) = (self.store.clone(), self.checks_project.clone());
+        let worktree = self.checks_worktree.clone();
+        cx.defer(move |cx| {
+            store.update(cx, |store, cx| {
+                if (store.moving.as_ref()).is_some_and(|m| places(m, project.as_ref(), &worktree)) {
+                    change(store);
+                    cx.notify();
+                }
+            })
+        });
+    }
+
+    /// Stop placing the commit, as the composer it's made from closes.
+    fn stop_committing(&self, cx: &mut App) {
+        self.change_committing(|store| store.moving = None, cx);
+    }
+
+    /// Commit where the navigator's placing the commit, once its message is written; till then,
+    /// write it. As Return does there.
+    pub fn commit_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.message.read(cx).text(cx).trim().is_empty() {
+            true => self.focus_message(window, cx),
+            false => self.commit(window, cx),
+        }
+    }
+
+    /// Commit all of `moving`'s checkout's uncommitted changes where it's placed, without a
+    /// message, as Return does while it's placed without the composer, as where the navigator
+    /// came out for it: what's shown stays as it is. Not conflicted files, nor a repository
+    /// cloned inside, which the composer leaves out too.
+    pub fn commit_now(&mut self, moving: Move, cx: &mut Context<Self>) {
+        let Moving::Files { worktree, .. } = &moving.what else {
+            return;
+        };
+        let (project, worktree) = (moving.project.clone(), worktree.clone());
+        let store = self.store.read(cx);
+        let Some(to) = moving.commit_to(store) else {
+            return snack(&self.store, "Nothing can be committed there", cx);
+        };
+        let uncommitted = (store.workspace(&project))
+            .and_then(|ws| ws.uncommitted_in(&worktree))
+            .unwrap_or_default();
+        let files: Vec<Selected> = (uncommitted.iter())
+            .filter(|file| !file.conflicted && !file.nested_repository())
+            .map(Selected::whole)
+            .collect();
+        let run_hooks = store.runs_hooks(&project);
+        // As it was placed, till the reload shows it made.
+        let overlay = Overlay {
+            lands: Some(moving),
+            files_in: worktree.clone(),
+            ..Overlay::files(&files)
+        };
+        self.store.update(cx, |store, cx| {
+            store.set_moving(None, cx);
+            let commit = backend::CommitChanges {
+                to,
+                changes: files.into(),
+                checkout: worktree,
+                message: String::new(),
+                run_hooks,
+            };
+            store.apply(
+                &project,
+                "Commit",
+                overlay,
+                commit,
+                |store, committed, cx| {
+                    let done = format!("Committed to {}", short_ref(&committed.branch));
+                    store.report_left_out(&done, &committed.left_out, cx);
+                    if let Some(output) = committed.hook_failed {
+                        store.error("Committed, but the post-commit hook failed", output, cx);
+                    }
+                },
+                cx,
+            )
+        });
+    }
+
+    /// Let go of the commit being placed: with the composer it's made from, if that's open.
+    pub fn cancel_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.composing {
+            true => self.leave_composer(window, cx),
+            false => self.stop_committing(cx),
+        }
+    }
+
+    /// Back to placing the commit, the composer left open, as Escape in its message does while
+    /// the navigator places one.
+    pub(super) fn back_to_placing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let back = (self.composer_back.clone()).unwrap_or_else(|| self.focus.clone());
+        window.focus(&back, cx);
+    }
+
+    /// Place the commit the navigator's placing in a new branch of its own, after the other
+    /// stacks, named `name` if one's given, as picking New branch does while it places one: the
+    /// commit makes the branch, rather than its being made first. Whether it placed it there.
+    fn place_in_new_branch(&mut self, name: Option<String>, cx: &mut Context<Self>) -> bool {
+        let Some(moving) = self.committing(cx) else {
+            return false;
+        };
+        let at = Stop::NewStack { first: false };
+        let placed = Move {
+            at: at.clone(),
+            ..moving
+        };
+        if placed.commit_to(self.store.read(cx)).is_none() {
+            return false;
+        }
+        self.new_branch_name = name;
+        self.change_committing(
+            |store| {
+                if let Some(moving) = &mut store.moving {
+                    moving.at = at;
+                }
+            },
+            cx,
+        );
+        true
+    }
+
+    /// Place the commit the navigator's placing on top of `branch`, as picking it does.
+    pub(super) fn place_on(&self, branch: &FullName, cx: &mut App) {
+        let at = Stop::In(crate::backend::Destination::Branch(branch.clone()));
+        self.change_committing(
+            |store| {
+                if let Some(moving) = &mut store.moving {
+                    moving.at = at;
+                }
+            },
+            cx,
+        );
     }
 
     /// Open the composer. With `picks`, files and lines picked, or the files a filter shows,
     /// are what it commits; without, as after a drop on a branch, the checks are already set.
-    fn compose(&mut self, picks: bool, window: &mut Window, cx: &mut Context<Self>) {
+    /// With `focus`, the keys go to its message.
+    fn compose(&mut self, picks: bool, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         // A commit being edited isn't committed but finished, and a linked worktree with no
         // branch has nowhere to commit. With no changes, the commit is an empty one.
         if let Some((project, worktree)) = self.selected_checkout(cx)
@@ -546,7 +706,6 @@ impl Detail {
                 .map(|file| file.path.clone());
             self.checks.unchecked.extend(left_out.collect::<Vec<_>>());
             self.checks.known = Some(files.iter().map(|file| file.path.clone()).collect());
-            self.composing_on_changes = !files.is_empty();
             self.composing_target = (self.checks_project.clone())
                 .and_then(|project| self.effective_target(&project, cx));
         }
@@ -558,13 +717,15 @@ impl Detail {
         self.line_picks = None;
         // The composer sits under the file list, so a hidden list comes back with it.
         self.hide_files(false, false, cx);
-        window.focus(&message, cx);
+        if focus {
+            window.focus(&message, cx);
+        }
         cx.notify();
     }
 
     /// Close the composer, giving the focus back to where writing the message started:
     /// the navigator, say, so its keys go on working after a commit.
-    pub(super) fn leave_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn leave_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_composer(cx);
         let back = self
             .composer_back
@@ -592,7 +753,7 @@ impl Detail {
         // What was dropped is what goes in, not what's picked.
         self.file_picks.clear();
         self.line_picks = None;
-        self.compose(false, window, cx);
+        self.compose(false, true, window, cx);
     }
 
     /// Check just `files` of `project`'s `checkout`, down to the hunks and lines they name.
@@ -690,7 +851,9 @@ impl Detail {
                 .flat_map(|ws| ws.commits())
                 .find(|c| rewords(editing, &editing.0, c, store));
             if let Some(other) = other
-                && store.message_of(&editing.0, other).1.trim() != input.read(cx).text().trim()
+                && !input
+                    .read(cx)
+                    .holds(store.message_of(&editing.0, other).1, cx)
             {
                 let why = format!(
                     "Save or cancel the new message for \"{}\" first",
@@ -701,10 +864,9 @@ impl Detail {
         }
         let message = store.message_of(&project, commit).1.to_owned();
         let key = (project.clone(), commit.key.clone(), commit.authored.clone());
-        let opened = message.trim().to_owned();
-        let scroll = self.reword_scroll.clone();
+        let opened = message.clone();
         let input = cx.new(|cx| {
-            let mut input = TextInput::new("Commit message", true, cx).scrolled_by(scroll);
+            let mut input = MessageEditor::new(MessageSize::Large, COMMIT_PLACEHOLDERS, cx);
             input.set_text(message, cx);
             input
         });
@@ -716,44 +878,31 @@ impl Detail {
             window,
             move |this, input, event, window, cx| match event {
                 InputEvent::Submit => {
-                    let message = input.read(cx).text().trim().to_owned();
                     // Unchanged, rewording would only give it and the commits above it new ids.
-                    if message == opened {
+                    if input.read(cx).holds(&opened, cx) {
                         this.rewording = None;
                         window.focus(&back, cx);
                         return cx.notify();
                     }
+                    let message = input.read(cx).text(cx).trim().to_owned();
                     // The commit as it is now, should an agent have rewritten it meanwhile.
                     let id = match this.selection(cx) {
                         Some(Selection::Commit(_, now)) => now,
                         _ => id,
                     };
-                    let project = project.clone();
                     let (detail, editing) = (cx.entity().downgrade(), editing.clone());
                     let submitted = message.clone();
                     this.store.update(cx, |store, cx| {
-                        let reworded = store.key_of(&project, id).map(|key| (key, message.clone()));
-                        let overlay = Overlay {
-                            reworded,
-                            ..Overlay::default()
-                        };
-                        let reword = backend::Reword {
-                            commit: id,
-                            message,
-                        };
-                        store.apply(
+                        // Open until it lands, so a reword that fails keeps what was written,
+                        // and so does one written on meanwhile.
+                        store.reword(
                             &project,
-                            "Edit message",
-                            overlay,
-                            reword,
-                            move |store, rewritten, cx| {
-                                store.follow(&rewritten, cx);
-                                store.snack_undoable("Message updated", cx);
-                                // Open until it lands, so a reword that fails keeps what was
-                                // written, and so does one written on meanwhile.
+                            id,
+                            message,
+                            move |_, cx| {
                                 (detail.update(cx, |detail, cx| {
                                     if (detail.rewording.as_ref()).is_some_and(|(k, input, _)| {
-                                        *k == editing && input.read(cx).text().trim() == submitted
+                                        *k == editing && input.read(cx).text(cx).trim() == submitted
                                     }) {
                                         detail.rewording = None;
                                         cx.notify();
@@ -777,6 +926,52 @@ impl Detail {
         window.focus(&input.focus_handle(cx), cx);
         self.rewording = Some((key, input, subscription));
         cx.notify();
+    }
+
+    /// Edit the selected commit's message with `title`, typed for it in its row, in place of
+    /// its own, the keys in its body. False when another commit's new message is unsaved, as
+    /// the snackbar then says.
+    pub fn reword_in_full(
+        &mut self,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.start_reword(window, cx);
+        let Some(input) = self.rewording_selected(cx) else {
+            return false;
+        };
+        input.update(cx, |input, cx| {
+            input.set_title(title, cx);
+            input.focus_body(window, cx)
+        });
+        true
+    }
+
+    /// The editor of the selected commit's message, while it's being edited.
+    pub fn rewording_selected(&self, cx: &App) -> Option<Entity<MessageEditor>> {
+        let Some(Selection::Commit(project, id)) = self.selection(cx) else {
+            return None;
+        };
+        let store = self.store.read(cx);
+        let (_, commit) = store.find_commit(&project, id)?;
+        let (_, input, _) = (self.rewording.as_ref())
+            .filter(|(editing, ..)| rewords(editing, &project, commit, store))?;
+        Some(input.clone())
+    }
+
+    /// The branch a commit started from the changes' own row goes on first: the topmost one of
+    /// `checkout` that takes commits, as the navigator places it.
+    pub(super) fn start_target(
+        &self,
+        project: &ProjectId,
+        checkout: &Checkout,
+        cx: &App,
+    ) -> Option<FullName> {
+        let store = self.store.read(cx);
+        (store.workspace(project)?.branches_in(checkout))
+            .find(|branch| takes_commits(store, project, branch))
+            .and_then(|branch| branch.ref_name.clone())
     }
 
     /// The branch the composer commits to. A linked worktree's changes go on the branch it
@@ -815,47 +1010,69 @@ impl Detail {
             );
             return;
         }
-        let message = self.message.read(cx).text().trim().to_owned();
+        let message = self.message.read(cx).text(cx).trim().to_owned();
         if self.choices_loading(&project, cx) {
             return;
         }
+        // With nothing checked, or nothing to check, it's an empty commit.
         let files = self.selected_changes(cx);
-        // A checkout with no changes at all commits an empty commit.
-        let nothing_changed = (self.store.read(cx).workspace(&project))
-            .and_then(|ws| ws.uncommitted_in(&worktree))
-            .is_none_or(<[_]>::is_empty);
-        // Opened on changes that all went meanwhile, as an agent committed them, an empty
-        // commit isn't what was being written.
-        if nothing_changed && self.composing_on_changes {
-            snack(&self.store, COMMITTED_MEANWHILE, cx);
-            return;
-        }
-        if files.is_empty() && !nothing_changed {
-            snack(&self.store, "Nothing checked to commit", cx);
-            return;
-        }
-        let target = self.effective_target(&project, cx);
-        if self.target_went(&project, &target, cx) {
-            return;
-        }
+        // Where the navigator places it, while it does, else on the branch picked.
+        let committing = self.committing(cx);
+        let target = match &committing {
+            Some(_) => None,
+            None => self.effective_target(&project, cx),
+        };
+        let to = match &committing {
+            Some(moving) => match moving.commit_to(self.store.read(cx)) {
+                // In a new branch named as typed when it was picked.
+                Some(CommitTo::NewBranchAt { beside, first, .. }) => CommitTo::NewBranchAt {
+                    beside,
+                    first,
+                    name: self.new_branch_name.take(),
+                },
+                Some(to) => to,
+                None => return snack(&self.store, "Nothing can be committed there", cx),
+            },
+            None if self.target_went(&project, &target, cx) => return,
+            None => target.clone().map_or(
+                CommitTo::NewBranchAt {
+                    beside: None,
+                    first: false,
+                    name: None,
+                },
+                CommitTo::Branch,
+            ),
+        };
         // A linked worktree's commit goes on its own branch, so the next one in the main
         // checkout still goes where it would have.
         let picked = (!worktree.is_linked()).then(|| self.commit_target.clone());
         let detail = cx.entity().downgrade();
         let window = window.window_handle();
         let (finished, written, from) = (project.clone(), message.clone(), worktree.clone());
-        // The files leave the list and the commit shows on its branch right away.
-        let overlay = Overlay {
-            new_commit: target.clone().map(|branch| {
-                let title = crate::backend::subject_and_body(&message).0;
-                (NewAt::Top(branch), title.into())
-            }),
-            files_in: worktree.clone(),
-            ..Overlay::files(&files)
+        // The files leave the list and the commit shows on its branch right away, or, placed
+        // with the keys, where it was placed, as that showed it, till the reload shows it made.
+        let overlay = match committing {
+            Some(moving) => Overlay {
+                lands: Some(moving),
+                files_in: worktree.clone(),
+                ..Overlay::files(&files)
+            },
+            None => Overlay {
+                new_commit: target.map(|branch| {
+                    let title = crate::backend::subject_and_body(&message).0;
+                    (NewAt::Top(branch), title.into())
+                }),
+                files_in: worktree.clone(),
+                ..Overlay::files(&files)
+            },
         };
+        let placed = overlay.lands.is_some();
         self.store.update(cx, |store, cx| {
+            if placed {
+                store.set_moving(None, cx);
+            }
             let commit = backend::CommitChanges {
-                to: target.map_or(CommitTo::NewBranch, CommitTo::Branch),
+                to,
                 changes: files.into(),
                 checkout: worktree,
                 message,
@@ -867,6 +1084,11 @@ impl Detail {
                 overlay,
                 commit,
                 move |store, committed, cx| {
+                    // Placed with the keys, it's selected, as the TUI goes on to it.
+                    if placed {
+                        let made = Selection::Commit(finished.clone(), committed.made.id);
+                        store.select(Some(made), cx);
+                    }
                     // The message is done with, even kept for a checkout left meanwhile.
                     let key = (finished.clone(), from.clone());
                     if (store.drafts.get(&key)).is_some_and(|d| d.trim() == written) {
@@ -882,7 +1104,7 @@ impl Detail {
                         if picked.as_ref() == Some(&detail.commit_target) {
                             detail.commit_target = Some(target);
                         }
-                        if detail.message.read(cx).text().trim() == written {
+                        if detail.message.read(cx).text(cx).trim() == written {
                             (detail.message).update(cx, |input, cx| input.set_text("", cx));
                             detail.finish_composing(&from, window, cx);
                         }
@@ -914,7 +1136,7 @@ impl Detail {
         if self.checks_worktree != *worktree {
             return;
         }
-        match self.message.focus_handle(cx).is_focused(window) {
+        match self.message.read(cx).contains_focus(window, cx) {
             true => self.leave_composer(window, cx),
             false => self.close_composer(cx),
         }
@@ -1083,11 +1305,11 @@ impl Detail {
         if diff.trim().is_empty() || self.writing.is_some() {
             return;
         }
-        let notes = self.message.read(cx).text().to_owned();
+        let notes = self.message.read(cx).text(cx);
         let prompt = ai::commit_prompt(&notes, &diff);
         let kept = notes.clone();
         let input = self.message.clone();
-        input.update(cx, |input, _| input.break_undo_run());
+        input.update(cx, |input, cx| input.break_undo_run(cx));
         let task = cx.spawn(async move |this, cx| {
             // Without a code fence around it, as a model can put one.
             let written = ai::write(ai::COMMIT_SYSTEM, prompt, |text| {
@@ -1163,22 +1385,36 @@ impl Detail {
                     whole && check == Toggled::True,
                 )
             });
-        let target = self.effective_target(project, cx);
-        let message_focused = self.message.focus_handle(cx).is_focused(window);
-        v_flex()
-            .flex_none()
+        // Where the navigator places the commit, while it does: a new branch by where it goes,
+        // as it has no name yet.
+        let target = match self.committing(cx) {
+            Some(moving) => match moving.commit_to(self.store.read(cx)) {
+                Some(CommitTo::Branch(branch) | CommitTo::BelowCommit { branch, .. }) => {
+                    short_ref(&branch).into_owned()
+                }
+                Some(CommitTo::NewBranchAt {
+                    beside: Some((beside, below)),
+                    ..
+                }) => {
+                    let side = if below { "below" } else { "above" };
+                    format!("new branch {side} {}", short_ref(&beside))
+                }
+                Some(CommitTo::NewBranchAt { beside: None, .. }) | None => NEW_STACK.into(),
+            },
+            None => (self.effective_target(project, cx))
+                .map_or(NEW_STACK.into(), |branch| short_ref(&branch).into_owned()),
+        };
+        let compose = v_flex()
             .p(dp(12.))
+            .pb_0()
             .gap(dp(8.))
-            .border_t_1()
-            .border_color(theme.border_3)
-            .bg(theme.bg_1)
             .child(
                 h_flex()
                     .gap(dp(6.))
                     .text_size(dp(12.))
                     .text_color(theme.text_2)
                     .child("Commit to")
-                    .child(self.render_target_picker(target.as_ref(), theme, cx))
+                    .child(self.render_target_picker(target, theme, cx))
                     // Saying it's writing, as an answer can take a while to start. Above the
                     // box, as in it the words would run under it.
                     .when(self.writing.is_some(), |el| {
@@ -1186,60 +1422,46 @@ impl Detail {
                     }),
             )
             .child(
-                div()
-                    .relative()
-                    .child(
-                        field(&self.message, message_focused, theme)
-                            .pl(dp(10.))
-                            // Clear of the AI button in the corner.
-                            .pr(dp(30.))
-                            .py(dp(8.))
-                            .rounded(dp(6.))
-                            .line_height(dp(19.))
-                            .cursor_text()
-                            .id("message-box")
-                            .min_h(dp(84.))
-                            .max_h(dp(260.))
-                            .overflow_y_scroll()
-                            .track_scroll(&self.message_scroll)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.focus_message(window, cx)),
-                            ),
-                    )
-                    .child(
-                        div().absolute().top(dp(4.)).right(dp(4.)).child(
-                            icon_button(
-                                match self.writing {
-                                    Some(_) => "writing-message",
-                                    None => "write-message",
-                                },
-                                Icon::Ai,
-                            )
-                            .small()
-                            .disabled_because(
-                                (self.writing.is_none() && checked == 0)
-                                    .then_some("Check some changes to write about"),
-                            )
-                            .tooltip(if self.writing.is_some() {
-                                "Writing… Click to keep what's written so far"
-                            } else {
-                                "Write the message with AI, guided by what's in the box"
-                            })
-                            // A slow model, as a local one can be, would otherwise hold the
-                            // commit until it's done.
-                            .on_click(cx.listener(|this, _, _, cx| match this.writing.take() {
-                                // Before it wrote anything, what guided it comes back.
-                                Some((_, notes)) if this.message.read(cx).text().is_empty() => {
-                                    (this.message).update(cx, |input, cx| input.set_text(notes, cx))
-                                }
-                                Some(_) => cx.notify(),
-                                None => this.write_message(cx),
-                            })),
-                        ),
+                div().relative().child(self.message.clone()).child(
+                    div().absolute().top(dp(4.)).right(dp(4.)).child(
+                        icon_button(
+                            match self.writing {
+                                Some(_) => "writing-message",
+                                None => "write-message",
+                            },
+                            Icon::Ai,
+                        )
+                        .small()
+                        .disabled_because(
+                            (self.writing.is_none() && checked == 0)
+                                .then_some("Check some changes to write about"),
+                        )
+                        .tooltip(if self.writing.is_some() {
+                            "Writing… Click to keep what's written so far"
+                        } else {
+                            "Write the message with AI, guided by what's in the box"
+                        })
+                        // A slow model, as a local one can be, would otherwise hold the
+                        // commit until it's done.
+                        .on_click(cx.listener(|this, _, _, cx| match this.writing.take() {
+                            // Before it wrote anything, what guided it comes back.
+                            Some((_, notes)) if this.message.read(cx).text(cx).is_empty() => {
+                                (this.message).update(cx, |input, cx| input.set_text(notes, cx))
+                            }
+                            Some(_) => cx.notify(),
+                            None => this.write_message(cx),
+                        })),
                     ),
-            )
+                ),
+            );
+        v_flex()
+            .flex_none()
+            .border_t_1()
+            .border_color(theme.border_3)
+            .bg(theme.bg_1)
+            .child(compose)
             .child(
-                h_flex()
+                super::panes::footer_bar()
                     .gap(dp(6.))
                     .child(
                         // Every line of them, said shorter, so a narrow pane cuts at most the
@@ -1293,13 +1515,10 @@ impl Detail {
                     .child(
                         button("commit", "Commit")
                             .small()
+                            .min_width(dp(super::COMMIT_BUTTON_WIDTH))
                             .style(ButtonStyle::Pop)
-                            .disabled_because(match files.is_empty() {
-                                true => self.composing_on_changes.then_some(COMMITTED_MEANWHILE),
-                                false => (checked == 0).then_some("Check some changes first"),
-                            })
                             .tooltip_with_key(
-                                if files.is_empty() {
+                                if checked == 0 {
                                     "Make an empty commit"
                                 } else {
                                     "Commit the checked changes"
@@ -1312,15 +1531,14 @@ impl Detail {
             .into_any_element()
     }
 
-    /// The branch the commit goes to, which picks another in the main checkout. A linked
-    /// worktree's commits go on the branch it has checked out.
+    /// Where the commit goes, said as `label`, which picks another branch in the main checkout.
+    /// A linked worktree's commits go on its own branches.
     fn render_target_picker(
         &self,
-        target: Option<&FullName>,
+        label: String,
         theme: &Theme,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let label = target.map_or("a new branch".into(), short_ref).into_owned();
         let key = shortcut(&PickCommitTarget, cx);
         h_flex()
             .id("commit-target")
@@ -1346,7 +1564,7 @@ impl Detail {
 
     /// Pick the branch the next commit goes to, or make a new one for it, typing to filter.
     pub(crate) fn pick_commit_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Selection::Uncommitted(project)) = self.selection(cx) else {
+        let Some(Selection::Uncommitted(project, Checkout::Main)) = self.selection(cx) else {
             return;
         };
         let current = self.effective_target(&project, cx);
@@ -1355,7 +1573,7 @@ impl Detail {
             return;
         };
         let store = self.store.read(cx);
-        let place = store.place(&Selection::Uncommitted(project.clone()));
+        let place = store.place(&Selection::Uncommitted(project.clone(), Checkout::Main));
         let mut choices: Vec<Choice> = (workspace.branches_in(&Checkout::Main))
             .filter(|branch| takes_commits(store, &project, branch))
             .filter_map(|branch| {
@@ -1373,6 +1591,7 @@ impl Detail {
                                 format!("{name} was renamed or left the workspace meanwhile");
                             return snack(&detail.store, gone, cx);
                         }
+                        detail.place_on(&ref_name, cx);
                         detail.commit_target = Some(ref_name);
                         cx.notify();
                     }))
@@ -1388,6 +1607,12 @@ impl Detail {
         choices.push(Choice::naming("New branch", move |this, name, _, cx| {
             let (targeted, detail) = (project.clone(), detail.clone());
             let name = (!name.is_empty()).then(|| name.to_owned());
+            // While the navigator places the commit, there, made with it.
+            let named = name.clone();
+            let placed = detail.update(cx, |detail, cx| detail.place_in_new_branch(named, cx));
+            if placed.unwrap_or(false) {
+                return;
+            }
             // The new branch becomes the target, rather than the page shown.
             let done = move |store: &mut Store, branch: FullName, cx: &mut Context<Store>| {
                 let message = format!("Created {}", short_ref(&branch));
@@ -1420,6 +1645,16 @@ impl Detail {
             )
         });
     }
+}
+
+/// What a commit's new branch in a stack of its own is called before it has a name.
+const NEW_STACK: &str = "new independent branch";
+
+/// Whether `moving` places a commit of `project`'s checkout `worktree`'s changes.
+fn places(moving: &Move, project: Option<&ProjectId>, worktree: &Checkout) -> bool {
+    moving.op == Op::Commit
+        && Some(&moving.project) == project
+        && matches!(&moving.what, Moving::Files { worktree: of, .. } if of == worktree)
 }
 
 /// Whether the composer commits to `branch`. Not to the default branch, as new work goes on a
@@ -1474,6 +1709,7 @@ mod tests {
         let hunk = |key, added: &str| Hunk {
             key,
             header: String::new(),
+            patch: "".into(),
             lines: vec![
                 line(LineKind::Context, "fn main() {"),
                 line(LineKind::Removed, "    old();"),

@@ -10,6 +10,7 @@ pub mod cli;
 pub mod conflicts;
 mod diff;
 pub mod edit;
+pub mod graph;
 mod highlight;
 pub mod history;
 pub mod images;
@@ -327,6 +328,7 @@ pub fn load_workspace(path: &Path, kept: Kept) -> Result<Workspace> {
         (head.as_ref()).is_some_and(|name| name.as_bstr() == but_core::WORKSPACE_REF_NAME);
     let tree = head_tree(&repo);
     let git_operation = git_operation(&repo);
+    let oplog_at_start = history::oplog_head(&ctx);
     // The uncommitted files and the refs are read beside the workspace's graph, which takes
     // longest, rather than before it: on a large repository, cold from disk, they take
     // hundreds of milliseconds.
@@ -425,6 +427,8 @@ pub fn load_workspace(path: &Path, kept: Kept) -> Result<Workspace> {
         }),
         worktrees,
         archived_worktrees,
+        oplog: history::newest_entries(&ctx),
+        oplog_at_start,
     })
 }
 
@@ -439,7 +443,7 @@ fn target(
 ) -> Result<(Option<Target>, Option<String>)> {
     // What's new is what the target branch's upstream has that what's checked out doesn't:
     // what a pull brings in. Without an upstream, it's what the local target branch itself
-    // gained, as from a land or a `git merge` into it.
+    // gained, as from merging a branch or a `git merge` into it.
     let repo = ctx.repo.get()?;
     let Some((meta, source)) = meta.and_then(|meta| Some((meta, target_source(&repo, meta)?)))
     else {
@@ -517,15 +521,17 @@ fn worktree_branches(
         .collect()
 }
 
-/// A hash of the pull requests the forge cache knows, so a refresh that learns of one, or
-/// of a new title or state, has the Branches page list them again.
+/// A hash of the pull requests the forge cache knows, so a refresh that learns of one, or of
+/// a change to one, as its description edited, has the Branches page list them again.
 fn reviews_fingerprint(cached: &HashMap<u64, but_forge::ForgeReview>) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     // Order-free, as the map's order isn't fixed.
     cached.values().fold(0, |sum, review| {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         let settled = (&review.merged_at, &review.closed_at);
-        (review.number, &review.title, review.draft, settled).hash(&mut hasher);
+        // When it changed rather than its description, which can be long.
+        let changed = &review.modified_at;
+        (review.number, &review.title, review.draft, settled, changed).hash(&mut hasher);
         sum ^ hasher.finish()
     })
 }
@@ -1343,6 +1349,7 @@ mod failure_tests {
                 UnresolvedLegacyTargetRefError {
                     target_ref: "refs/remotes/origin/main".try_into().unwrap(),
                     reason,
+                    track_command: None,
                     target_commit_id: None,
                     push_remote: None,
                 },

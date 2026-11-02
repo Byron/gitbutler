@@ -2,7 +2,7 @@
 //! selection, what's been cut, and each project's operation in flight.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -27,24 +27,35 @@ mod mutation;
 mod picks;
 mod saved;
 mod seen;
+mod terminals;
 
 pub use activity::{Activity, QUARTER, SeenCommit};
 use load::{Change, Reload};
 pub use mesh::{MeshBranch, MeshPick, MeshState};
 use mutation::Running;
-pub use mutation::{Label, NewAt, Overlay, Rereads, SLOW, branch_moved, conflicted_parts};
+pub use mutation::{
+    Label, NewAt, Overlay, Rereads, SLOW, branch_moved, conflicted_parts, up_to_date,
+};
 pub use picks::Picks;
-pub use saved::{BranchStatus, FileSort, Pane, Prefs, ScopeLines, WatchedOrder};
+pub use saved::{
+    BranchStatus, FileSort, FileView, Pane, Prefs, ScopeLines, TerminalRuns, WatchedOrder,
+};
 use saved::{Restored, Saved};
 use seen::Seen;
 pub use seen::{GLOW, Seeable};
+pub use terminals::Terminals;
 
 pub type ProjectId = SharedString;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Selection {
     Project(ProjectId),
-    Uncommitted(ProjectId),
+    /// A worktree's heading, the main one's or a linked one's by name, whose page is its
+    /// overview: what's going on in it and what just happened there.
+    Checkout(ProjectId, Checkout),
+    /// A worktree's uncommitted changes, first under its heading, whose page is their files
+    /// and diff; the main worktree's are also the files of a commit being edited.
+    Uncommitted(ProjectId, Checkout),
     /// A branch by its full ref, or `None` for an unnamed one.
     Branch(ProjectId, Option<FullName>),
     Commit(ProjectId, CommitId),
@@ -52,8 +63,8 @@ pub enum Selection {
     Branches(ProjectId),
     /// The operation log, to look back at and restore.
     History(ProjectId),
-    /// A linked worktree, by name, and its uncommitted changes.
-    Worktree(ProjectId, bstr::BString),
+    /// The project's commits drawn as a graph, the workspace's and the history below them.
+    Graph(ProjectId),
     /// A stack of two or more branches, by its bottom branch, and what they change together.
     Stack(ProjectId, Option<FullName>),
     /// A checkout of the project on one of the user's other machines, by the mesh's id for
@@ -64,6 +75,8 @@ pub enum Selection {
     Upstream(ProjectId, Option<FullName>, CommitId),
     /// The heading over a section of a project's card, whose page shows what it folds away.
     Section(ProjectId, Section),
+    /// A terminal open on one of the project's worktrees.
+    Terminal(ProjectId, crate::terminal::TerminalId),
 }
 
 /// A section of a project's card that folds away under its heading.
@@ -79,26 +92,21 @@ pub enum Section {
 }
 
 impl Selection {
-    pub fn uncommitted_in(project: ProjectId, checkout: Checkout) -> Self {
-        match checkout {
-            Checkout::Main => Selection::Uncommitted(project),
-            Checkout::Linked(name) => Selection::Worktree(project, name),
-        }
-    }
-
     pub fn project(&self) -> &ProjectId {
         match self {
             Selection::Project(project)
-            | Selection::Uncommitted(project)
+            | Selection::Checkout(project, _)
+            | Selection::Uncommitted(project, _)
             | Selection::Branch(project, _)
             | Selection::Commit(project, _)
             | Selection::Branches(project)
             | Selection::History(project)
-            | Selection::Worktree(project, _)
+            | Selection::Graph(project)
             | Selection::Stack(project, _)
             | Selection::Mesh(project, ..)
             | Selection::Upstream(project, ..)
-            | Selection::Section(project, _) => project,
+            | Selection::Section(project, _)
+            | Selection::Terminal(project, _) => project,
         }
     }
 
@@ -130,7 +138,7 @@ pub enum Cut {
     /// Commits to put copies of somewhere else, the picked ones together, in the order
     /// they're listed.
     CherryPick(ProjectId, Arc<[CommitId]>),
-    /// A branch to stack on another, with the branches above it.
+    /// A branch to stack on another, without the branches above it.
     Branch(ProjectId, FullName),
     /// Files from the worktree (`from: None`), down to the hunks checked, or from a commit.
     Files {
@@ -141,6 +149,8 @@ pub enum Cut {
         /// Shared, since every row a drag passes over works out what a drop would do.
         files: Arc<[Selected]>,
     },
+    /// A linked worktree to put elsewhere among the others, by name.
+    Worktree(ProjectId, bstr::BString),
 }
 
 impl Cut {
@@ -149,7 +159,31 @@ impl Cut {
             Cut::Commit(project, _)
             | Cut::CherryPick(project, _)
             | Cut::Branch(project, _)
-            | Cut::Files { project, .. } => project,
+            | Cut::Files { project, .. }
+            | Cut::Worktree(project, _) => project,
+        }
+    }
+
+    /// Without the files that can't land ([`Selected::movable`]), if any can.
+    pub fn movable(self) -> Option<Self> {
+        match self {
+            Cut::Files {
+                project,
+                from,
+                worktree,
+                files,
+            } => {
+                let files: Arc<[Selected]> = (files.iter().filter(|file| file.movable()))
+                    .cloned()
+                    .collect();
+                (!files.is_empty()).then_some(Cut::Files {
+                    project,
+                    from,
+                    worktree,
+                    files,
+                })
+            }
+            cut => Some(cut),
         }
     }
 
@@ -184,6 +218,33 @@ impl Cut {
                 },
                 files => format!("{} files", files.len()),
             },
+            Cut::Worktree(_, name) => name.to_string(),
+        }
+    }
+
+    /// What a terminal pastes when it's dropped there, as ⌘C copies its row, from its
+    /// project's `workspace`, whose main checkout is `main`: each commit's
+    /// [`reference`](Commit::reference), a branch's name, or a worktree's folder. Nothing once
+    /// a commit or worktree it holds is gone.
+    pub fn pasted(&self, main: &Path, workspace: &Workspace) -> Option<Vec<String>> {
+        let folder = |checkout: &Checkout| {
+            let path = workspace.checkout_path(main, checkout)?;
+            Some(vec![path.display().to_string()])
+        };
+        match self {
+            Cut::Commit(_, ids) | Cut::CherryPick(_, ids) => (ids.iter())
+                .map(|id| Some(workspace.find_commit(*id)?.1.reference()))
+                .collect(),
+            Cut::Branch(_, ref_name) => Some(vec![short_ref(ref_name).into_owned()]),
+            Cut::Worktree(_, name) => folder(&Checkout::Linked(name.clone())),
+            // A worktree's row drags its files, which mean it here: a terminal covers the file
+            // list, the only other place they're dragged from.
+            Cut::Files {
+                from: None,
+                worktree,
+                ..
+            } => folder(worktree),
+            Cut::Files { from: Some(_), .. } => None,
         }
     }
 }
@@ -206,6 +267,8 @@ pub enum StoreEvent {
     /// Git has no author to record commits with in a project: ask for the user's name and
     /// email.
     AuthorMissing(ProjectId),
+    /// A terminal was opened and selected, to type in.
+    TerminalOpened,
 }
 
 /// An error card's button: its label, and what it runs.
@@ -310,8 +373,14 @@ pub struct Store {
     /// What the pointer is dragging, followed as agents rewrite it: GPUI's own copy stays as
     /// the drag began. Only meaningful while GPUI has a drag active.
     pub dragging: Option<Cut>,
+    /// What a terminal pastes of a drag from the diff, as it began: the patch of what it
+    /// carries ([`Store::pasted`]). Only meaningful while GPUI has a drag active.
+    pub dragged_patch: Option<String>,
     /// The row the drag is over and where on it a drop lands, when it takes the drop.
     pub drop_at: Option<(Selection, crate::transfer::Place)>,
+    /// Commits being moved with the keys, followed as agents rewrite them, until they land or
+    /// the selection goes elsewhere.
+    pub moving: Option<crate::transfer::Move>,
     /// Pane widths the user dragged away from their defaults.
     widths: HashMap<Pane, f32>,
     /// Where the window is, saved for the next launch.
@@ -344,6 +413,7 @@ pub struct Store {
     /// The user's other machines, and what they have of the watched projects. Everything the
     /// mesh does lives in `state/mesh.rs`; see the crate's AGENTS.md for its rules.
     pub mesh: mesh::Mesh,
+    pub terminals: Terminals,
     /// Each project's operation in flight, one at a time until the reload after it lands, so
     /// the next sees what it did, plus those that run beside it ([`backend::OpKind::beside`]).
     /// Projects don't wait on each other.
@@ -388,7 +458,8 @@ pub struct Store {
     pub merged: HashMap<CommitId, Option<(Vec<TargetCommit>, bool)>>,
     /// The commits each project had before the app's last operation on it, and the checkouts
     /// it made commits in: see [`Overlay::checkouts`]. Commits that appear there after it are
-    /// the app's own doing, so they load as already seen.
+    /// the app's own doing, so they load as already seen. A person's operations with the CLI
+    /// or the TUI set it too, for every checkout, when the load after them shows they ran.
     rebaseline: HashMap<ProjectId, (HashSet<String>, mutation::Checkouts)>,
     save_task: Task<()>,
     save_queued: bool,
@@ -474,7 +545,9 @@ impl Store {
             added: None,
             asked_author: false,
             dragging: None,
+            dragged_patch: None,
             drop_at: None,
+            moving: None,
             toasts: Vec::new(),
             account: account::Account::default(),
             cli: None,
@@ -483,6 +556,7 @@ impl Store {
             updating: None,
             update_put_off: None,
             mesh: mesh::Mesh::start(cx),
+            terminals: Terminals::default(),
             running: Vec::new(),
             ops_started: 0,
             own_writes: HashMap::new(),
@@ -653,14 +727,17 @@ impl Store {
             Selection::Branch(_, ref_name) => workspace.find_branch(ref_name.as_ref()),
             Selection::Commit(_, id) => workspace.find_commit(*id).map(|(branch, _)| branch),
             Selection::Project(_)
-            | Selection::Uncommitted(_)
+            | Selection::Checkout(..)
+            | Selection::Uncommitted(_, Checkout::Main)
             | Selection::Branches(_)
             | Selection::History(_)
-            | Selection::Worktree(..)
+            | Selection::Graph(_)
+            | Selection::Uncommitted(_, Checkout::Linked(_))
             | Selection::Stack(..)
             | Selection::Mesh(..)
             | Selection::Upstream(..)
-            | Selection::Section(..) => None,
+            | Selection::Section(..)
+            | Selection::Terminal(..) => None,
         }
     }
 
@@ -725,6 +802,21 @@ impl Store {
         self.set_prefs(|prefs| prefs.watched_order = order, cx);
     }
 
+    /// Put the watched projects in `order` by hand, switching to the manual order from the one
+    /// picked if it's another and that changes where they are.
+    pub fn order_watched(&mut self, order: &[ProjectId], cx: &mut Context<Self>) {
+        let watched = self.expanded_ids();
+        self.order_projects(order);
+        if self.expanded_ids() == watched && self.prefs.watched_order == WatchedOrder::Manual {
+            return;
+        }
+        self.save_soon(cx);
+        match self.prefs.watched_order {
+            WatchedOrder::Manual => cx.notify(),
+            _ => self.set_prefs(|prefs| prefs.watched_order = WatchedOrder::Manual, cx),
+        }
+    }
+
     /// The projects open in the navigator.
     pub(crate) fn expanded_ids(&self) -> Vec<ProjectId> {
         (self.projects.iter())
@@ -743,33 +835,7 @@ impl Store {
         let Some(workspace) = self.workspace(selection.project()) else {
             return;
         };
-        let still_there = match &selection {
-            Selection::Project(_)
-            | Selection::Uncommitted(_)
-            | Selection::Branches(_)
-            | Selection::History(_) => true,
-            Selection::Branch(_, ref_name) => workspace.find_branch(ref_name.as_ref()).is_some(),
-            Selection::Commit(_, id) => workspace.find_commit(*id).is_some(),
-            Selection::Worktree(_, name) => workspace.worktrees.iter().any(|w| w.name == *name),
-            Selection::Stack(_, bottom) => workspace
-                .lane(bottom.as_ref())
-                .is_some_and(|lane| lane.branches.len() > 1),
-            // The mesh's reads keep it current.
-            Selection::Mesh(..) | Selection::Section(_, Section::Mesh) => true,
-            Selection::Section(_, Section::Upstream(ref_name)) => {
-                !workspace.upstream(ref_name.as_ref()).is_empty()
-            }
-            Selection::Section(_, Section::Inactive) => {
-                workspace.worktrees.iter().any(|wt| wt.is_inactive())
-            }
-            Selection::Upstream(project, ref_name, id) => {
-                (workspace.upstream(ref_name.as_ref()).iter()).any(|c| c.id == *id)
-                    || self
-                        .merged_upstream(project, ref_name.as_ref(), *id)
-                        .is_some()
-            }
-        };
-        if !still_there {
+        if !self.still_there(&selection) {
             // A remote's commit, pulled or brought in by an update, goes up to its branch, or
             // the target's to the project's page, as does a section emptied.
             let project = selection.project().clone();
@@ -783,10 +849,69 @@ impl Store {
                 Selection::Upstream(_, None, _) | Selection::Section(..) => {
                     Selection::Project(project)
                 }
-                _ => Selection::Uncommitted(project),
+                // Changes all committed or discarded go up to their worktree's heading, if it's
+                // still there.
+                Selection::Uncommitted(_, checkout)
+                    if self
+                        .still_there(&Selection::Checkout(project.clone(), checkout.clone())) =>
+                {
+                    Selection::Checkout(project, checkout)
+                }
+                _ => Selection::Checkout(project, Checkout::Main),
             };
             self.select(Some(home), cx);
         }
+    }
+
+    /// Whether `selection` points at something its project's last read still has, or at
+    /// something in a project not read yet.
+    pub fn still_there(&self, selection: &Selection) -> bool {
+        let Some(workspace) = self.workspace(selection.project()) else {
+            return true;
+        };
+        match selection {
+            Selection::Project(_)
+            | Selection::Branches(_)
+            | Selection::History(_)
+            | Selection::Graph(_)
+            | Selection::Checkout(_, Checkout::Main) => true,
+            Selection::Branch(_, ref_name) => workspace.find_branch(ref_name.as_ref()).is_some(),
+            Selection::Commit(_, id) => workspace.find_commit(*id).is_some(),
+            Selection::Checkout(_, Checkout::Linked(name)) => {
+                workspace.worktrees.iter().any(|w| w.name == *name)
+            }
+            // Listed only with something uncommitted, or as a commit being edited's files.
+            Selection::Uncommitted(_, checkout) => {
+                (workspace.editing.is_some() && *checkout == Checkout::Main)
+                    || workspace
+                        .uncommitted_in(checkout)
+                        .is_some_and(|f| !f.is_empty())
+            }
+            Selection::Terminal(_, id) => self.terminals.get(*id).is_some(),
+            Selection::Stack(_, bottom) => workspace
+                .lane(bottom.as_ref())
+                .is_some_and(|lane| lane.branches.len() > 1),
+            // The mesh's reads keep it current.
+            Selection::Mesh(..) | Selection::Section(_, Section::Mesh) => true,
+            Selection::Section(_, Section::Upstream(ref_name)) => {
+                !workspace.upstream(ref_name.as_ref()).is_empty()
+            }
+            Selection::Section(_, Section::Inactive) => {
+                let after = self.prefs.inactive_after;
+                workspace.worktrees.iter().any(|wt| wt.is_inactive(after))
+            }
+            Selection::Upstream(project, ref_name, id) => {
+                (workspace.upstream(ref_name.as_ref()).iter()).any(|c| c.id == *id)
+                    || self
+                        .merged_upstream(project, ref_name.as_ref(), *id)
+                        .is_some()
+            }
+        }
+    }
+
+    /// Whether no part of the window shows.
+    pub fn hidden(&self) -> bool {
+        self.hidden
     }
 
     pub fn select(&mut self, selection: Option<Selection>, cx: &mut Context<Self>) {
@@ -795,6 +920,13 @@ impl Store {
         }
         self.followed = None;
         self.made = None;
+        // A move is of what's selected, so it ends once the selection goes elsewhere, as a
+        // click on another row takes it.
+        if let Some(moving) = &self.moving
+            && !selection.as_ref().is_some_and(|item| moving.holds(item))
+        {
+            self.set_moving(None, cx);
+        }
         if !self.picked.is_empty() {
             self.picked.clear();
             cx.notify();
@@ -839,6 +971,7 @@ impl Store {
             .detach();
         }
         self.selection = selection;
+        self.show_terminals(cx);
         self.save_soon(cx);
         cx.emit(StoreEvent::SelectionChanged);
         cx.notify();
@@ -854,22 +987,30 @@ impl Store {
         };
         let view = match selection {
             Selection::Project(_) => "project",
-            Selection::Uncommitted(_) => "uncommitted",
+            Selection::Checkout(..) => "checkout",
+            Selection::Uncommitted(_, Checkout::Main) => "uncommitted",
             Selection::Branch(..) => "branch",
             Selection::Commit(..) => "commit",
             Selection::Branches(_) => "branches",
             Selection::History(_) => "history",
-            Selection::Worktree(..) => "worktree",
+            Selection::Graph(_) => "graph",
+            Selection::Uncommitted(_, Checkout::Linked(_)) => "worktree",
             Selection::Stack(..) => "stack",
             Selection::Mesh(..) => "mesh",
             Selection::Upstream(..) => "upstream",
             Selection::Section(..) => "section",
+            Selection::Terminal(..) => "terminal",
         };
         backend::metrics::viewed(view, || backend::metrics::State {
             theme: match self.prefs.appearance {
                 crate::theme::Appearance::System => "system",
                 crate::theme::Appearance::Light => "light",
                 crate::theme::Appearance::Dark => "dark",
+            },
+            color_scheme: match self.prefs.color_scheme {
+                crate::theme::ColorScheme::GitButler => "gitbutler",
+                crate::theme::ColorScheme::Ghostty => "ghostty",
+                crate::theme::ColorScheme::Named(_) => "named",
             },
             zoom: f64::from(self.prefs.ui_scale.percent()) / 100.,
             editor: self.prefs.editor.as_deref(),
@@ -945,7 +1086,7 @@ impl Store {
     }
 
     /// Keep ⌘Z, and the snackbar's Undo, from taking back the mutation that just ran, as a
-    /// land, which the target keeps; History can still restore to before it.
+    /// merge, which the target keeps; History can still restore to before it.
     pub fn drop_last_step(&mut self) -> Option<(ProjectId, SnapshotId)> {
         let (project, snapshot) = self.last_snapshot.take()?;
         (self.undo_steps).retain(|step| step.project != project || step.snapshot != snapshot);
@@ -1164,5 +1305,95 @@ impl Store {
         }
         self.cut = cut;
         cx.notify();
+    }
+
+    pub fn set_moving(&mut self, moving: Option<crate::transfer::Move>, cx: &mut Context<Self>) {
+        self.moving = moving;
+        cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::model::build::full;
+    use crate::backend::{Lane, PushState, Worktree};
+
+    #[test]
+    fn a_row_dropped_on_a_terminal_pastes_its_name_or_folder() {
+        let project = ProjectId::from("p");
+        let [kept, gone] = [1, 2].map(|n| CommitId(gix::ObjectId::from([n; 20])));
+        let feat = full("refs/heads/feat");
+        let workspace = Workspace {
+            lanes: vec![Lane {
+                branches: vec![Branch {
+                    name: "feat".into(),
+                    ref_name: Some(feat.clone()),
+                    commits: vec![Commit {
+                        key: "vtlrvnlmsxrmrsnrkvqlwrzqokpsoxzk".into(),
+                        ..Commit::bare(kept.0)
+                    }],
+                    incoming: Vec::new(),
+                    remote: None,
+                    push: PushState::NeverPushed,
+                    review: None,
+                }],
+                checkout: Checkout::Main,
+                rests_on: None,
+            }],
+            worktrees: vec![Worktree {
+                name: "agent".into(),
+                path: "/work/agent".into(),
+                branch: None,
+                uncommitted: Vec::new(),
+                git_operation: None,
+                tree: None,
+                updated_at: None,
+            }],
+            ..Workspace::default()
+        };
+        let pasted = |cut: Cut| cut.pasted(Path::new("/work/repo"), &workspace);
+        let words = |words: &[&str]| Some(words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
+        let files = |worktree| Cut::Files {
+            project: project.clone(),
+            from: None,
+            worktree,
+            files: Arc::from([]),
+        };
+        assert_eq!(
+            pasted(Cut::Commit(project.clone(), Arc::from([kept]))),
+            words(&["vtlrvnlmsxrmrsnrkvqlwrzqokpsoxzk"]),
+            "a commit by its change ID"
+        );
+        assert_eq!(
+            pasted(Cut::Commit(project.clone(), Arc::from([kept, gone]))),
+            None,
+            "nothing once a commit it holds is gone, rather than a stale id"
+        );
+        assert_eq!(
+            pasted(Cut::Branch(project.clone(), feat)),
+            words(&["feat"]),
+            "a branch by its short name"
+        );
+        assert_eq!(
+            pasted(Cut::Worktree(project.clone(), "agent".into())),
+            words(&["/work/agent"]),
+            "a linked worktree by its folder"
+        );
+        assert_eq!(
+            pasted(Cut::Worktree(project.clone(), "removed".into())),
+            None,
+            "nothing for a worktree that's gone"
+        );
+        assert_eq!(
+            pasted(files(Checkout::Main)),
+            words(&["/work/repo"]),
+            "the main worktree's row drags its files, which paste its folder"
+        );
+        assert_eq!(
+            pasted(files(Checkout::Linked("agent".into()))),
+            words(&["/work/agent"]),
+            "and a linked worktree's its own"
+        );
     }
 }

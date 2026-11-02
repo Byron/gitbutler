@@ -1,4 +1,4 @@
-use std::fmt::Write;
+use std::{fmt::Write, path::Path};
 
 use crate::theme::{self, Paint};
 use but_core::{WORKSPACE_REF_NAME, sync::LockScope};
@@ -7,8 +7,9 @@ use command_group::AsyncCommandGroup;
 
 use crate::{
     args::Args,
+    command::worktree::archive::{self, ArchivalOperation},
     error::{CliResult, bad_input},
-    utils::{OutputChannel, binary_path::current_exe_for_but_exec},
+    utils::{OutputChannel, binary_path::current_exe_for_but_exec, change_source::InvokedFrom},
 };
 
 #[derive(Default)]
@@ -56,8 +57,9 @@ pub(crate) struct InitCtxOptions {
 /// Gets or initializes a non-bare repository context.
 ///
 /// This function discovers the git repository from the current directory, finds or initializes
-/// the GitButler project for that repository, and optionally triggers a background sync if
-/// the configured interval has elapsed.
+/// the GitButler project for that repository, unarchives the linked worktree the current
+/// directory is in, and optionally triggers a background sync if the configured interval has
+/// elapsed.
 ///
 /// # Arguments
 ///
@@ -111,8 +113,8 @@ pub fn init_ctx(
     // lets try to get the repo from the current directory
     let repo = match but_ctx::discover_main_repo(&args.current_dir) {
         Ok(repo) => repo,
-        Err(_) => {
-            return Err(bad_input(format!(
+        Err(err) => {
+            let mut no_repo = bad_input(format!(
                 "No git repository found at {}",
                 args.current_dir
                     .strip_prefix(".")
@@ -120,8 +122,12 @@ pub fn init_ctx(
                     .join(".git")
                     .display()
             ))
-            .hint("Run `but init` to initialize a Git repository.")
-            .into());
+            .hint("Run `but init` to initialize a Git repository.");
+            // Other discovery failures stay uncoded, so filtering out the code can't hide them.
+            if crate::is_not_in_git_repository_error(&err) {
+                no_repo = no_repo.code("NoGitRepository");
+            }
+            return Err(no_repo.into());
         }
     };
 
@@ -185,6 +191,8 @@ pub fn init_ctx(
         }
     };
 
+    unarchive_invoked_worktree(&ctx, &args.current_dir)?;
+
     // If this is the first time running GitButler, show a metrics info message and update onboarding status
     if !ctx.settings.onboarding_complete && out.format().allows_human_ui() {
         crate::command::onboarding::handle(out)?;
@@ -221,6 +229,30 @@ pub fn init_ctx(
     Ok(ctx)
 }
 
+/// Unarchive the linked worktree `directory` is in, as running `but` there means it is in use.
+///
+/// An archived worktree is left out of the workspace, so every command run in it would refuse
+/// its changes or show none. Worktrees already on disk when GitButler first reads a repository
+/// start out archived, which includes the one an agent harness made before its first `but` call.
+fn unarchive_invoked_worktree(ctx: &Context, directory: &Path) -> anyhow::Result<()> {
+    let InvokedFrom::LinkedWorktree(name) = InvokedFrom::discover(directory)? else {
+        return Ok(());
+    };
+    let archived = ctx
+        .worktrees_with_state()?
+        .into_iter()
+        .any(|worktree| worktree.archived && worktree.name == name);
+    if archived {
+        let guard = ctx.shared_worktree_access();
+        let op = ArchivalOperation {
+            worktree: name,
+            archived: false,
+        };
+        let _outcome = archive::run(ctx, guard.read_permission(), op)?;
+    }
+    Ok(())
+}
+
 fn infer_target(ctx: &mut Context) -> CliResult<()> {
     if ctx.project_meta()?.target_ref.is_none() {
         let target_ref = {
@@ -232,11 +264,11 @@ fn infer_target(ctx: &mut Context) -> CliResult<()> {
                     .hint("Run `but commit` to create an initial commit")
                     .into());
             } else {
-                return Err(anyhow::anyhow!(
-                    "No target branch is configured and none could be inferred. \
-                                Run `but config target <remote>/<branch>` to configure one."
-                )
-                .into());
+                return Err(
+                    bad_input("No target branch is configured and none could be inferred")
+                        .hint("Run `but config target <remote>/<branch>` to configure one")
+                        .into(),
+                );
             }
         };
 

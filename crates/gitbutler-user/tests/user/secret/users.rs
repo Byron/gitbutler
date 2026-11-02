@@ -1,6 +1,7 @@
 // use gitbutler_user::{credentials, credentials::count as count_secrets};
 use std::path::{Path, PathBuf};
 
+use but_secret::secret;
 use gitbutler_user::User;
 use serial_test::serial;
 
@@ -44,9 +45,10 @@ fn auto_migration_of_secrets_on_when_getting_and_setting_user() -> anyhow::Resul
                 );
                 if has_github_token {
                     assert_eq!(
-                        user.github_access_token()?.map(|s| s.0),
+                        secret::retrieve("github_access_token", secret::Namespace::BuildKind)?
+                            .map(|s| s.0),
                         Some("gho_AAAAAAAAAAAAABBBBBBBBBBBBBBBCCCCCCCC".into()),
-                        "it can make the access token available"
+                        "the GitHub token was migrated into the secret store"
                     );
                 }
                 Ok(())
@@ -70,8 +72,8 @@ fn auto_migration_of_secrets_on_when_getting_and_setting_user() -> anyhow::Resul
             };
             assert_no_secret_in_plain_text()?;
 
-            let user = gitbutler_user::get_user()?.expect("stored user can be read");
-            assert_access_token_values(&user)?;
+            let stored_user = gitbutler_user::get_user()?.expect("stored user can be read");
+            assert_access_token_values(&stored_user)?;
 
             gitbutler_user::delete_user()?;
             assert_eq!(
@@ -88,8 +90,7 @@ fn auto_migration_of_secrets_on_when_getting_and_setting_user() -> anyhow::Resul
             assert_eq!(
                 count_secrets(),
                 expected_secrets,
-                "the in-memory users had its secrets cached, so they are picked up and stored officially. \
-            This is important, as the frontend sends these initially"
+                "the original migrated user still has its secrets, so setting it persists them again"
             );
             assert_no_secret_in_plain_text()?;
 

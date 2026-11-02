@@ -1,20 +1,29 @@
-// A keymap like the `but` TUI's. So far its keys for moving around, copying, undoing, renaming
-// and adding an empty commit, Return to fold and unfold, and the keys the app's lists and
-// overlays need, as GitButler's keymap has them. `base.json`, which macOS gives every app,
-// binds after these. `secondary` is cmd on macOS and ctrl elsewhere; a section with "os" binds
-// only there. Order matters: within a context the binding added last wins, and the last binding
-// for an action is the key menus and tooltips show, so the TUI's letters come after the arrows.
+// A keymap like the `but` TUI's. So far its keys for moving around, copying, undoing, renaming,
+// committing, moving and squashing commits and adding an empty commit, Return to fold and unfold, f to show and hide the
+// files, / to filter or find, ⌘C to copy, ⌘K for the command palette, ⌘P to go to anything
+// and ⌘J to a terminal, ⌘T to open a terminal, ⌘R to fetch and ⇧⌘R to pull, ⌘1, ⌘2 and ⌘3 to go
+// to the navigator, the files and the diff, ⌘B and ⌥⌘B to show and hide the navigator and the
+// details, and the keys the app's lists and overlays need, as GitButler's keymap has them.
+// `base.json`, which macOS gives every app, binds after these. `secondary` is cmd on macOS and
+// ctrl elsewhere; a section with "os" binds only there. Order matters: within a context the
+// binding added last wins, and the last binding for an action is the key menus and tooltips
+// show, so the TUI's letters come after the arrows.
 [
-  // : for the TUI's command line, ? for its help, / for its jump and Esc to go back. y copies the
-  // selection and ⇧Y picks what else of it to copy. u undoes and ⇧U redoes. ← and →, or h and l,
-  // go to the pane on that side, as l focuses the TUI's details and h its status.
+  // ⌘K opens the command palette too, as in GitButler's keymap, first so : is the key shown.
+  {
+    "bindings": { "secondary-k": "app::CommandPalette" }
+  },
+  // : for the TUI's command line, ? for its help and Esc to go back. y copies the selection, as
+  // ⌘C does, bound first so y is the key shown, and ⇧Y picks what else of it to copy. u undoes
+  // and ⇧U redoes. ← and →, or h and l, go to the pane on that side, as l focuses the TUI's
+  // details and h its status.
   {
     "context": "Workspace && !TextInput",
     "bindings": {
       ":": "app::CommandPalette",
       "?": "settings::OpenKeyboardShortcuts",
-      "/": "palette::GoTo",
       "escape": "app::Cancel",
+      "secondary-c": "navigator::CopySelection",
       "y": "navigator::CopySelection",
       "shift-y": "palette::CopyMore",
       "u": "app::Undo",
@@ -25,10 +34,36 @@
       "h": "app::FocusPaneLeft"
     }
   },
-  // The TUI's status list: up and down, ⇧J and ⇧K between sections, g and ⇧G to either end. r
-  // renames, where the TUI's squashes, and n adds an empty commit above the selected one, or on
-  // top of the selected branch. Return folds or unfolds what the selected row heads: a card, a
-  // section, a worktree, a stack, a branch or a merge.
+  // ⌘R fetches, as in GitButler's keymap, and ⇧⌘R pulls: fetches, then updates the workspace
+  // and the worktrees, as `but pull` does.
+  {
+    "bindings": {
+      "secondary-r": "remote::Fetch",
+      "secondary-shift-r": "remote::Pull"
+    }
+  },
+  // ⌘P goes to anything, the TUI's branch picker for more than branches, ⌘1, ⌘2 and ⌘3 go to the
+  // navigator, the files and the diff, and ⌘B and ⌥⌘B show or hide the navigator and the
+  // details, as in GitButler's keymap. ⌘J goes to a terminal, as VS Code's and Zed's open the
+  // panel theirs are in, and ⌘T opens one, as a terminal app opens a tab. From a terminal too,
+  // which takes the TUI's letters.
+  {
+    "bindings": {
+      "secondary-p": "palette::GoTo",
+      "secondary-j": "palette::GoToTerminal",
+      "secondary-t": "terminal::NewTerminal",
+      "secondary-1": "app::FocusNavigator",
+      "secondary-2": "app::FocusChanges",
+      "secondary-3": "app::FocusDiff",
+      "secondary-b": "app::ToggleNavigator",
+      "secondary-alt-b": "app::ToggleDetail"
+    }
+  },
+  // The TUI's status list: up and down, ⇧J and ⇧K between sections, g and ⇧G to either end. n
+  // adds an empty commit above the selected one, or on top of the selected branch. m moves the
+  // selected commit, as the TUI's m does, and ⇧S squashes the uncommitted changes into it, as
+  // the TUI's ⇧R does. Return folds or unfolds what the selected row heads: a card, a section,
+  // a worktree, a stack, a branch or a merge.
   {
     "context": "Navigator && !TextInput",
     "bindings": {
@@ -40,10 +75,47 @@
       "shift-j": "navigator::NextSection",
       "g": "navigator::SelectFirst",
       "shift-g": "navigator::SelectLast",
-      "r": "navigator::RenameSelection",
       "n": "edits::AddEmptyCommitAbove",
+      "m": "navigator::MoveSelection",
+      "shift-s": "navigator::SquashIntoSelection",
       "enter": "navigator::ToggleFold"
     }
+  },
+  // s squashes the selected commit, branch or changes, or in the diff the files or lines ⌘X
+  // would cut, as the TUI's r does: r is reword's here, below.
+  {
+    "context": "(Navigator || Diff) && !TextInput",
+    "bindings": { "s": "navigator::SquashSelection" }
+  },
+  // While commits move, the keys above step through where they can land, and Return lands
+  // them there. After the list's Return, so it wins. m and s move instead of squashing, or the
+  // other way round, and while squashing u keeps only the target's message, as in the TUI,
+  // after undo's u, so it wins.
+  {
+    "context": "Navigator && Moving && !TextInput",
+    "bindings": { "enter": "navigator::MoveHere" }
+  },
+  {
+    "context": "Navigator && Squashing && !TextInput",
+    "bindings": { "u": "navigator::UseTargetMessage" }
+  },
+  // r rewords a commit, renames a branch or a terminal and names the unnamed branch, where the
+  // TUI's squashes: a section apiece, as the key runs the one the selection has.
+  {
+    "context": "Navigator && !TextInput",
+    "bindings": { "r": "edits::Reword" }
+  },
+  {
+    "context": "Navigator && !TextInput",
+    "bindings": { "r": "edits::RenameBranch" }
+  },
+  {
+    "context": "Navigator && !TextInput",
+    "bindings": { "r": "edits::NameBranch" }
+  },
+  {
+    "context": "Navigator && !TextInput",
+    "bindings": { "r": "edits::RenameTerminal" }
   },
   // The TUI's details: j and k between hunks, ⌃D and ⌃U half a page, g and ⇧G to the first and
   // last file. Return on a file's header folds or unfolds it, as on its row in the file list.
@@ -61,6 +133,27 @@
       "enter": "diff::ToggleFileFold"
     }
   },
+  // f shows or hides the file list, or the files beside a History or Branches list, as f shows
+  // a commit's files in the TUI. From the navigator too, which the app passes it on from.
+  {
+    "context": "(Navigator || Diff) && !TextInput",
+    "bindings": { "f": "diff::ToggleFiles" }
+  },
+  // / searches what has the keys: the navigator with its filter, the diff with its find bar, and
+  // the file list or a list with its filter, as the project page's commits, Branches and
+  // Operations history have. Those are inside the diff's context, so theirs wins there.
+  {
+    "context": "Navigator && !TextInput",
+    "bindings": { "/": "navigator::FocusFilter" }
+  },
+  {
+    "context": "Diff && !TextInput",
+    "bindings": { "/": "find::FindInDiff" }
+  },
+  {
+    "context": "(Files || List) && !TextInput",
+    "bindings": { "/": "diff::FilterFiles" }
+  },
   // The file list, inside the diff's context, steps through its files rather than going on to
   // the diff's hunks, which would take the keys there.
   {
@@ -70,6 +163,46 @@
       "j": "diff::NextFile",
       "up": "diff::PreviousFile",
       "k": "diff::PreviousFile"
+    }
+  },
+  // While committing, Space checks or unchecks the file under the cursor, as the TUI's Space
+  // marks one, and as a click on its checkbox does, and goes on to the next; in the diff, the
+  // hunk under its cursor. Return in the list goes on to the message, once what goes in is
+  // checked.
+  {
+    "context": "Diff && Composer && !TextInput",
+    "bindings": { "space": "diff::ToggleCheck" }
+  },
+  // A commit placed with the navigator hidden, and so no composer, Return commits as it is,
+  // without a message, rather than folding the file.
+  {
+    "context": "Diff && Committing && !TextInput",
+    "bindings": { "enter": "app::StartCommit" }
+  },
+  // c commits the uncommitted changes, as the TUI's c does: the keys above step through where
+  // the commit goes, and Return writes its message, or commits once it's written. ⌘↩ does too,
+  // as in GitButler's keymap, from the file filter and a terminal as well. After Return's,
+  // above, so c is the key shown.
+  {
+    "context": "Files && !Composer > TextInput",
+    "bindings": { "secondary-enter": "app::StartCommit" }
+  },
+  {
+    "context": "Terminal",
+    "bindings": { "secondary-enter": "app::StartCommit" }
+  },
+  {
+    "context": "Workspace && !TextInput",
+    "bindings": {
+      "secondary-enter": "app::StartCommit",
+      "c": "app::StartCommit"
+    }
+  },
+  {
+    "context": "Files && Composer && !TextInput",
+    "bindings": {
+      "space": "diff::ToggleCheck",
+      "enter": "diff::WriteMessage"
     }
   },
   // The History and Branches lists step and jump as the navigator does, and fold as GitButler's
@@ -100,6 +233,33 @@
       "shift-enter": "find::FindPrevious"
     }
   },
+  // After the text field's own keys, so these win in a commit message's fields.
+  {
+    "context": "MessageTitle > TextInput",
+    "bindings": {
+      "enter": "message_editor::ToBody",
+      "tab": "message_editor::ToBody"
+    }
+  },
+  // A commit's title commits on Return, written or not, as a body is seldom wanted: Tab goes
+  // to it. A pull request's title goes on to its body.
+  {
+    "context": "Composer > MessageTitle > TextInput",
+    "bindings": { "enter": "text_input::Submit" }
+  },
+  {
+    "context": "MessageBody > TextInput",
+    "bindings": {
+      "shift-tab": "message_editor::ToTitle",
+      "backspace": "message_editor::LeaveEmptyBody"
+    }
+  },
+  // A commit's title edited in its row saves on Return too, and Tab goes on to its body, in the
+  // commit's header.
+  {
+    "context": "Reword > TextInput",
+    "bindings": { "tab": "message_editor::ToBody" }
+  },
   // After the text field's own keys, so these win inside the palette. ⌃P and ⌃N, as in the
   // TUI's jump.
   {
@@ -109,6 +269,22 @@
       "down": "palette::PaletteDown",
       "ctrl-p": "palette::PaletteUp",
       "ctrl-n": "palette::PaletteDown"
+    }
+  },
+  // ⇧F10 opens the selected row's right-click menu, as on Windows and Linux and in VS Code.
+  {
+    "context": "Workspace && !TextInput",
+    "bindings": { "shift-f10": "app::ShowContextMenu" }
+  },
+  // A right-click menu's items, as Settings' pages: Return runs the one the keys are on.
+  {
+    "context": "ContextMenu",
+    "bindings": {
+      "up": "navigator::SelectPrevious",
+      "k": "navigator::SelectPrevious",
+      "down": "navigator::SelectNext",
+      "j": "navigator::SelectNext",
+      "enter": "navigator::Confirm"
     }
   },
   // Settings' pages, from its search box too, as the palette's list is.
@@ -127,6 +303,11 @@
       "down": "navigator::SelectNext",
       "j": "navigator::SelectNext"
     }
+  },
+  // Back to the search box from a page link or a control, as / goes to the navigator's filter.
+  {
+    "context": "Settings && !TextInput",
+    "bindings": { "/": "settings::FocusSearch" }
   },
   // After the text field's own keys, so these win in the search field.
   {

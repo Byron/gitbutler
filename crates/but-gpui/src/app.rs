@@ -1,26 +1,32 @@
 //! The window's root: the project navigator on the left, details on the right, the keys,
 //! and the actions that work anywhere in the window. `overlays.rs` draws what opens above.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyView, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontFeatures, Pixels,
-    Point, PromptLevel, Role, StyleRefinement, Subscription, WeakEntity, Window, actions, div,
-    prelude::*,
+    AnyView, App, ClipboardItem, Context, DispatchPhase, Div, DragMoveEvent, Entity, ExternalPaths,
+    FocusHandle, Focusable, FontFeatures, MouseMoveEvent, Pixels, PlatformInput, Point,
+    PromptLevel, Role, SharedString, StyleRefinement, Subscription, Task, WeakEntity, Window,
+    actions, div, prelude::*, relative,
 };
 
 use crate::backend::upstream::UpdateScope;
-use crate::backend::{self, short_ref};
+use crate::backend::{self, Checkout, short_ref};
+use crate::clock;
 use crate::detail::{Detail, DiffPane};
 use crate::navigator::Navigator;
 use crate::overlays::{ContextMenu, MenuItem, Prompt};
-use crate::palette::Palette;
+use crate::palette::{Choice, Palette};
 use crate::projects::pick_folder;
-use crate::state::{Cut, MeshPick, Pane, ProjectId, Selection, Store, StoreEvent, snack};
-use crate::theme::{Theme, UiScale};
-use crate::transfer::{Place, Transfer};
+use crate::state::{
+    Cut, FileView, MeshPick, Pane, Prefs, ProjectId, Selection, Store, StoreEvent, snack,
+    up_to_date,
+};
+use crate::terminal::NewTerminal;
+use crate::theme::{ColorScheme, Theme, UiScale};
+use crate::transfer::{Moving, Op, Place, ProjectDrag, Transfer};
 use crate::ui::fold::{Slide, edge, inert};
-use crate::ui::{HEADER_HEIGHT, dp, fixed, resize_pane};
+use crate::ui::{HEADER_HEIGHT, POPOVER_RADIUS, dp, fixed, resize_pane};
 
 // Named in the keymap as area::Action, by where they act.
 actions!(
@@ -49,9 +55,12 @@ actions!(
         FocusPaneRight,
         StartCommit,
         ToggleNavigator,
+        ToggleDetail,
         CommandPalette,
+        ShowContextMenu,
         CheckForUpdates,
         BuildAndRestart,
+        BuildAndRestartFromHere,
         OperationsHistory,
         CloseWindow,
     ]
@@ -64,6 +73,8 @@ actions!(
         MarkAllRead,
         NewBranch,
         NewBranchOnTop,
+        NewWorktree,
+        NewWorktreeWithName,
         SelectPrevious,
         SelectNext,
         Expand,
@@ -72,15 +83,18 @@ actions!(
         Confirm,
         CutSelection,
         PasteHere,
-        DeleteSelection,
-        UncommitSelection,
-        RenameSelection,
+        MoveSelection,
+        MoveHere,
+        SquashSelection,
+        SquashIntoSelection,
+        UseTargetMessage,
     ]
 );
 actions!(
     remote,
     [
         Fetch,
+        Pull,
         UpdateFromTarget,
         UpdateWorkspace,
         UpdateWorktrees,
@@ -88,6 +102,28 @@ actions!(
     ]
 );
 actions!(pr, [OpenPullRequest]);
+actions!(
+    copy,
+    [
+        CopyCommitId,
+        CopyBranchName,
+        CopyPullRequestLink,
+        CopySnapshotId,
+        CopyPath,
+        CopyRelativePath,
+        CopyAbsolutePath,
+        CopyErrorMessage,
+    ]
+);
+
+/// Register `A` on `el` as copying `text`.
+fn copy_on<A: gpui::Action>(
+    el: gpui::Stateful<gpui::Div>,
+    text: String,
+    cx: &Context<AppView>,
+) -> gpui::Stateful<gpui::Div> {
+    el.on_action(cx.listener(move |this, _: &A, _, cx| this.copy_text(text.clone(), cx)))
+}
 
 pub struct AppView {
     pub store: Entity<Store>,
@@ -95,12 +131,33 @@ pub struct AppView {
     diff: Entity<DiffPane>,
     pub(crate) navigator: Entity<Navigator>,
     pub menu: Option<ContextMenu>,
+    /// A menu with commands in it, waiting for the frame that registers the actions of the
+    /// selection it opened on, to say which it offers.
+    pub pending_menu: Option<ContextMenu>,
+    /// The open menu's, which takes the keys from what had them.
+    pub(crate) menu_focus: FocusHandle,
     pub prompt: Option<Prompt>,
     /// The emoji picker open on a project's icon.
     pub icon_picker: Option<crate::projects::IconPicker>,
     pub navigator_open: bool,
     /// The navigator sliding open or shut.
     navigator_slide: Slide,
+    /// Whether the detail shows beside the navigator. Hidden, the navigator takes the window;
+    /// the two are never both hidden.
+    pub(crate) detail_open: bool,
+    /// The detail sliding in from the window's right edge or back off it.
+    detail_slide: Slide,
+    /// The window narrowed to the navigator while the detail is hidden, or narrowing to it or
+    /// widening back as the detail slides, where the window can be resized for it.
+    narrowing: Option<Narrowing>,
+    /// Resizes the window a step at a time as it narrows or widens, by
+    /// [`AppView::step_narrowing`].
+    resizing: Option<Task<()>>,
+    /// The navigator out over the detail while it's closed.
+    peek: Peek,
+    /// macOS's traffic lights are out of the way of the navigator out over the detail.
+    #[cfg(target_os = "macos")]
+    lights_away: bool,
     pub palette: Option<Palette>,
     /// The modal on screen, if any, what takes its keys, its card's own, which Tab keeps
     /// to, the subscription that closes it, and what had the keys before it opened, to give
@@ -114,14 +171,63 @@ pub struct AppView {
     )>,
     /// Palette commands by label, most recently run first.
     pub recent_commands: Vec<&'static str>,
-    /// How to build the app again, when `cargo run` started it, for Build and restart.
-    pub(crate) rebuild: Option<backend::rebuild::Rebuild>,
     /// The build under way or last ended, and what shows it when it fails out of sight.
     pub(crate) building: Option<(Entity<crate::rebuild::BuildOutput>, Subscription)>,
     /// The frames drawn each second, drawn over everything while `Prefs::show_fps` is on.
     fps: Entity<crate::fps::Fps>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// How near the window's left edge the pointer brings the closed navigator out over the
+/// detail, as Arc's sidebar comes out.
+const PEEK_EDGE: f32 = 6.;
+/// How far the navigator out over the detail floats from the window's edges.
+const PEEK_INSET: f32 = 6.;
+/// How far past its card the shadow of the navigator out over the detail reaches, which goes
+/// off the window with it as it slides away.
+const PEEK_SHADOW: f32 = 16.;
+/// How long the pointer can stray past the navigator out over the detail before it goes back,
+/// so overshooting its edge a little leaves it out.
+const PEEK_GRACE: Duration = Duration::from_millis(300);
+
+/// The closed navigator out over the detail, as the pointer at the window's left edge brings
+/// it, until the pointer strays from it, or as ⌘1 brings it, until the keys leave it.
+#[derive(Default)]
+struct Peek {
+    open: bool,
+    /// It sliding in from the window's edge or back off it.
+    slide: Slide,
+    /// Sends it back once the pointer has strayed from it for [`PEEK_GRACE`].
+    leaving: Option<Task<()>>,
+    /// Brought out by ⌘1, so it stays while it has the keys, whatever the pointer does.
+    keyed: bool,
+    /// Where ⌘1 was pressed: the selection, and what had the keys, which Esc goes back to.
+    returns_to: Option<(Selection, Option<FocusHandle>)>,
+    /// Brought out to place a commit in, as ⌘↩ does while it's hidden, so it goes back once
+    /// that's committed or let go, as it went back from ⌘1.
+    committing: bool,
+}
+
+/// The window narrowing to the navigator as the detail slides in under it, or widening back as
+/// it slides out, in unscaled pixels.
+#[derive(Clone, Copy)]
+struct Narrowing {
+    /// The window's width with the detail, which the panes are laid out for meanwhile, so
+    /// they aren't laid out again at every width.
+    wide: f32,
+    /// The navigator's, which it keeps meanwhile, and the window's once narrowed.
+    navigator: f32,
+    /// Resized to where the slide ended, after which its width is the user's.
+    settled: bool,
+    /// How many steps the window has been asked for where the slide ended.
+    asked: u8,
+}
+
+/// How often the window is resized as it narrows or widens: about a frame at 120Hz.
+const RESIZE_STEP: Duration = Duration::from_millis(8);
+/// How many steps the window is asked for its width where the detail's slide ended, until it
+/// has it: a resize that never lands, as one the screen holds back, leaves it as it is.
+const LAST_RESIZE_TRIES: u8 = 30;
 
 /// The app, as the views it owns reach it: only once the update running now is over. Reached
 /// at once, the app could update or read the view that asked, which is being updated, and that
@@ -177,7 +283,7 @@ impl AppView {
     pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.set_global(theme_for(store.read(cx), window));
         #[cfg(target_os = "macos")]
-        place_traffic_lights(window, cx);
+        place_traffic_lights(false, window, cx);
         let app = AppHandle::of(cx);
         let detail = cx.new(|cx| Detail::new(store.clone(), app.clone(), window, cx));
         let diff = cx.new(|cx| DiffPane::new(&detail, window, cx));
@@ -187,37 +293,43 @@ impl AppView {
             // A menu's items and the palette's commands act on the selection and the picks, so
             // when an agent's change moves them off what they opened on, they go rather than
             // act on something else. Menu items can hold the commit they opened on, so a menu
-            // goes when an agent only rewrote it too, as does M's list of them; the palette's
+            // goes when an agent only rewrote it too, as ⌘K does while it lists such items;
             // commands read the selection when run.
             cx.observe_in(&store, window, |this, store, window, cx| {
                 let store = store.read(cx);
                 let menu_gone =
                     (this.menu.as_ref()).is_some_and(|m| m.acting_on != store.acting_on());
+                if (this.pending_menu.as_ref()).is_some_and(|m| m.acting_on != store.acting_on()) {
+                    this.pending_menu = None;
+                }
                 let palette_gone = (this.palette.as_ref()).is_some_and(|p| match p.holds_ids {
                     true => p.acting_on != store.acting_on(),
                     false => !store.still_acting_on(&p.acting_on),
                 });
                 if menu_gone {
-                    this.menu = None;
+                    this.close_menu(window, cx);
                 }
                 if palette_gone {
                     this.close_palette(window, cx);
                 }
                 cx.notify()
             }),
-            cx.subscribe_in(&store, window, |this, _, event, window, cx| {
-                if let StoreEvent::AuthorMissing(project) = event {
-                    this.ask_author(project.clone(), window, cx);
-                }
+            cx.subscribe_in(&store, window, |this, _, event, window, cx| match event {
+                StoreEvent::AuthorMissing(project) => this.ask_author(project.clone(), window, cx),
+                StoreEvent::TerminalOpened => this.enter_terminal(window, cx),
+                _ => {}
             }),
             cx.observe_window_appearance(window, |this, window, cx| {
                 this.apply_appearance(window, cx)
             }),
             #[cfg(target_os = "macos")]
-            cx.observe_global_in::<Theme>(window, |_, window, cx| place_traffic_lights(window, cx)),
-            // A scripted window opens off screen, which isn't where the user left theirs.
+            cx.observe_global_in::<Theme>(window, |this, window, cx| {
+                place_traffic_lights(this.lights_away, window, cx)
+            }),
+            // A scripted window opens off screen, which isn't where the user left theirs, and
+            // one narrowed to the navigator opens again with the detail.
             cx.observe_window_bounds(window, |this, window, cx| {
-                if !scripted() {
+                if !scripted() && this.narrowing.is_none() {
                     this.store
                         .update(cx, |store, cx| store.save_window_place(window, cx));
                 }
@@ -244,6 +356,18 @@ impl AppView {
             // list does once Apply selects the branch, they go to the navigator instead, or to
             // the diff while a message is being written.
             cx.on_focus_lost(window, |this, window, cx| this.restore_focus(window, cx)),
+            // The navigator ⌘1 brought out goes back once the keys leave it, as ⌘2 and ⌘3 take
+            // them. GPUI blurs it as another app comes in front too, which leaves it out.
+            cx.on_focus_out(
+                &navigator.focus_handle(cx),
+                window,
+                |this, _, window, cx| {
+                    // After the frame, as a notify while it's drawn draws nothing.
+                    if this.peek.keyed && window.is_window_active() {
+                        cx.defer_in(window, |this, window, cx| this.close_peek(window, cx));
+                    }
+                },
+            ),
         ];
         // Closing the window quits, so it asks the same as ⌘Q.
         let this = cx.entity().downgrade();
@@ -263,14 +387,22 @@ impl AppView {
             diff,
             navigator,
             menu: None,
+            pending_menu: None,
+            menu_focus: cx.focus_handle(),
             prompt: None,
             icon_picker: None,
             navigator_open: true,
             navigator_slide: Slide::default(),
+            detail_open: true,
+            detail_slide: Slide::default(),
+            narrowing: None,
+            resizing: None,
+            peek: Peek::default(),
+            #[cfg(target_os = "macos")]
+            lights_away: false,
             palette: None,
             modal: None,
             recent_commands: Vec::new(),
-            rebuild: backend::rebuild::Rebuild::detect(),
             building: None,
             fps: cx.new(|_| crate::fps::Fps::default()),
             _subscriptions: subscriptions,
@@ -281,6 +413,99 @@ impl AppView {
     pub fn apply_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.set_global(theme_for(self.store.read(cx), window));
         cx.refresh_windows();
+    }
+
+    /// List the colour schemes, GitButler's, the Ghostty config's and every Ghostty theme, to
+    /// pick one to draw the app and its terminals in.
+    pub fn pick_color_scheme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.store.read(cx).prefs.color_scheme.clone();
+        let named = but_tty::Ghostty::themes()
+            .into_iter()
+            .map(ColorScheme::Named);
+        let choices = ([ColorScheme::GitButler, ColorScheme::Ghostty].into_iter())
+            .chain(named)
+            .map(|scheme| {
+                let detail = match &scheme {
+                    _ if scheme == current => Some("In use"),
+                    ColorScheme::GitButler => Some("Light or dark, as Appearance says"),
+                    ColorScheme::Ghostty => Some("The themes your Ghostty config sets"),
+                    ColorScheme::Named(_) => None,
+                };
+                let choice = Choice::new(scheme.label().to_owned(), move |app, window, cx| {
+                    (app.store).update(cx, |store, cx| {
+                        store.set_prefs(|prefs| prefs.color_scheme = scheme, cx)
+                    });
+                    app.apply_appearance(window, cx);
+                });
+                match detail {
+                    Some(detail) => choice.detail(detail),
+                    None => choice,
+                }
+            })
+            .collect();
+        self.open_picker(None, "Search colour schemes", "Use", choices, window, cx);
+    }
+
+    /// List the fonts to pick the one code in diffs shows in.
+    pub fn pick_diff_font(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.store.read(cx).prefs.diff_font.clone();
+        let own = Theme::get(cx).mono_font.clone();
+        let set = |prefs: &mut Prefs, font| prefs.diff_font = font;
+        self.pick_font(own, "GitButler's own".into(), current, set, window, cx);
+    }
+
+    /// List the fonts to pick the one terminals show in.
+    pub fn pick_terminal_font(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.store.read(cx).prefs.terminal_font.clone();
+        let ghostty = but_tty::Ghostty::load();
+        let detail = (ghostty.font_families.into_iter().next())
+            .map_or("Your Ghostty config sets none".into(), SharedString::from);
+        let set = |prefs: &mut Prefs, font| prefs.terminal_font = font;
+        self.pick_font("As Ghostty's".into(), detail, current, set, window, cx);
+    }
+
+    /// List `unpicked`, which `detail` explains and leaves no font picked, then the installed
+    /// fonts, for `set` to keep the one chosen. `current` is the one in use.
+    fn pick_font(
+        &mut self,
+        unpicked: SharedString,
+        detail: SharedString,
+        current: Option<String>,
+        set: fn(&mut Prefs, Option<String>),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text_system = cx.text_system().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let families = (cx.background_spawn(async move { text_system.all_font_names() })).await;
+            let families = families
+                .into_iter()
+                .filter(|family| !family.starts_with('.'));
+            let fonts = families.map(|family| (family.clone().into(), Some(family), None));
+            let choices: Vec<Choice> = std::iter::once((unpicked, None, Some(detail)))
+                .chain(fonts)
+                .map(|(label, font, detail)| {
+                    let in_use = font == current;
+                    let choice = Choice::new(label, move |app, window, cx| {
+                        (app.store).update(cx, |store, cx| {
+                            store.set_prefs(|prefs| set(prefs, font), cx)
+                        });
+                        app.apply_appearance(window, cx);
+                        (app.detail).update(cx, |detail, cx| detail.remeasure(cx));
+                    });
+                    match detail {
+                        _ if in_use => choice.detail("In use"),
+                        Some(detail) => choice.detail(detail),
+                        None => choice,
+                    }
+                })
+                .collect();
+            this.update_in(cx, |this, window, cx| {
+                this.open_picker(None, "Search fonts", "Use", choices, window, cx)
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Select `selection`. Asked for again, as a crumb naming the page shown is clicked, the
@@ -305,21 +530,44 @@ impl AppView {
         }
     }
 
-    /// Whether to quit right away. While an operation hasn't finished, ask instead, and quit
-    /// on a yes: quitting would stop it partway.
+    /// Whether to quit right away. While an operation hasn't finished or a terminal is open,
+    /// ask instead, and quit on a yes: quitting would stop the operation partway and end what
+    /// runs in the terminal.
     fn can_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let (message, detail) = match self.store.read(cx).unfinished() {
-            0 => return true,
-            1 => (
+        let store = self.store.read(cx);
+        let operations = match store.unfinished() {
+            0 => None,
+            1 => Some((
                 "Quit before the operation finishes?".to_owned(),
-                "It may stop partway.",
-            ),
-            n => (
+                "It may stop partway.".to_owned(),
+            )),
+            n => Some((
                 format!("Quit before {n} operations finish?"),
-                "They may stop partway.",
-            ),
+                "They may stop partway.".to_owned(),
+            )),
         };
-        self.confirm_then(None, message, detail, "Quit", window, cx, |_, cx| cx.quit());
+        let terminals = match store.terminals.count() {
+            0 => None,
+            1 => Some((
+                "Quit with a terminal open?".to_owned(),
+                "The terminal closes, and what runs in it ends.".to_owned(),
+            )),
+            n => Some((
+                format!("Quit with {n} terminals open?"),
+                format!("The {n} terminals close, and what runs in them ends."),
+            )),
+        };
+        // Operations ask first, as they're what quitting would leave half done.
+        let (message, detail) = match (operations, terminals) {
+            (None, None) => return true,
+            (Some(asked), None) | (None, Some(asked)) => asked,
+            (Some((message, operations)), Some((_, terminals))) => {
+                (message, format!("{operations} {terminals}"))
+            }
+        };
+        self.confirm_then(None, message, &detail, "Quit", window, cx, |_, cx| {
+            cx.quit()
+        });
         false
     }
 
@@ -361,29 +609,75 @@ impl AppView {
     fn fetch(&mut self, _: &Fetch, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(project) = self.selected_project(cx) {
             self.store.update(cx, |store, cx| {
-                store.fetch(&project, cx);
+                store.fetch(&project, None, cx);
                 store.refresh_forge(&project);
             });
         }
     }
 
-    fn new_branch(&mut self, _: &NewBranch, window: &mut Window, cx: &mut Context<Self>) {
-        // Not while a prompt or picker is open: the branch would be made out of sight behind it.
-        if self.covered() {
-            return;
+    /// Fetch the selected project, then update its workspace and worktrees, as `but pull` does.
+    fn pull(&mut self, _: &Pull, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(project) = self.selected_project(cx) {
+            self.store.update(cx, |store, cx| {
+                store.fetch(&project, Some(UpdateScope::All), cx);
+                store.refresh_forge(&project);
+            });
         }
-        let Some(project) = self.selected_project(cx).or_else(|| {
-            self.store
-                .read(cx)
-                .projects
-                .iter()
+    }
+
+    /// The selected project, else the first watched one, to start a branch or worktree in. None
+    /// while a prompt or picker is open: it would be made out of sight behind it.
+    fn project_to_start_in(&self, cx: &App) -> Option<ProjectId> {
+        if self.covered() {
+            return None;
+        }
+        self.selected_project(cx).or_else(|| {
+            let store = self.store.read(cx);
+            (store.projects.iter())
                 .find(|p| p.expanded)
                 .map(|p| p.id.clone())
-        }) else {
+        })
+    }
+
+    fn new_branch(&mut self, _: &NewBranch, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project_to_start_in(cx) else {
             return;
         };
         let create = backend::CreateBranch { name: None };
         self.new_branch_at(project, true, None, None, window, cx, create);
+    }
+
+    fn new_worktree(&mut self, _: &NewWorktree, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project_to_start_in(cx) else {
+            return;
+        };
+        let create = backend::worktrees::CreateWorktree::New(None);
+        (self.store).update(cx, |store, cx| store.create_worktree(&project, create, cx))
+    }
+
+    fn new_worktree_with_name(
+        &mut self,
+        _: &NewWorktreeWithName,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.project_to_start_in(cx) else {
+            return;
+        };
+        let selected = project.clone();
+        self.prompt_branch(
+            Selection::Project(project),
+            "New worktree",
+            window,
+            cx,
+            |name| backend::worktrees::CreateWorktree::New(Some(name)),
+            move |store, name, cx| {
+                store.select(
+                    Some(Selection::Checkout(selected, Checkout::Linked(name))),
+                    cx,
+                )
+            },
+        )
     }
 
     /// Ask the desktop app's update feed now: show the update card for the newer version it
@@ -510,8 +804,47 @@ impl AppView {
     }
 
     fn cut_selection(&mut self, _: &CutSelection, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(cut) = self.selection_cut(window, cx) {
+            self.cut(cut, cx);
+        }
+    }
+
+    /// Squash what's picked in the diff or the file list, as ⌘X cuts it there, with the keys
+    /// in the navigator, from the selection's row, which holds it. The navigator squashes
+    /// what's selected there itself.
+    fn squash_from_detail(
+        &mut self,
+        _: &SquashSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.detail.read(cx).is_focused(window, cx) {
+            return;
+        }
+        let cut = self.selection_cut(window, cx).and_then(Cut::movable);
+        let Some(Cut::Files {
+            project,
+            from,
+            worktree,
+            files,
+        }) = cut
+        else {
+            return;
+        };
+        let what = Moving::Files {
+            from,
+            worktree,
+            files,
+        };
+        (self.navigator).update(cx, |navigator, cx| {
+            navigator.squash(project, what, window, cx)
+        });
+    }
+
+    /// What ⌘X cuts where the keys are.
+    fn selection_cut(&self, window: &Window, cx: &App) -> Option<Cut> {
         let in_diff = self.detail.read(cx).is_focused(window, cx);
-        let cut = match self.selection(cx) {
+        match self.selection(cx) {
             // From a commit's diff, its lines, hunk or file under the cursor.
             Some(Selection::Commit(..)) if in_diff => self.detail.read(cx).cursor_cut(cx),
             // The picked commits with it, when it's one of them.
@@ -524,12 +857,10 @@ impl AppView {
             }
             // From the diff, the lines, hunk or file under the cursor; from the navigator or
             // the composer, what's checked.
-            Some(Selection::Uncommitted(_) | Selection::Worktree(..))
-                if in_diff && !self.detail.read(cx).composing() =>
-            {
+            Some(Selection::Uncommitted(..)) if in_diff && !self.detail.read(cx).composing() => {
                 self.detail.read(cx).cursor_cut(cx)
             }
-            Some(Selection::Uncommitted(_) | Selection::Worktree(..)) => {
+            Some(Selection::Uncommitted(..)) => {
                 let detail = self.detail.read(cx);
                 (detail.selected_checkout(cx)).and_then(|(project, worktree)| {
                     let files = detail.files_to_move(&project, worktree.clone(), cx);
@@ -542,9 +873,6 @@ impl AppView {
                 })
             }
             _ => None,
-        };
-        if let Some(cut) = cut {
-            self.cut(cut, cx);
         }
     }
 
@@ -584,15 +912,33 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.land(payload, target, place, None, window, cx)
+    }
+
+    /// Do what `payload` landing on `target` at `place` does, as a drop does, and land the move
+    /// with the keys `lands` if that's what it is.
+    pub fn land(
+        &mut self,
+        payload: &Cut,
+        target: &Selection,
+        place: Place,
+        lands: Option<crate::transfer::Move>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(transfer) = Transfer::resolve(payload, target, place, self.store.read(cx)) else {
             snack(&self.store, "That can't go there", cx);
             return;
         };
         let project = target.project().clone();
-        let staged = (self.store).update(cx, |store, cx| transfer.perform(&project, store, cx));
+        let staged =
+            (self.store).update(cx, |store, cx| transfer.perform(&project, lands, store, cx));
         if let Some((branch, files)) = staged {
             self.store.update(cx, |store, cx| {
-                store.select(Some(Selection::Uncommitted(project.clone())), cx)
+                store.select(
+                    Some(Selection::Uncommitted(project.clone(), Checkout::Main)),
+                    cx,
+                )
             });
             self.detail
                 .update(cx, |detail, cx| detail.stage(branch, &files, window, cx));
@@ -606,12 +952,28 @@ impl AppView {
             return;
         }
         // The menu first, as it can be open over a modal.
-        if self.menu.take().is_some() {
-            cx.notify();
-            return;
+        if self.menu.is_some() {
+            return self.close_menu(window, cx);
         }
         if self.modal.is_some() {
             return self.close_modal(window, cx);
+        }
+        // A move under way, before what's in the pane with the keys, as it's what they do. A
+        // commit being placed goes with the composer it's made from.
+        match self.store.read(cx).moving.as_ref().map(|moving| moving.op) {
+            Some(Op::Commit) => {
+                (self.detail).update(cx, |detail, cx| detail.cancel_commit(window, cx));
+                if self.peek.committing {
+                    self.send_peek_back(window, cx);
+                }
+                return;
+            }
+            Some(Op::Move | Op::Squash(_)) => {
+                return self
+                    .store
+                    .update(cx, |store, cx| store.set_moving(None, cx));
+            }
+            None => {}
         }
         if self.detail.read(cx).is_focused(window, cx) {
             // Undo the nearest thing first: a text selection, then the file filter.
@@ -623,7 +985,6 @@ impl AppView {
                     || detail.close_open_filter(window, cx)
                     || detail.close_opened_branch(cx)
                     || detail.close_opened_target(cx)
-                    || detail.close_changes(cx)
             });
             if handled {
                 return cx.notify();
@@ -634,15 +995,22 @@ impl AppView {
                 return self.focus_main(window, cx);
             }
         }
+        // With nothing cut or picked, the navigator ⌘1 brought out goes back, and with it the
+        // selection and the keys to where ⌘1 was pressed, while that's still there.
+        let store = self.store.read(cx);
+        if self.peek.keyed
+            && store.cut.is_none()
+            && store.picked.is_empty()
+            && self.navigator.focus_handle(cx).contains_focused(window, cx)
+        {
+            return self.send_peek_back(window, cx);
+        }
         // With nothing cut or picked, the branch opened on the Branches page goes back to its
         // table.
-        let store = self.store.read(cx);
         if store.cut.is_none()
             && store.picked.is_empty()
             && self.detail.update(cx, |detail, cx| {
-                detail.close_opened_branch(cx)
-                    || detail.close_opened_target(cx)
-                    || detail.close_changes(cx)
+                detail.close_opened_branch(cx) || detail.close_opened_target(cx)
             })
         {
             return cx.notify();
@@ -681,19 +1049,74 @@ impl AppView {
         if self.covered() {
             return;
         }
-        // Asking for the navigator brings it back.
-        if !self.navigator_open {
+        let navigator = self.navigator.focus_handle(cx);
+        // Asking for the hidden navigator brings it out over the detail, as the pointer does,
+        // and back beside it while it's still sliding away.
+        if !self.navigator_open && !self.navigator_slide.closing(clock::now()) {
+            if !navigator.contains_focused(window, cx) {
+                self.peek.returns_to = self.selection(cx).map(|s| (s, window.focused(cx)));
+            }
+            self.peek.keyed = true;
+            if !self.peek.open {
+                self.open_peek(cx);
+            }
+        } else if !self.navigator_open {
             self.set_navigator(true, window, cx);
         }
-        window.focus(&self.navigator.focus_handle(cx), cx);
+        window.focus(&navigator, cx);
+    }
+
+    /// Open a terminal on the checkout the selection is in, the main one when it's in none.
+    fn new_terminal(&mut self, _: &NewTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, cx| {
+            let Some(selection) = store.selection.clone() else {
+                return;
+            };
+            let checkout = store.checkout_of(&selection).unwrap_or(Checkout::Main);
+            store.open_terminal(selection.project().clone(), checkout, cx);
+        });
+    }
+
+    /// The terminal the detail's place shows, while one is selected.
+    fn shown_terminal(&self, cx: &App) -> Option<Entity<crate::terminal::Terminal>> {
+        let store = self.store.read(cx);
+        match store.selection.as_ref()? {
+            Selection::Terminal(_, id) => store.terminals.get(*id).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Give the keys to the terminal shown, which covers the detail, if one is.
+    fn focus_terminal(&self, window: &mut Window, cx: &mut App) -> bool {
+        let terminal = self.shown_terminal(cx);
+        if let Some(terminal) = &terminal {
+            window.focus(&terminal.focus_handle(cx), cx);
+        }
+        terminal.is_some()
+    }
+
+    /// Go into the selected terminal, to type in: the detail it shows in comes back, and it
+    /// takes the keys. Selecting it alone leaves them where they were, so ↑ and ↓ go past it.
+    pub(crate) fn enter_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Not from under what's open over it, as when a prompt opened while its shell started.
+        if self.covered() || self.shown_terminal(cx).is_none() {
+            return;
+        }
+        self.set_detail(true, window, cx);
+        self.focus_terminal(window, cx);
+        // The navigator ⌘1 brought out goes back now the keys left it, which no frame shows
+        // when a picker's choice runs at once, so GPUI never says it lost them.
+        if self.peek.keyed {
+            self.close_peek(window, cx);
+        }
     }
 
     /// Focus the navigator, or the changes while the navigator isn't on screen, so keys
-    /// always reach something visible.
+    /// always reach something visible. Out over the detail, it's on screen.
     pub(crate) fn focus_main(&self, window: &mut Window, cx: &mut App) {
-        if self.navigator_open {
+        if self.navigator_open || self.peek.open {
             window.focus(&self.navigator.focus_handle(cx), cx);
-        } else {
+        } else if !self.focus_terminal(window, cx) {
             self.detail
                 .update(cx, |detail, cx| detail.focus(window, cx));
         }
@@ -707,17 +1130,17 @@ impl AppView {
             // A message being written whose box left the screen, as when an operation selects
             // something else, hands its keys to the diff rather than to the navigator, where
             // single letters rename and start branches. ⇧P still pushes from either.
-            None if self.detail.read(cx).composing() => self
+            None if self.detail_open && self.detail.read(cx).composing() => self
                 .detail
                 .update(cx, |detail, cx| detail.focus(window, cx)),
             None => self.focus_main(window, cx),
         }
     }
 
-    /// The file list, or the diff while the list is hidden; a Branches, Operations history or
-    /// project page's list.
-    /// Tab, or ⇧Tab going back: the next of the navigator, the file list and the diff that show,
-    /// round again. Without `wrap`, as → and ← go, only the panes on that side.
+    /// Tab, or ⇧Tab going back: the next of the navigator, a Branches, Operations history or
+    /// project page's list, the files beside that list, a page's Changes and pull request
+    /// tabs, the file list and the diff that show, round again. Without `wrap`, as → and ←
+    /// go, only the panes on that side, and on the tabs, the tab on that side first.
     fn focus_pane(
         &mut self,
         forward: bool,
@@ -725,33 +1148,99 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.covered() {
+        // With the detail hidden, the navigator is the only pane.
+        if self.covered() || !self.detail_open {
+            return;
+        }
+        // A terminal takes every key it's given, so only the navigator moves to it.
+        if let Some(terminal) = self.shown_terminal(cx) {
+            if self.navigator.focus_handle(cx).contains_focused(window, cx) {
+                window.focus(&terminal.focus_handle(cx), cx);
+            }
             return;
         }
         let detail = self.detail.read(cx);
         let at = if self.navigator.focus_handle(cx).contains_focused(window, cx) {
             0
-        } else if detail.files_focused(window) || detail.side_list_focused(window) {
+        } else if detail.side_list_focused(window) {
             1
-        } else {
+        } else if detail.files_focused(window) && detail.list_page(cx) {
             2
+        } else if detail.tabs_focused(window) {
+            3
+        } else if detail.files_focused(window) {
+            4
+        } else {
+            5
         };
-        // A page that's an overview alone has no pane past the navigator to take the keys.
+        if at == 3 && !wrap {
+            let stepped =
+                (self.detail).update(cx, |detail, cx| detail.step_tab(forward, window, cx));
+            // Right of the last tab is nothing: what the tabs show is under them.
+            if stepped || forward {
+                return;
+            }
+        }
+        let moved = self.focus_pane_from(at, forward, wrap, window, cx);
+        // Going left out of the tabs, the page keeps them for coming back from the left, and
+        // going out of what's under them, it forgets them.
+        if moved && at >= 3 {
+            let kept = at == 3 && !forward;
+            (self.detail).update(cx, |detail, _| detail.keep_tabs(kept));
+        }
+    }
+
+    /// Focus the pane after `at`, or before it going back, of those [`AppView::focus_pane`]
+    /// steps through, numbered from the navigator's 0. The tabs count while they show the
+    /// pull request, which has nothing under it to take the keys, and otherwise only while
+    /// the page keeps them, as ↑ from the files under them reaches them. Says whether one
+    /// took the keys.
+    fn focus_pane_from(
+        &mut self,
+        at: usize,
+        forward: bool,
+        wrap: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let detail = self.detail.read(cx);
+        // A page that's an overview alone has no pane past the navigator to take the keys, nor
+        // has the file list or the diff without changes to show.
+        let list_page = detail.list_page(cx);
+        let changes = !detail.without_changes(cx);
+        let review = detail.showing_review(cx);
         let shown = [
             self.navigator_open,
-            detail.files_shown(cx),
-            !detail.overview_only(cx),
+            list_page,
+            changes && list_page && detail.beside_files_shown(cx),
+            review || detail.tabs_kept(cx),
+            changes && !list_page && !review && detail.files_shown(cx),
+            changes && !review && !detail.overview_only(cx),
         ];
-        let next = |n: usize| (at + if forward { n } else { 3 - n }) % 3;
-        match (1..3)
+        let next = |n: usize| (at + if forward { n } else { shown.len() - n }) % shown.len();
+        match (1..shown.len())
             .map(next)
             .filter(|&pane| wrap || (pane > at) == forward)
             .find(|&pane| shown.get(pane) == Some(&true))
         {
             Some(0) => window.focus(&self.navigator.focus_handle(cx), cx),
-            Some(1) => (self.detail).update(cx, |detail, cx| detail.focus_files(window, cx)),
+            Some(2) => (self.detail).update(cx, |detail, cx| detail.focus_beside_files(window, cx)),
+            Some(3) => (self.detail).update(cx, |detail, cx| detail.focus_tabs(window, cx)),
+            // A list page's list, or the file list.
+            Some(1 | 4) => (self.detail).update(cx, |detail, cx| detail.focus_files(window, cx)),
             Some(_) => (self.detail).update(cx, |detail, cx| detail.focus(window, cx)),
-            None => {}
+            None => return false,
+        }
+        true
+    }
+
+    /// Move the keys off the navigator as it goes, to the leftmost pane beside it, as → from
+    /// it does: a list page's list, else the tabs while they show the pull request or the page
+    /// kept them, else the file list, else the diff. A page with none, as an overview alone or
+    /// a branch with no commits, gives them to the detail.
+    fn focus_past_navigator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_terminal(window, cx) && !self.focus_pane_from(0, true, false, window, cx) {
+            (self.detail).update(cx, |detail, cx| detail.focus(window, cx));
         }
     }
 
@@ -766,7 +1255,8 @@ impl AppView {
         }
     }
 
-    /// As the window's close button does: closing it quits, asking first while operations run.
+    /// As the window's close button does: closing it quits, asking first while operations run
+    /// or terminals are open.
     fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
         if self.can_quit(window, cx) {
             cx.quit();
@@ -774,69 +1264,164 @@ impl AppView {
     }
 
     fn focus_changes(&mut self, _: &FocusChanges, window: &mut Window, cx: &mut Context<Self>) {
-        if self.covered() {
+        if self.covered() || self.focus_terminal(window, cx) {
             return;
         }
+        // Asking for what's in the detail brings it back.
+        self.set_detail(true, window, cx);
         self.detail
             .update(cx, |detail, cx| detail.focus_files(window, cx));
     }
 
     fn focus_diff(&mut self, _: &FocusDiff, window: &mut Window, cx: &mut Context<Self>) {
-        if self.covered() {
+        if self.covered() || self.focus_terminal(window, cx) {
             return;
         }
+        self.set_detail(true, window, cx);
         self.detail
             .update(cx, |detail, cx| detail.focus(window, cx));
     }
 
+    /// Whether the navigator shows, beside the detail or out over it.
+    pub(crate) fn navigator_shown(&self) -> bool {
+        self.navigator_open || self.peek.open
+    }
+
+    /// Place a commit of the uncommitted changes of the selection's checkout with the keys,
+    /// from the selection: the navigator steps through where it can go, and the composer shows
+    /// what goes in and the message. While one's being placed, as Return does there. With the
+    /// navigator out of sight, only the status bar says where it goes, the composer stays
+    /// closed and what's shown stays as it is: Return, or this again, commits it all there
+    /// without a message.
     fn start_commit(&mut self, _: &StartCommit, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(moving) = (self.store.read(cx).moving.clone()).filter(|m| m.op == Op::Commit) {
+            // From the composer, with its message, written first; without it, as where the
+            // navigator came out for the commit, as it is, the navigator going back once it's
+            // made.
+            if self.detail.read(cx).composing() {
+                return (self.detail).update(cx, |detail, cx| detail.commit_here(window, cx));
+            }
+            (self.detail).update(cx, |detail, cx| detail.commit_now(moving, cx));
+            if self.peek.committing && self.store.read(cx).moving.is_none() {
+                self.send_peek_back(window, cx);
+            }
+            return;
+        }
         let Some(selection) = self.selection(cx) else {
             return;
         };
+        let shown = self.navigator_shown();
+        if shown {
+            // The message is written in the detail.
+            self.set_detail(true, window, cx);
+        }
         // Only what's on screen gets committed: from another page, ⌘↩ shows the changes
         // first, a linked worktree's from its branches and commits.
         let project = selection.project().clone();
-        let checkout = match (&selection, self.store.read(cx).worktree_for(&selection)) {
-            (Selection::Uncommitted(_) | Selection::Worktree(..), _) => selection.clone(),
-            (_, Some(worktree)) => Selection::Worktree(project, worktree.name.clone()),
-            (_, None) => Selection::Uncommitted(project),
+        let checkout = match &selection {
+            Selection::Uncommitted(..) => selection.clone(),
+            _ => {
+                let checkout = self.store.read(cx).checkout_of(&selection);
+                Selection::Uncommitted(project.clone(), checkout.unwrap_or_default())
+            }
         };
-        if selection == checkout {
-            return self
-                .detail
-                .update(cx, |detail, cx| detail.commit_or_write(window, cx));
+        let Some(worktree) = self.store.read(cx).checkout_of(&checkout) else {
+            return;
+        };
+        // From where it's started, before the selection is the changes'.
+        let start = (self.navigator).update(cx, |navigator, cx| {
+            navigator.commit_start(&project, &selection, cx)
+        });
+        // The hidden navigator comes out over the detail to place it in, as ⌘1 brings it,
+        // what's shown staying as it is, without the composer.
+        if !shown {
+            self.focus_navigator(&FocusNavigator, window, cx);
+            self.peek.committing = self.peek.keyed;
+            return self.navigator.update(cx, |navigator, cx| {
+                navigator.start_committing(project, worktree, start, window, cx)
+            });
         }
-        // From a branch, or one of its commits, the commit goes on that branch.
-        let branch = (self.store.read(cx).branch_for(&selection))
-            .and_then(|branch| branch.ref_name.clone())
-            .filter(|_| matches!(checkout, Selection::Uncommitted(_)));
-        self.store
-            .update(cx, |store, cx| store.select(Some(checkout.clone()), cx));
+        if selection != checkout {
+            self.store
+                .update(cx, |store, cx| store.select(Some(checkout), cx));
+        }
         // Once the detail has taken the new selection's checks, which it does as this update
         // ends: opened before, the composer would be of the checkout left, and close.
-        let detail = self.detail.clone();
+        let (detail, navigator) = (self.detail.clone(), self.navigator.clone());
         window.defer(cx, move |window, cx| {
-            detail.update(cx, |detail, cx| {
-                if let Some(branch) = branch {
-                    detail.branch_created(checkout.project(), branch, cx);
-                }
-                detail.focus_message(window, cx)
-            })
+            // Not where the composer won't open, as while a commit is being edited.
+            if detail.update(cx, |detail, cx| detail.open_composer(window, cx)) {
+                navigator.update(cx, |navigator, cx| {
+                    navigator.start_committing(project, worktree, start, window, cx)
+                });
+            }
         });
     }
 
     /// Open the pull request of the selected branch, or of the branch the selected commit
     /// is on, in the browser. Without one, start one where that's possible.
+    /// The pull request of the selected branch, or of what a page has picked: the branch
+    /// opened on the Branches page, or the target's merge.
+    pub(crate) fn pull_request_url(&self, cx: &App) -> Option<String> {
+        let store = self.store.read(cx);
+        match store.branch_for(store.selection.as_ref()?) {
+            Some(branch) => branch.review.as_ref()?.url.clone(),
+            None => self.detail.read(cx).page_pull_request(cx),
+        }
+    }
+
+    /// Register a copy of each thing the selection has to copy, as its menu offers them:
+    /// its pull request's link, a commit's ID, a branch's name, a checkout's path, and why a
+    /// project can't be read. The pages' own picks are the detail's.
+    pub(crate) fn copy_actions(
+        &self,
+        el: gpui::Stateful<gpui::Div>,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let store = self.store.read(cx);
+        let el = el.when_some(self.pull_request_url(cx), |el, url| {
+            copy_on::<CopyPullRequestLink>(el, url, cx)
+        });
+        let path = |path: &std::path::Path| path.display().to_string();
+        match store.selection.as_ref() {
+            Some(Selection::Commit(_, id) | Selection::Upstream(_, _, id)) => {
+                copy_on::<CopyCommitId>(el, id.0.to_string(), cx)
+            }
+            Some(Selection::Branch(_, Some(ref_name))) => {
+                copy_on::<CopyBranchName>(el, short_ref(ref_name).into_owned(), cx)
+            }
+            Some(Selection::Project(project)) => {
+                let error =
+                    (store.project(project)).and_then(|p| Some(p.error.clone()?.to_string()));
+                el.when_some(store.path(project), |el, dir| {
+                    copy_on::<CopyPath>(el, path(&dir), cx)
+                })
+                .when_some(error, |el, error| {
+                    copy_on::<CopyErrorMessage>(el, error, cx)
+                })
+            }
+            Some(Selection::Checkout(project, Checkout::Linked(name))) => {
+                let worktree =
+                    (store.workspace(project)).and_then(|ws| ws.find_worktree(name.as_ref()));
+                el.when_some(worktree, |el, worktree| {
+                    copy_on::<CopyPath>(el, path(&worktree.path), cx)
+                })
+            }
+            Some(Selection::Mesh(project, id, MeshPick::Checkout)) => el
+                .when_some(store.mesh_checkout(project, id), |el, checkout| {
+                    copy_on::<CopyPath>(el, checkout.path.clone(), cx)
+                }),
+            _ => el,
+        }
+    }
+
     fn open_pull_request(
         &mut self,
         _: &OpenPullRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let url = self.selection(cx).and_then(|selection| {
-            let branch = self.store.read(cx).branch_for(&selection)?;
-            branch.review.as_ref()?.url.clone()
-        });
+        let url = self.pull_request_url(cx);
         let create = crate::pr::CreatePullRequest;
         match url {
             Some(url) => cx.open_url(&url),
@@ -847,34 +1432,32 @@ impl AppView {
         }
     }
 
-    /// Copy what's selected in the form other tools take: a file's path, a commit's id,
-    /// a branch's name or a project's directory. What it copied blinks, as the TUI highlights
-    /// it.
+    /// Copy what's selected in the form other tools take: a hunk or a file's diff as git prints
+    /// it, a commit's id, a branch's name or a project's or worktree's directory, as dropping its
+    /// row on a terminal pastes it. What it copied blinks, as the TUI highlights it.
     fn copy_selection(&mut self, _: &CopySelection, window: &mut Window, cx: &mut Context<Self>) {
         let file = (self.detail.read(cx).is_focused(window, cx))
-            .then(|| self.detail.update(cx, |detail, cx| detail.copy(cx)))
+            .then(|| self.detail.update(cx, |detail, cx| detail.copy(window, cx)))
             .flatten();
         let selected = file.is_none();
         let text = file.or_else(|| match self.selection(cx)? {
             Selection::Commit(project, id) => {
                 let (_, commit) = self.store.read(cx).find_commit(&project, id)?;
-                Some(if commit.has_change_id() {
-                    commit.key.clone()
-                } else {
-                    id.0.to_string()
-                })
+                Some(commit.reference())
             }
             Selection::Upstream(_, _, id) => Some(id.0.to_string()),
+            Selection::Terminal(..) => None,
             Selection::Branch(_, ref_name) => {
                 ref_name.map(|ref_name| short_ref(&ref_name).into_owned())
             }
-            Selection::Project(project) => {
+            // The main worktree's folder is the project's.
+            Selection::Project(project) | Selection::Checkout(project, Checkout::Main) => {
                 Some(self.store.read(cx).path(&project)?.display().to_string())
             }
-            Selection::Worktree(project, name) => {
-                let workspace = self.store.read(cx).workspace(&project)?;
-                let worktree = workspace.find_worktree(name.as_ref())?;
-                Some(worktree.path.display().to_string())
+            Selection::Checkout(project, Checkout::Linked(name)) => {
+                let path =
+                    (self.store.read(cx)).checkout_path(&project, &Checkout::Linked(name))?;
+                Some(path.display().to_string())
             }
             Selection::Mesh(project, id, MeshPick::Checkout) => Some(
                 self.store
@@ -883,10 +1466,11 @@ impl AppView {
                     .path
                     .clone(),
             ),
-            Selection::Uncommitted(_)
+            Selection::Uncommitted(..)
             | Selection::Mesh(..)
             | Selection::Branches(_)
             | Selection::History(_)
+            | Selection::Graph(_)
             | Selection::Stack(..)
             | Selection::Section(..) => None,
         });
@@ -950,14 +1534,13 @@ impl AppView {
         let Some(target) = store.workspace(&project).and_then(|ws| ws.target.as_ref()) else {
             return;
         };
-        let (behind, what) = match scope {
-            UpdateScope::All => (target.needs_update(), "Already"),
-            UpdateScope::Workspace => (target.workspace_behind, "The workspace is already"),
-            UpdateScope::Worktrees => (target.worktrees_behind, "The worktrees are already"),
+        let behind = match scope {
+            UpdateScope::All => target.needs_update(),
+            UpdateScope::Workspace => target.workspace_behind,
+            UpdateScope::Worktrees => target.worktrees_behind,
         };
         if !behind {
-            let message = format!("{what} up to date with {}", target.name);
-            snack(&self.store, message, cx);
+            snack(&self.store, up_to_date(scope, &target.name), cx);
             return;
         }
         self.store.update(cx, |store, cx| {
@@ -974,6 +1557,10 @@ impl AppView {
         self.set_navigator(!self.navigator_open, window, cx);
     }
 
+    fn toggle_detail(&mut self, _: &ToggleDetail, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_detail(!self.detail_open, window, cx);
+    }
+
     fn command_palette(&mut self, _: &CommandPalette, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() {
             self.close_palette(window, cx);
@@ -982,24 +1569,457 @@ impl AppView {
         }
     }
 
-    /// Show or hide the navigator, sliding it there. When it goes, focus moves off it, and it
-    /// comes back with it, as hiding it took it away.
+    /// Show or hide the navigator, sliding it there. The keys stay where they are, but for
+    /// moving off it when it goes, and onto it when it comes back while they're on a diff with
+    /// nothing for them. Out over the detail already, it shows beside it at once rather than
+    /// sliding in again. Hidden while the detail is, the detail comes back in its place.
     pub(crate) fn set_navigator(
         &mut self,
         navigator_open: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if navigator_open != self.navigator_open {
+        if !navigator_open {
+            self.set_detail(true, window, cx);
+        }
+        let peeking = self.peek.open || self.peek.slide.closing(clock::now());
+        if navigator_open {
+            self.peek = Peek::default();
+            (self.navigator).update(cx, |navigator, cx| navigator.set_floating(false, cx));
+        }
+        if navigator_open && peeking {
+            self.navigator_slide = Slide::default();
+        } else if navigator_open != self.navigator_open {
             self.navigator_slide.start(navigator_open, cx);
         }
         self.navigator_open = navigator_open;
-        if navigator_open {
+        if !navigator_open && self.navigator.focus_handle(cx).contains_focused(window, cx) {
+            self.focus_past_navigator(window, cx);
+        } else if navigator_open && self.detail.read(cx).keys_stranded(window, cx) {
             window.focus(&self.navigator.focus_handle(cx), cx);
-        } else if self.navigator.focus_handle(cx).contains_focused(window, cx) {
-            self.focus_main(window, cx);
         }
         cx.notify();
+    }
+
+    /// Show or hide the detail. Hiding it narrows the window to the navigator as the detail
+    /// slides in under it, and showing it widens the window back, as [`AppView::narrow_window`]
+    /// can; otherwise the detail slides off the window's right edge, the navigator's edge
+    /// following it to take the window. Hidden while the navigator is, the navigator comes back
+    /// in its place. The keys it takes with it go to the navigator.
+    pub(crate) fn set_detail(
+        &mut self,
+        detail_open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if detail_open == self.detail_open {
+            return;
+        }
+        if !detail_open {
+            self.set_navigator(true, window, cx);
+        }
+        self.narrow_window(detail_open, window, cx);
+        self.detail_slide.start(detail_open, cx);
+        self.detail_open = detail_open;
+        let navigator = self.navigator.focus_handle(cx);
+        if !detail_open && !self.covered() && !navigator.contains_focused(window, cx) {
+            window.focus(&navigator, cx);
+        }
+        cx.notify();
+    }
+
+    /// Have the window narrow to the navigator as the detail goes, or widen back by as much as
+    /// that took as it comes back, the navigator keeping the width it has. Only on macOS, where
+    /// the window's least width can be lowered for it, and out of full screen.
+    fn narrow_window(&mut self, detail_open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let scale = Theme::get(cx).scale;
+        let width = f32::from(window.viewport_size().width) / scale;
+        let resizes = cfg!(target_os = "macos") && !window.is_fullscreen();
+        self.narrowing = match self.narrowing {
+            _ if !resizes => None,
+            // Turned back partway, it goes back from where it is.
+            Some(narrowing) if !narrowing.settled => Some(Narrowing {
+                asked: 0,
+                ..narrowing
+            }),
+            Some(narrowing) => Some(Narrowing {
+                wide: width + narrowing.wide - narrowing.navigator,
+                navigator: width,
+                settled: false,
+                asked: 0,
+            }),
+            None if detail_open => None,
+            None => Some(Narrowing {
+                wide: width,
+                navigator: (self.detail.read(cx)).navigator_width(clock::now(), window, cx),
+                settled: false,
+                asked: 0,
+            }),
+        };
+        let least = match self.narrowing {
+            Some(_) => Pane::Navigator.limits().0 * scale,
+            None => crate::LEAST_WINDOW_WIDTH,
+        };
+        set_least_width(least, window);
+        // From a task rather than as frames are drawn: each resize has AppKit draw the window
+        // at once, in step with its new width, where a frame drawn on the display's beat for the
+        // width before can land after it and be stretched to the new one.
+        self.resizing = self.narrowing.is_some().then(|| {
+            cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(RESIZE_STEP).await;
+                    let step = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                        this.step_narrowing(window, cx)
+                    };
+                    if !this.update_in(cx, step).unwrap_or(false) {
+                        break;
+                    }
+                }
+            })
+        });
+    }
+
+    /// Resize the window to as much of the detail as shows while it narrows to the navigator or
+    /// widens back, then to where the slide ended until it's there, after which its width is
+    /// the user's. Widened back, the panes lay out for the window again, and it can't be made
+    /// as narrow as the navigator. Whether there's another step.
+    fn step_narrowing(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(mut narrowing) = self.narrowing.filter(|narrowing| !narrowing.settled) else {
+            return false;
+        };
+        let now = clock::now();
+        let shown = self.detail_slide.share(self.detail_open, now);
+        let width = narrowing.navigator + (narrowing.wide - narrowing.navigator) * shown;
+        let width = Theme::get(cx).scaled(width).round();
+        let viewport = window.viewport_size();
+        let sliding = self.detail_slide.openness(now).is_some();
+        // A resize lands a step or more later, so the last is asked for again until the window
+        // has it, for a while.
+        let there = (viewport.width - width).abs() < fixed(0.5);
+        if sliding || (!there && narrowing.asked < LAST_RESIZE_TRIES) {
+            window.resize(gpui::size(width, viewport.height));
+            if !sliding {
+                narrowing.asked += 1;
+            }
+            self.narrowing = Some(narrowing);
+            return true;
+        }
+        if self.detail_open {
+            self.narrowing = None;
+            set_least_width(crate::LEAST_WINDOW_WIDTH, window);
+        } else {
+            self.narrowing = Some(Narrowing {
+                settled: true,
+                ..narrowing
+            });
+        }
+        cx.notify();
+        false
+    }
+
+    /// Bring the closed navigator out over the detail as the pointer, `at` from the panes' top
+    /// left, reaches the window's left edge below the location bar, so going for macOS's
+    /// traffic lights doesn't send them out of its way, and send it back once the pointer has
+    /// strayed past it for [`PEEK_GRACE`], unless [`AppView::peek_held`].
+    fn follow_pointer(
+        &mut self,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+    ) {
+        let now = clock::now();
+        if self.navigator_open || self.navigator_slide.closing(now) {
+            return;
+        }
+        let Point { x, y } = at;
+        if !self.peek.open {
+            let beside = y >= Theme::get(cx).scaled(HEADER_HEIGHT);
+            if x <= fixed(PEEK_EDGE) && beside && !self.covered() {
+                self.open_peek(cx);
+            }
+            return;
+        }
+        let width = self.detail.read(cx).navigator_width(now, window, cx);
+        let strayed = x > Theme::get(cx).scaled(PEEK_INSET + width);
+        if !strayed {
+            self.peek.leaving = None;
+        } else if self.peek.leaving.is_none() && !self.peek_held(window, cx) {
+            self.peek.leaving = Some(cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(PEEK_GRACE).await;
+                this.update_in(cx, |this, window, cx| this.close_peek(window, cx))
+                    .ok();
+            }));
+        }
+    }
+
+    /// Bring the closed navigator out over the detail.
+    fn open_peek(&mut self, cx: &mut Context<AppView>) {
+        self.peek.open = true;
+        self.peek.slide.start(true, cx);
+        (self.navigator).update(cx, |navigator, cx| navigator.set_floating(true, cx));
+        cx.notify();
+    }
+
+    /// Whether the navigator out over the detail stays though the pointer strayed from it:
+    /// what was opened from it is over the window, a drag may be headed for it, its filter
+    /// has the keys, or it has them since ⌘1 brought it out. The pointer's next move looks
+    /// again.
+    fn peek_held(&self, window: &Window, cx: &App) -> bool {
+        let navigator = self.navigator.focus_handle(cx);
+        let keys = navigator.contains_focused(window, cx);
+        let typing = keys && !navigator.is_focused(window);
+        self.covered() || cx.has_active_drag() || typing || (self.peek.keyed && keys)
+    }
+
+    /// Send the navigator ⌘1 brought out back, and with it the selection and the keys to where
+    /// ⌘1 was pressed, while that's still there.
+    fn send_peek_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.peek.keyed = false;
+        if let Some((selection, focus)) = self.peek.returns_to.take()
+            && self.store.read(cx).still_there(&selection)
+        {
+            self.store
+                .update(cx, |store, cx| store.select(Some(selection), cx));
+            if let Some(focus) = focus {
+                window.focus(&focus, cx);
+            }
+        }
+        self.close_peek(window, cx);
+    }
+
+    /// Send the navigator out over the detail back, unless [`AppView::peek_held`], moving the
+    /// keys off it, as it takes no more.
+    fn close_peek(&mut self, window: &mut Window, cx: &mut Context<AppView>) {
+        self.peek.leaving = None;
+        if !self.peek.open || self.peek_held(window, cx) {
+            return;
+        }
+        self.peek.open = false;
+        self.peek.keyed = false;
+        self.peek.returns_to = None;
+        self.peek.committing = false;
+        self.peek.slide.start(false, cx);
+        if self.navigator.focus_handle(cx).contains_focused(window, cx) {
+            self.focus_past_navigator(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Follows the pointer anywhere over the panes, over what takes it too, for the closed
+    /// navigator to come out over the detail: in from their left edge, which is the window's
+    /// but for the frame a desktop that leaves it to the app has drawn around them.
+    fn watch_pointer(&self, cx: &Context<AppView>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        gpui::canvas(
+            |_, _, _| {},
+            move |bounds, (), window, _| {
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture {
+                        let at = event.position - bounds.origin;
+                        this.update(cx, |this, cx| this.follow_pointer(at, window, cx))
+                            .ok();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0()
+    }
+
+    /// The detail, and the diff beside its file list, for the caller to place.
+    fn render_detail(
+        &self,
+        now: Instant,
+        navigator_sliding: bool,
+        files_sliding: bool,
+        window: &Window,
+        cx: &App,
+    ) -> Div {
+        let theme = Theme::get(cx);
+        div()
+            .relative()
+            // Over the navigator as it slides, taking the pointer from it.
+            .when(navigator_sliding, |el| el.bg(theme.bg_1).occlude())
+            .child(
+                self.detail
+                    .clone()
+                    .cached(StyleRefinement::default().size_full()),
+            )
+            .when_some(self.diff_left(now, window, cx), |el, left| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(dp(
+                            HEADER_HEIGHT + self.detail.read(cx).view_header_height(cx)
+                        ))
+                        .bottom_0()
+                        .right_0()
+                        .left(dp(left))
+                        // Over the files as they slide, edged as they are.
+                        .when(files_sliding, |el| {
+                            el.bg(theme.bg_1)
+                                .occlude()
+                                .child(edge(theme.border_3).left(fixed(-1.)))
+                        })
+                        .child(
+                            self.diff
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        ),
+                )
+            })
+            .children(self.shown_terminal(cx).map(|terminal| {
+                div()
+                    .absolute()
+                    .top(dp(HEADER_HEIGHT))
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .child(terminal.cached(StyleRefinement::default().size_full()))
+                    .child(self.paste_outline(theme))
+            }))
+            .when(navigator_sliding, |el| {
+                el.child(edge(theme.border_3).left(fixed(-1.)))
+            })
+    }
+
+    /// Over the terminal shown, an outline while what's held over it would paste there, a row
+    /// or files from the Finder, as a row that takes a drop has. It's drawn here, where GPUI styles it again each frame of the
+    /// drag: the terminal's own view draws only when it changes, so one there would stay up
+    /// after a drag let go elsewhere or stopped with Escape.
+    fn paste_outline(&self, theme: &Theme) -> Div {
+        let (store, color) = (self.store.clone(), theme.pop);
+        div()
+            .absolute()
+            .inset_0()
+            .drag_over::<Cut>(move |style, _, _, _| style.border_1().border_color(color))
+            .drag_over::<ProjectDrag>(move |style, _, _, _| style.border_1().border_color(color))
+            .drag_over::<ExternalPaths>(move |style, _, _, _| style.border_1().border_color(color))
+            // Not once a commit or worktree the drag holds is gone, which pastes nothing.
+            .can_drop(move |dragged, _, cx| {
+                !dragged.is::<Cut>() || store.read(cx).pasted().is_some()
+            })
+    }
+
+    /// The navigator and the detail while the detail slides in from the window's right edge or
+    /// back off it, `shown` of it on screen, or is hidden. The detail keeps the width it has
+    /// beside as much of the navigator as shows, `navigator_share` of it, and moves, so it's
+    /// not laid out again as it goes, and the navigator reaches its edge, taking the window
+    /// once it's gone. As the window narrows to the navigator or widens back, the detail
+    /// slides under the navigator instead, along with the window's right edge.
+    fn render_detail_aside(
+        &self,
+        now: Instant,
+        shown: f32,
+        navigator_share: f32,
+        files_sliding: bool,
+        window: &Window,
+        cx: &App,
+    ) -> Div {
+        let navigator_sliding = self.navigator_slide.openness(now).is_some();
+        let sliding = self.detail_slide.openness(now).is_some();
+        if let Some(narrowing) = self.narrowing.filter(|narrowing| !narrowing.settled) {
+            let theme = Theme::get(cx);
+            let beside = narrowing.navigator * navigator_share;
+            let navigator = div().w(dp(narrowing.navigator)).h_full().child(
+                self.navigator
+                    .clone()
+                    .cached(StyleRefinement::default().size_full()),
+            );
+            return div()
+                .absolute()
+                .inset_0()
+                .when(self.detail_open || sliding, |el| {
+                    el.child(
+                        self.render_detail(now, false, files_sliding, window, cx)
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_0()
+                            .w(dp(narrowing.wide - beside)),
+                    )
+                })
+                // Over the detail, as much of it as shows while it slides open or shut, edged
+                // as it is.
+                .when(beside > 0., |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .w(dp(beside))
+                            .overflow_hidden()
+                            .occlude()
+                            .child(inert(navigator, !self.navigator_open))
+                            .when(navigator_sliding, |el| {
+                                el.child(edge(theme.border_3).right_0())
+                            }),
+                    )
+                });
+        }
+        let beside = navigator_share * self.detail.read(cx).navigator_width(now, window, cx);
+        // From where the detail's left edge is when it shows to the window's right edge, so
+        // its width, and how far along it is, are shares of this one's.
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(dp(beside))
+            .right_0()
+            .when(
+                self.navigator_open || self.navigator_slide.closing(now) || sliding,
+                |el| {
+                    let navigator = div().size_full().child(
+                        self.navigator
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    );
+                    el.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(dp(-beside))
+                            .right(relative(shown))
+                            .child(inert(navigator, !self.navigator_open)),
+                    )
+                },
+            )
+            .when(self.detail_open || sliding, |el| {
+                el.child(
+                    self.render_detail(now, navigator_sliding, files_sliding, window, cx)
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(relative(1. - shown))
+                        .w_full(),
+                )
+            })
+    }
+
+    /// The navigator out over the detail: a card sliding in from past the window's edge,
+    /// shadow and all, keeping its width as it goes.
+    fn render_peek(&self, now: Instant, window: &Window, cx: &App) -> impl IntoElement {
+        let width = self.detail.read(cx).navigator_width(now, window, cx);
+        let away = PEEK_INSET + width + PEEK_SHADOW;
+        let left = PEEK_INSET - away * (1. - self.peek.slide.share(self.peek.open, now));
+        let navigator = div().size_full().child(
+            self.navigator
+                .clone()
+                .cached(StyleRefinement::default().size_full()),
+        );
+        div()
+            .absolute()
+            .top(dp(PEEK_INSET))
+            .bottom(dp(PEEK_INSET))
+            .left(dp(left))
+            .w(dp(width))
+            .rounded(dp(POPOVER_RADIUS))
+            .shadow_lg()
+            // Over the detail, taking the pointer from it.
+            .occlude()
+            .child(inert(navigator, !self.peek.open))
     }
 }
 
@@ -1014,19 +2034,48 @@ impl Render for AppView {
         // Every `dp` size is in rems, so this scales the whole window.
         window.set_rem_size(Theme::get(cx).scaled(crate::ui::BASE_REM));
         crate::ui::Covered::note(self.covered(), window, cx);
+        // After this frame, whose actions are the selection's now.
+        if self.pending_menu.is_some() {
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |window, cx| {
+                (this.update(cx, |this, cx| this.open_pending_menu(window, cx))).ok();
+            });
+        }
         let theme = Theme::get(cx).clone();
         let ligatures = self.store.read(cx).prefs.ligatures;
         let show_fps = self.store.read(cx).prefs.show_fps;
         // The detail lays out its header and its file list beside as much of the navigator as
         // shows, so it's told before it draws in this frame.
-        let now = Instant::now();
+        let now = clock::now();
         let navigator_share = self.navigator_slide.share(self.navigator_open, now);
         let navigator_sliding = self.navigator_slide.openness(now).is_some();
         let detail = self.detail.read(cx);
         detail.navigator_shown.set(navigator_share);
+        detail
+            .window_width
+            .set(self.narrowing.map(|narrowing| narrowing.wide));
         let files_sliding = detail.sliding(now);
-        if navigator_sliding || files_sliding {
+        let peek_sliding = self.peek.slide.openness(now).is_some();
+        // Likewise the navigator, beside as much of the detail as shows.
+        let detail_share = self.detail_slide.share(self.detail_open, now);
+        let detail_sliding = self.detail_slide.openness(now).is_some();
+        self.navigator.read(cx).detail_shown.set(detail_share);
+        // As the window narrows or widens, each resize draws it, and a frame drawn on the
+        // display's beat would be for the width before.
+        let resizing = self.narrowing.is_some_and(|narrowing| !narrowing.settled);
+        let sliding = navigator_sliding || files_sliding || peek_sliding || detail_sliding;
+        if sliding && !resizing {
             window.request_animation_frame();
+        }
+        // The navigator out over the detail goes over where macOS's traffic lights are, and
+        // AppKit draws them over everything the app does, so they make way while it's drawn.
+        #[cfg(target_os = "macos")]
+        {
+            let away = self.peek.open || self.peek.slide.closing(now);
+            if away != self.lights_away {
+                self.lights_away = away;
+                place_traffic_lights(away, window, cx);
+            }
         }
         let has_update_feed = cx
             .try_global::<crate::Embedded>()
@@ -1042,6 +2091,18 @@ impl Render for AppView {
                     this.navigator.update(cx, |_, cx| cx.notify());
                 }
             }))
+            // GPUI counts nothing as under the pointer while the last input was a key, and a
+            // drag in from another app, as files from the Finder onto a terminal, comes as moves
+            // it doesn't count as the mouse's: after typing, it would land nowhere. Sent again
+            // as the mouse's move, the drag counts.
+            .on_drag_move(|event: &DragMoveEvent<ExternalPaths>, window, cx| {
+                if window.last_input_was_keyboard() {
+                    let event = event.event.clone();
+                    window.defer(cx, move |window, cx| {
+                        window.dispatch_event(PlatformInput::MouseMove(event), cx);
+                    });
+                }
+            })
             .on_action(cx.listener(Self::quit))
             .on_action(|_: &Minimize, window, _| window.minimize_window())
             .on_action(|_: &Zoom, window, _| window.zoom_window())
@@ -1058,8 +2119,9 @@ impl Render for AppView {
                 el.on_action(cx.listener(Self::check_for_updates))
             })
             // Only in a build `cargo run` started, likewise.
-            .when(self.rebuild.is_some(), |el| {
+            .when(cx.has_global::<backend::rebuild::Rebuild>(), |el| {
                 el.on_action(cx.listener(Self::build_and_restart))
+                    .on_action(cx.listener(Self::build_and_restart_from_here))
             })
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_keyboard_shortcuts))
@@ -1067,19 +2129,35 @@ impl Render for AppView {
             .on_action(cx.listener(Self::clone_repository))
             // Here rather than around the navigator, so the details pane's buttons reach them.
             .map(|el| self.pr_actions(el, cx))
+            .map(|el| self.copy_actions(el, cx))
+            .map(|el| self.navigator_actions(el, cx))
+            .map(|el| self.project_list_actions(el, cx))
             .map(|el| self.resolve_actions(el, cx))
             .on_action(cx.listener(Self::go_to))
-            .on_action(cx.listener(Self::show_actions))
+            .on_action(cx.listener(Self::go_to_terminal))
+            .on_action(cx.listener(Self::show_context_menu))
             .on_action(cx.listener(Self::copy_more))
             .on_action(cx.listener(Self::open_selected_in_terminal))
+            .on_action(cx.listener(Self::new_terminal))
             // The selection doesn't decide: an operation that finished in another project is
             // still the last thing done.
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.store.update(cx, Store::undo_last)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.store.update(cx, Store::redo_last)))
             .on_action(cx.listener(Self::fetch))
+            .on_action(cx.listener(Self::pull))
             .on_action(cx.listener(Self::new_branch))
+            .on_action(cx.listener(Self::new_worktree))
+            .on_action(cx.listener(Self::new_worktree_with_name))
             .on_action(cx.listener(Self::push_selected))
             .on_action(cx.listener(Self::cut_selection))
+            // Where the diff shows what's selected, which can squash.
+            .when(
+                matches!(
+                    self.store.read(cx).selection,
+                    Some(Selection::Commit(..) | Selection::Uncommitted(..))
+                ),
+                |el| el.on_action(cx.listener(Self::squash_from_detail)),
+            )
             // Only while something is cut, so ⌘K doesn't offer it with nothing to paste.
             .when(self.store.read(cx).cut.is_some(), |el| {
                 el.on_action(cx.listener(Self::paste_here))
@@ -1100,7 +2178,15 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &ToggleFileTree, _, cx| {
                 (this.store).update(cx, |store, cx| {
-                    store.set_prefs(|prefs| prefs.file_tree = !prefs.file_tree, cx)
+                    store.set_prefs(
+                        |prefs| {
+                            prefs.file_view = match prefs.file_view {
+                                FileView::Tree => FileView::List,
+                                FileView::List => FileView::Tree,
+                            }
+                        },
+                        cx,
+                    )
                 })
             }))
             .on_action(cx.listener(Self::cancel))
@@ -1132,6 +2218,7 @@ impl Render for AppView {
                 this.update_selected_project(UpdateScope::Worktrees, cx)
             }))
             .on_action(cx.listener(Self::toggle_navigator))
+            .on_action(cx.listener(Self::toggle_detail))
             .on_action(cx.listener(Self::command_palette))
             // The composer's keys, pressed with the focus elsewhere, like the navigator.
             .on_action(
@@ -1183,6 +2270,12 @@ impl Render for AppView {
                 this.detail.update(cx, |detail, cx| detail.toggle_wrap(cx))
             }))
             .on_action(
+                cx.listener(|this, _: &crate::detail::ToggleFiles, window, cx| {
+                    this.detail
+                        .update(cx, |detail, cx| detail.toggle_files(window, cx))
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &crate::detail::NextHunk, window, cx| {
                     this.detail
                         .update(cx, |detail, cx| detail.move_hunk(true, window, cx))
@@ -1218,70 +2311,62 @@ impl Render for AppView {
                     .flex_row()
                     .flex_1()
                     .min_h_0()
+                    .relative()
                     // What the navigator's menus and keys, and the commit header's menu, do to
                     // the selection.
                     .map(|el| self.edit_actions(el, cx))
                     .on_drag_move(resize_pane(Pane::Navigator, self.store.clone()))
-                    .when(
-                        self.navigator_open || self.navigator_slide.closing(now),
-                        |el| {
-                            let width = self.detail.read(cx).navigator_width(now, window, cx);
-                            // Sliding, it keeps its width and its place, so it's drawn again
-                            // only when it changes, not as it slides or the diff changes: the
-                            // detail beside it moves its edge across it.
-                            let navigator = div().w(dp(width)).h_full().child(
-                                self.navigator
-                                    .clone()
-                                    .cached(StyleRefinement::default().size_full()),
-                            );
-                            el.child(
-                                div()
-                                    .w(dp(width * navigator_share))
-                                    .flex_none()
-                                    .h_full()
-                                    .child(inert(navigator, !self.navigator_open)),
+                    .map(|el| match detail_share < 1. {
+                        true => el.overflow_hidden().child(self.render_detail_aside(
+                            now,
+                            detail_share,
+                            navigator_share,
+                            files_sliding,
+                            window,
+                            cx,
+                        )),
+                        false => el
+                            .when(
+                                self.navigator_open || self.navigator_slide.closing(now),
+                                |el| {
+                                    let width =
+                                        self.detail.read(cx).navigator_width(now, window, cx);
+                                    // Sliding, it keeps its width and its place, so it's drawn
+                                    // again only when it changes, not as it slides or the diff
+                                    // changes: the detail beside it moves its edge across it.
+                                    let navigator = div().w(dp(width)).h_full().child(
+                                        self.navigator
+                                            .clone()
+                                            .cached(StyleRefinement::default().size_full()),
+                                    );
+                                    el.child(
+                                        div()
+                                            .w(dp(width * navigator_share))
+                                            .flex_none()
+                                            .h_full()
+                                            .child(inert(navigator, !self.navigator_open)),
+                                    )
+                                },
                             )
-                        },
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .relative()
-                            // Over the navigator as it slides, taking the pointer from it.
-                            .when(navigator_sliding, |el| el.bg(theme.bg_1).occlude())
                             .child(
-                                self.detail
-                                    .clone()
-                                    .cached(StyleRefinement::default().size_full()),
-                            )
-                            .when_some(self.diff_left(now, window, cx), |el, left| {
-                                el.child(
-                                    div()
-                                        .absolute()
-                                        .top(dp(HEADER_HEIGHT
-                                            + self.detail.read(cx).view_header_height(cx)))
-                                        .bottom_0()
-                                        .right_0()
-                                        .left(dp(left))
-                                        // Over the files as they slide, edged as they are.
-                                        .when(files_sliding, |el| {
-                                            el.bg(theme.bg_1)
-                                                .occlude()
-                                                .child(edge(theme.border_3).left(fixed(-1.)))
-                                        })
-                                        .child(
-                                            self.diff
-                                                .clone()
-                                                .cached(StyleRefinement::default().size_full()),
-                                        ),
+                                self.render_detail(
+                                    now,
+                                    navigator_sliding,
+                                    files_sliding,
+                                    window,
+                                    cx,
                                 )
-                            })
-                            .when(navigator_sliding, |el| {
-                                el.child(edge(theme.border_3).left(fixed(-1.)))
-                            }),
-                    ),
+                                .flex_1()
+                                .min_w_0()
+                                .h_full(),
+                            ),
+                    })
+                    // Closed, the navigator comes out over the detail as the pointer reaches
+                    // the window's left edge, as Arc's sidebar does.
+                    .when(!self.navigator_open, |el| el.child(self.watch_pointer(cx)))
+                    .when(self.peek.open || self.peek.slide.closing(now), |el| {
+                        el.child(self.render_peek(now, window, cx))
+                    }),
             )
             .child(self.render_status_bar(window, cx))
             .children(self.render_modal(cx))
@@ -1297,28 +2382,45 @@ impl Render for AppView {
                 el.child(crate::ui::window_controls::window_controls(window, cx))
             })
             // Over everything, and it takes no clicks, as it has no hitbox.
-            .when(show_fps, |el| el.child(self.fps.clone()));
+            .when(show_fps, |el| el.child(self.fps.clone()))
+            .when(cfg!(target_os = "macos"), |el| {
+                el.child(crate::ui::holds_back_first_click())
+            });
         crate::ui::window_frame::window_frame(root, window, cx)
     }
 }
 
 /// Puts macOS's traffic lights, which keep their size at every interface scale, halfway down
-/// the header, however tall the scale draws it.
+/// the header, however tall the scale draws it. While `away`, they're past the window's left
+/// edge, where AppKit doesn't draw them.
 #[cfg(target_os = "macos")]
-fn place_traffic_lights(window: &Window, cx: &App) {
+fn place_traffic_lights(away: bool, window: &Window, cx: &App) {
     use crate::ui::fixed;
     use gpui::point;
 
     const LIGHTS: f32 = 14.;
+    // Further than the three of them reach.
+    const AWAY: f32 = -100.;
     let top = (Theme::get(cx).scaled(HEADER_HEIGHT) - fixed(LIGHTS)) / 2.;
-    window.set_traffic_light_position(point(fixed(14.), top));
+    let left = match away {
+        true => fixed(AWAY),
+        false => fixed(14.),
+    };
+    window.set_traffic_light_position(point(left, top));
 }
 
 /// The theme the appearance setting and the system call for.
 fn theme_for(store: &Store, window: &Window) -> Theme {
     let prefs = &store.prefs;
-    Theme::for_appearance(prefs.appearance, window.appearance(), prefs.code_size)
+    let (scheme, system) = (&prefs.color_scheme, window.appearance());
+    let ghostty = but_tty::Ghostty::load();
+    let digit = |family: &str| crate::ui::digit_advance(family, window.text_system());
+    let installed = |family: &str| digit(family).is_some();
+    Theme::new(prefs.appearance, scheme, system, prefs.code_size, &ghostty)
         .with_scale(prefs.ui_scale)
+        .with_diff_font(prefs.diff_font.as_deref(), digit)
+        .with_ligatures(prefs.ligatures)
+        .with_terminal_font(prefs.terminal_font.as_deref(), &ghostty, installed)
 }
 
 /// What the snackbar says after copying `text`: the text itself when it's short.
@@ -1354,6 +2456,35 @@ fn show_cursor_again(window: &Window) {
         }
     }
 }
+
+/// Let the window be made as narrow as `width`, in logical pixels, as GPUI only sets how small
+/// it can be made as it opens it.
+#[cfg(target_os = "macos")]
+fn set_least_width(width: f32, window: &Window) {
+    use objc2::{msg_send, runtime::AnyObject};
+    use objc2_foundation::NSSize;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+    let view = handle.ns_view.as_ptr().cast::<AnyObject>();
+    let least = NSSize::new(width.into(), crate::LEAST_WINDOW_HEIGHT.into());
+    // SAFETY: `view` is the window's live NSView, used on the main thread, and
+    // `setContentMinSize:` only changes how small the window can be made.
+    unsafe {
+        let ns_window: *mut AnyObject = msg_send![view, window];
+        if !ns_window.is_null() {
+            let _: () = msg_send![ns_window, setContentMinSize: least];
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_least_width(_: f32, _: &Window) {}
 
 /// Whether a dev script drives the window, which then says when it's hidden.
 pub(crate) fn scripted() -> bool {

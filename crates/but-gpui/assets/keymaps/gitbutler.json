@@ -25,6 +25,8 @@
       "secondary-o": "app::AddProject",
       "secondary-shift-o": "projects::CloneRepository",
       "secondary-n": "navigator::NewBranch",
+      // From a terminal too, as a terminal app opens a tab.
+      "secondary-t": "terminal::NewTerminal",
       // VS Code's and Zed's key works too; ⌘K, Linear's and GitHub's, is the one shown.
       "secondary-shift-p": "app::CommandPalette",
       "secondary-k": "app::CommandPalette",
@@ -35,6 +37,8 @@
       "secondary-3": "app::FocusDiff",
       // As VS Code, Cursor and Zed hide their sidebar.
       "secondary-b": "app::ToggleNavigator",
+      // As VS Code hides its secondary side bar.
+      "secondary-alt-b": "app::ToggleDetail",
       // The desktop app's key for it.
       "secondary-shift-h": "app::OperationsHistory"
     }
@@ -48,9 +52,20 @@
   {
     "bindings": { "secondary-r": "remote::Fetch" }
   },
+  // A commit placed with the navigator hidden, and so no composer, Return commits as it is,
+  // without a message. Before ⌘↩, below, so that's the key shown.
+  {
+    "context": "Diff && Committing && !TextInput",
+    "bindings": { "enter": "app::StartCommit" }
+  },
   // From the file filter too, which the commit then takes the files of.
   {
     "context": "Files && !Composer > TextInput",
+    "bindings": { "secondary-enter": "app::StartCommit" }
+  },
+  // And from a terminal, whose shell has no use for it.
+  {
+    "context": "Terminal",
     "bindings": { "secondary-enter": "app::StartCommit" }
   },
   {
@@ -76,9 +91,9 @@
       // ⌘R only looks at the remote; ⇧R brings the target's changes in.
       "shift-r": "remote::UpdateFromTarget",
       "secondary-shift-t": "open_in::OpenInTerminal",
-      // Between the navigator, the file list and the diff, as Mail and Xcode move between
-      // their panes. ← and →, or h and l, go to the pane on that side, as from a commit into
-      // its files and back, and stop at the window's edge.
+      // Between the navigator, a list page's list, the files and the diff, as Mail and Xcode
+      // move between their panes. ← and →, or h and l, go to the pane on that side, as from a
+      // commit into its files and back, and stop at the window's edge.
       "tab": "app::FocusNextPane",
       "shift-tab": "app::FocusPreviousPane",
       "l": "app::FocusPaneRight",
@@ -131,20 +146,74 @@
       "shift-space": "diff::PageUp",
       "ctrl-d": "diff::HalfPageDown",
       "ctrl-u": "diff::HalfPageUp",
-      // F2 is the rename key on Windows and Linux, and Lite's; r is the one shown.
-      "f2": "navigator::RenameSelection",
-      "r": "navigator::RenameSelection",
       "b": "navigator::NewBranchOnTop",
       "o": "pr::OpenPullRequest",
       "u": "navigator::ToggleRead",
-      "shift-u": "navigator::MarkAllRead",
-      "secondary-backspace": "navigator::DeleteSelection"
+      "shift-u": "navigator::MarkAllRead"
     }
+  },
+  // While commits move, the keys above step through where they can land, and Return lands
+  // them there. After the navigator's Return, so it wins. While squashing, u keeps only the
+  // target's message, as in the TUI, after the navigator's u, so it wins.
+  {
+    "context": "Navigator && Moving && !TextInput",
+    "bindings": { "enter": "navigator::MoveHere" }
+  },
+  {
+    "context": "Navigator && Squashing && !TextInput",
+    "bindings": { "u": "navigator::UseTargetMessage" }
+  },
+  // Renaming, deleting and taking out do what fits the selection, so each key is bound once for
+  // each of those, a section apiece, and runs the one the selection has. F2 is the rename key on
+  // Windows and Linux, and Lite's; r is the one shown. A commit's:
+  {
+    "context": "Navigator && !TextInput",
+    "bindings": {
+      "f2": "edits::Reword",
+      "r": "edits::Reword",
+      "secondary-backspace": "edits::DiscardCommit"
+    }
+  },
+  // A branch's:
+  {
+    "context": "Navigator && !TextInput",
+    "bindings": {
+      "f2": "edits::RenameBranch",
+      "r": "edits::RenameBranch",
+      "secondary-backspace": "edits::DeleteBranch"
+    }
+  },
+  // The unnamed branch's, which gets a name at its newest commit:
+  {
+    "context": "Navigator && !TextInput",
+    "bindings": {
+      "f2": "edits::NameBranch",
+      "r": "edits::NameBranch"
+    }
+  },
+  // A terminal's:
+  {
+    "context": "Navigator && !TextInput",
+    "bindings": {
+      "f2": "edits::RenameTerminal",
+      "r": "edits::RenameTerminal"
+    }
+  },
+  // Uncommitted changes':
+  {
+    "context": "Navigator && !TextInput",
+    "bindings": { "secondary-backspace": "edits::DiscardChanges" }
+  },
+  // A commit comes out of its branch, and a branch's stack out of the workspace.
+  {
+    "os": ["macos"],
+    "context": "Navigator && !TextInput",
+    "bindings": { "secondary-alt-backspace": "edits::Uncommit" }
   },
   {
     "os": ["macos"],
     "context": "Navigator && !TextInput",
-    "bindings": { "secondary-alt-backspace": "navigator::UncommitSelection" }
+    "bindings": { "secondary-alt-backspace": "edits::UnapplyStack" }
   },
   // Ctrl+Alt+Backspace kills the X server where that's still on, and Ctrl+Alt is AltGr on
   // many European layouts. Delete deletes as Explorer and Files do, last so it's shown.
@@ -152,9 +221,22 @@
     "os": ["windows", "linux"],
     "context": "Navigator && !TextInput",
     "bindings": {
-      "ctrl-shift-backspace": "navigator::UncommitSelection",
-      "delete": "navigator::DeleteSelection"
+      "ctrl-shift-backspace": "edits::Uncommit",
+      "delete": "edits::DiscardCommit"
     }
+  },
+  {
+    "os": ["windows", "linux"],
+    "context": "Navigator && !TextInput",
+    "bindings": {
+      "ctrl-shift-backspace": "edits::UnapplyStack",
+      "delete": "edits::DeleteBranch"
+    }
+  },
+  {
+    "os": ["windows", "linux"],
+    "context": "Navigator && !TextInput",
+    "bindings": { "delete": "edits::DiscardChanges" }
   },
   // Jumps through the tree: to either end, and between branches and projects. ⇧ with an
   // arrow picks commits, as ⇧-click does.
@@ -237,10 +319,19 @@
     "bindings": { "delete": "diff::DiscardFile" }
   },
   // While committing, as a click on the checkbox does: space a file in the list, as in Lite,
-  // and x the hunk under the diff's cursor.
+  // and space or x the hunk under the diff's cursor, each going on to the next, rather than
+  // Space paging the diff. Return in the list goes on to the message, once what goes in is
+  // checked.
+  {
+    "context": "Diff && Composer && !TextInput",
+    "bindings": { "space": "diff::ToggleCheck" }
+  },
   {
     "context": "Files && Composer && !TextInput",
-    "bindings": { "space": "diff::ToggleCheck" }
+    "bindings": {
+      "space": "diff::ToggleCheck",
+      "enter": "diff::WriteMessage"
+    }
   },
   {
     "context": "Diff && !TextInput",
@@ -271,11 +362,18 @@
       "shift-l": "navigator::Expand",
       "shift-right": "navigator::Expand",
       "shift-h": "navigator::Collapse",
-      "shift-left": "navigator::Collapse",
-      // Applies the branch on Branches, restores to before the operation on Operations
-      // history, after asking.
-      "enter": "navigator::Confirm"
+      "shift-left": "navigator::Collapse"
     }
+  },
+  // Return applies the branch on Branches, and restores to before the operation on Operations
+  // history, after asking: a section apiece, as the key runs the one the page has.
+  {
+    "context": "List && !TextInput",
+    "bindings": { "enter": "branches::ApplyBranch" }
+  },
+  {
+    "context": "List && !TextInput",
+    "bindings": { "enter": "history::RestoreOperation" }
   },
   // While committing, with the focus anywhere, typing the message too, as ⌘↩ commits.
   {
@@ -298,6 +396,33 @@
       "enter": "find::FindNext",
       "shift-enter": "find::FindPrevious"
     }
+  },
+  // After the text field's own keys, so these win in a commit message's fields.
+  {
+    "context": "MessageTitle > TextInput",
+    "bindings": {
+      "enter": "message_editor::ToBody",
+      "tab": "message_editor::ToBody"
+    }
+  },
+  // A commit's title commits on Return, written or not, as a body is seldom wanted: Tab goes
+  // to it. A pull request's title goes on to its body.
+  {
+    "context": "Composer > MessageTitle > TextInput",
+    "bindings": { "enter": "text_input::Submit" }
+  },
+  {
+    "context": "MessageBody > TextInput",
+    "bindings": {
+      "shift-tab": "message_editor::ToTitle",
+      "backspace": "message_editor::LeaveEmptyBody"
+    }
+  },
+  // A commit's title edited in its row saves on Return too, and Tab goes on to its body, in the
+  // commit's header.
+  {
+    "context": "Reword > TextInput",
+    "bindings": { "tab": "message_editor::ToBody" }
   },
   // As vim steps through matches.
   {
@@ -330,14 +455,10 @@
     "context": "Picked && !TextInput",
     "bindings": { "secondary-enter": "conflict::ApplyResolutions" }
   },
-  // The keys that open a context menu on Windows and Linux, first so menus show M.
+  // ⇧F10 opens the selected row's right-click menu, as on Windows and Linux and in VS Code.
   {
-    "os": ["windows", "linux"],
     "context": "Workspace && !TextInput",
-    "bindings": {
-      "shift-f10": "palette::ShowActions",
-      "menu": "palette::ShowActions"
-    }
+    "bindings": { "shift-f10": "app::ShowContextMenu" }
   },
   {
     "context": "Workspace && !TextInput",
@@ -345,10 +466,6 @@
   },
   {
     "bindings": { "secondary-p": "palette::GoTo" }
-  },
-  {
-    "context": "Workspace && !TextInput",
-    "bindings": { "m": "palette::ShowActions" }
   },
   // After the text field's own keys, so these win inside the palette.
   {
@@ -358,6 +475,17 @@
       "down": "palette::PaletteDown",
       "ctrl-p": "palette::PaletteUp",
       "ctrl-n": "palette::PaletteDown"
+    }
+  },
+  // A right-click menu's items, as Settings' pages: Return runs the one the keys are on.
+  {
+    "context": "ContextMenu",
+    "bindings": {
+      "up": "navigator::SelectPrevious",
+      "k": "navigator::SelectPrevious",
+      "down": "navigator::SelectNext",
+      "j": "navigator::SelectNext",
+      "enter": "navigator::Confirm"
     }
   },
   // Settings' pages, from its search box too, as the palette's list is.
@@ -376,6 +504,11 @@
       "down": "navigator::SelectNext",
       "j": "navigator::SelectNext"
     }
+  },
+  // Back to the search box from a page link or a control, as / goes to the navigator's filter.
+  {
+    "context": "Settings && !TextInput",
+    "bindings": { "/": "settings::FocusSearch" }
   },
   // After the text field's own keys, so these win in the search field.
   {

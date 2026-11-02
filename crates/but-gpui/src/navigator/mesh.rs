@@ -5,15 +5,15 @@
 
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, Context, MouseButton, Window, div, prelude::*};
+use gpui::{AnyElement, App, Context, Window, div, prelude::*};
 
 use super::rows::{COMMIT_INDENT, Fold, Row, Rows, found, matches};
 use super::{ClickOpened, Navigator, RowStyle, STEP, change_counts, click_opens, double_click};
-use crate::app::CopySelection;
+use crate::app::{CopyPath, CopySelection};
 use crate::backend::mesh::{self, BranchStatus};
 use crate::overlays::MenuItem;
 use crate::state::{MeshBranch, MeshPick, ProjectId, Section, Selection, Store};
-use crate::ui::{Icon, Tooltip, faint, icon, small_icon};
+use crate::ui::{Icon, Tooltip, faint, icon, review, small_icon};
 
 impl Navigator {
     /// `id`'s checkouts on other machines under their heading, unless that's folded without
@@ -158,7 +158,7 @@ impl Navigator {
                 let id = format!("mesh-commit-{project}-{key}-{:?}", commit.id);
                 let glyph = small_icon(glyph).text_color(style.meta(color));
                 let title = commit.title.clone().into();
-                style.commit_line(id, COMMIT_INDENT, glyph, title, false)
+                style.commit_line(id, COMMIT_INDENT, glyph, title, false, None)
             }
             (MeshPick::Branch(name), Some(branch)) => {
                 let fold = (project.clone(), key.clone(), name.clone());
@@ -173,6 +173,10 @@ impl Navigator {
                     BranchStatus::Diverged => (Icon::Branch, theme.warn),
                     BranchStatus::Other => (Icon::Branch, style.muted()),
                 };
+                let color = match branch.status {
+                    BranchStatus::Integrated => review::merged_color(style.solid, theme),
+                    _ => style.meta(color),
+                };
                 let toggle = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
                     this.toggle_mesh_branch(fold.clone(), open, window, cx)
                 };
@@ -185,7 +189,7 @@ impl Navigator {
                         cx,
                         toggle.clone(),
                     ))
-                    .child(icon(glyph).text_color(style.meta(color)))
+                    .child(icon(glyph).text_color(color))
                     .child(
                         div()
                             .flex_1()
@@ -195,7 +199,6 @@ impl Navigator {
                             .child(name.clone()),
                     )
                     .children(style.unpushed(unpushed))
-                    .when(!open, |el| el.children(style.commits(n)))
                     .when(n > 0, |el| el.on_click(click_opens(clicked, toggle, cx)))
             }
             (MeshPick::Checkout, _) => {
@@ -254,10 +257,7 @@ impl Navigator {
             }
             _ => return None,
         };
-        Some(
-            row.on_mouse_down(MouseButton::Left, self.select_on_press(item, cx))
-                .into_any_element(),
-        )
+        Some(self.selectable(row, item, cx).into_any_element())
     }
 
     /// Whether `project`'s work elsewhere shows under its heading: unfolded, with the
@@ -429,15 +429,7 @@ impl Navigator {
                 cx.open_url(&url)
             }));
         }
-        if *pick == MeshPick::Checkout {
-            let path = checkout.path.clone();
-            items.push(MenuItem::keyed(
-                "Copy path",
-                &CopySelection,
-                cx,
-                move |app, _, cx| app.copy_text(path.clone(), cx),
-            ));
-        }
+        items.push(MenuItem::command(&CopyPath, cx).keys(&CopySelection, cx));
         items
     }
 }

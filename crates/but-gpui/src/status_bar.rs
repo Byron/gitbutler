@@ -7,14 +7,18 @@ use gpui::{
 };
 
 use crate::app::{
-    AppView, CommandPalette, CutSelection, Fetch, FocusDiff, OpenPullRequest, PasteHere, Push,
-    RenameSelection, StartCommit, UncommitSelection, Undo, UpdateFromTarget,
+    AppView, CommandPalette, CutSelection, Fetch, FocusDiff, MoveHere, MoveSelection,
+    OpenPullRequest, PasteHere, Push, SquashSelection, StartCommit, Undo, UpdateFromTarget,
+    UseTargetMessage,
 };
-use crate::backend::{Branch, Checkout, CommitId, FileChange, ReviewState, Workspace};
+use crate::backend::rebuild::Rebuild;
+use crate::backend::{Branch, Checkout, CommitId, FileChange, Messages, ReviewState, Workspace};
 use crate::detail::{AmendTop, DiscardHunk, NextFile, NextHunk};
+use crate::edits::{NameBranch, RenameBranch, RenameTerminal, Reword, Uncommit};
 use crate::pr::{CreatePullRequest, create_offer};
 use crate::state::{Cut, ProjectId, SLOW, Section, Selection};
 use crate::theme::Theme;
+use crate::transfer::{Op, Transfer};
 use crate::ui::{
     Icon, STATUS_BAR_HEIGHT, Tooltip, ago, dot, dp, duration, h_flex, plural, shortcut,
     shortcut_here, small_icon,
@@ -65,6 +69,59 @@ impl AppView {
                 .child(small_icon(Icon::Clock).text_color(theme.pop))
                 .child(working);
             (working.into_any_element(), Vec::new())
+        } else if let Some(moving) = &store.moving {
+            // What's moving, and where Return lands it, unless that's where it is.
+            let lands = moving.lands(store);
+            let what = moving.describe(store);
+            // A new commit has no name till its message is written.
+            let what = match lands {
+                true => format!("{what} {}", moving.place(store))
+                    .trim_start()
+                    .to_owned(),
+                false => what,
+            };
+            // In the colour each marks rows in, as the TUI's modes have their own.
+            let (doing, color) = (moving.op.doing(), moving.op.colour(&theme));
+            let state = h_flex()
+                .gap(dp(6.))
+                .min_w_0()
+                .overflow_hidden()
+                .child(div().flex_none().text_color(color).child(doing))
+                .child(div().min_w_0().truncate().child(what));
+            // Commits squashed into one keep both messages, or only the one they go into's.
+            let messages = match (moving.op, moving.squashed(store)) {
+                (Op::Squash(keep), Some(Transfer::Squash { .. })) => {
+                    let said = match keep {
+                        Messages::Both => "keep only its message",
+                        Messages::Target => "keep both messages",
+                    };
+                    shortcut(&UseTargetMessage, cx).map(|keys| (keys, said))
+                }
+                (Op::Squash(_) | Op::Move | Op::Commit, _) => None,
+            };
+            // Commits or a branch squash instead of moving, or move instead of squashing.
+            let instead = match moving.op {
+                Op::Squash(_) => shortcut(&MoveSelection, cx).map(|keys| (keys, "move instead")),
+                Op::Move => shortcut(&SquashSelection, cx).map(|keys| (keys, "squash instead")),
+                Op::Commit => None,
+            };
+            // Without the composer, as where the navigator came out for it, Return commits as
+            // it is, without a message. Without the navigator, the arrows go on through the
+            // files.
+            let unseen = moving.op == Op::Commit && !self.navigator_shown();
+            let verb = match moving.op == Op::Commit && !self.detail.read(cx).composing() {
+                true => "commit",
+                false => moving.verb(store),
+            };
+            let keys = (!unseen)
+                .then(|| ("↑↓".into(), "choose where"))
+                .into_iter()
+                .chain((shortcut(&MoveHere, cx).filter(|_| lands)).map(|keys| (keys, verb)))
+                .chain(messages)
+                .chain(instead.filter(|_| moving.of_commits()))
+                .chain([("esc".into(), "cancel")])
+                .collect();
+            (state.into_any_element(), keys)
         } else if let Some(cut) = &store.cut {
             // On another commit, a commit goes above it, below it with ⇧, or one that's cut
             // rather than copied into it with ⌥.
@@ -106,8 +163,10 @@ impl AppView {
                 store.picked.len(),
                 "commit",
                 Some(match picks_conflicted {
-                    true => "drag them together, or press M to squash or discard them",
-                    false => "drag them together, or press M to squash, uncommit or discard them",
+                    true => "drag them together, or right-click to squash or discard them",
+                    false => {
+                        "drag them together, or right-click to squash, uncommit or discard them"
+                    }
                 }),
             ),
             (
@@ -160,10 +219,7 @@ impl AppView {
 
         let detail_focused = detail.is_focused(window, cx);
         // A linked worktree's changes commit and discard as the main checkout's do.
-        let uncommitted = matches!(
-            store.selection,
-            Some(Selection::Uncommitted(_) | Selection::Worktree(..))
-        );
+        let uncommitted = matches!(store.selection, Some(Selection::Uncommitted(..)));
         let composing = uncommitted && detail.composing();
         let hints: Vec<(&dyn Action, &str)> = if composing {
             let amend = detail
@@ -227,25 +283,27 @@ impl AppView {
                         .is_some_and(|branch| branch.review.is_some());
                     let create = (create_offer(store, selection) == Some(Ok(())))
                         .then_some((&CreatePullRequest as &dyn Action, "create pull request"));
+                    let rename: (&dyn Action, _) = match ref_name {
+                        Some(_) => (&RenameBranch, "rename"),
+                        None => (&NameBranch, "name"),
+                    };
                     (push.then_some((&Push as &dyn Action, "push")).into_iter())
                         .chain(review.then_some((&OpenPullRequest as &dyn Action, "pull request")))
                         .chain(create)
-                        .chain([(&RenameSelection as &dyn Action, "rename")])
+                        .chain([rename])
                         .collect()
                 }
                 Some(Selection::Commit(_, id)) => {
                     let conflicted = picks_conflicted || conflicted(id);
-                    [
-                        (&CutSelection as &dyn Action, "cut"),
-                        (&RenameSelection, "edit message"),
-                    ]
-                    .into_iter()
-                    .chain((!conflicted).then_some((&UncommitSelection as &dyn Action, "uncommit")))
-                    .collect()
+                    [(&CutSelection as &dyn Action, "cut"), (&Reword, "reword")]
+                        .into_iter()
+                        .chain((!conflicted).then_some((&Uncommit as &dyn Action, "uncommit")))
+                        .collect()
                 }
-                Some(Selection::Uncommitted(_) | Selection::Worktree(..)) => {
+                Some(Selection::Checkout(..) | Selection::Uncommitted(..)) => {
                     vec![(&StartCommit, "commit")]
                 }
+                Some(Selection::Terminal(..)) => vec![(&RenameTerminal, "rename")],
                 _ => Vec::new(),
             };
             if store.can_undo() {
@@ -303,7 +361,7 @@ impl AppView {
                     })
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(CommandPalette), cx)),
             )
-            .children(self.rebuild.is_some().then(|| self.build_button(cx)))
+            .children((cx.has_global::<Rebuild>()).then(|| self.build_button(cx)))
     }
 
     /// The bar's left while nothing is under way, picked or cut: what in the selected project
@@ -370,12 +428,7 @@ impl AppView {
                     color: None,
                     text,
                     tip: "Show the worktree",
-                    to: match first {
-                        Checkout::Main => Selection::Uncommitted(project.clone()),
-                        Checkout::Linked(name) => {
-                            Selection::Worktree(project.clone(), name.clone())
-                        }
-                    },
+                    to: Selection::Checkout(project.clone(), first.clone()),
                 });
             }
             let unread: Vec<CommitId> = (workspace.lanes.iter())
@@ -480,10 +533,10 @@ fn needs(
     let count = |files: &[FileChange]| files.iter().filter(|file| file.conflicted).count();
     let files: Vec<(usize, Selection)> = std::iter::once((
         count(&workspace.uncommitted),
-        Selection::Uncommitted(project.clone()),
+        Selection::Uncommitted(project.clone(), Checkout::Main),
     ))
     .chain((workspace.worktrees.iter()).map(|worktree| {
-        let to = Selection::Worktree(project.clone(), worktree.name.clone());
+        let to = Selection::Uncommitted(project.clone(), Checkout::Linked(worktree.name.clone()));
         (count(&worktree.uncommitted), to)
     }))
     .filter(|(n, to)| *n > 0 && elsewhere(to))
@@ -580,7 +633,7 @@ fn hint(keys: &str, label: &str, theme: &Theme) -> gpui::Div {
 mod tests {
     use super::{Need, needs, under_way};
     use crate::backend::model::build::{branch, full, id, workspace, worktree};
-    use crate::backend::{Checks, FileChange, Review, ReviewState};
+    use crate::backend::{Checkout, Checks, FileChange, Review, ReviewState};
     use crate::state::{ProjectId, Selection};
 
     #[test]
@@ -627,7 +680,7 @@ mod tests {
                 (
                     Need::ConflictedFiles,
                     "3 conflicted files".to_owned(),
-                    Selection::Uncommitted(project.clone())
+                    Selection::Uncommitted(project.clone(), Checkout::Main)
                 ),
                 (
                     Need::FailedChecks,
@@ -637,13 +690,13 @@ mod tests {
             ],
             "a merged pull request's checks and a linked worktree's, which go stale, don't count"
         );
-        let main = Selection::Uncommitted(project.clone());
+        let main = Selection::Uncommitted(project.clone(), Checkout::Main);
         assert_eq!(
             needs(&project, &ws, Some(&main))[1],
             (
                 Need::ConflictedFiles,
                 "2 conflicted files".to_owned(),
-                Selection::Worktree(project.clone(), "agent-x".into())
+                Selection::Uncommitted(project.clone(), Checkout::Linked("agent-x".into()))
             ),
             "Main worktree's page shows its own conflicts, and the linked worktree's still count"
         );

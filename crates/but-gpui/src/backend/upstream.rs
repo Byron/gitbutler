@@ -1,6 +1,6 @@
 //! The remotes and the target branch: pushing and pulling branches, updating the workspace
-//! from the target, fetching and landing; and the target's history, with what came in that
-//! the workspace doesn't have yet, the pull request each commit landed, and when the
+//! from the target, fetching and merging; and the target's history, with what came in that
+//! the workspace doesn't have yet, the pull request each commit merged, and when the
 //! project last fetched.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -32,7 +32,7 @@ pub struct TargetCommit {
     pub email: String,
     /// The agent that wrote it, when `author` is the person who committed it.
     pub agent: Option<Agent>,
-    /// The pull request it landed, without CI checks.
+    /// The pull request it merged, without CI checks.
     pub review: Option<Review>,
     /// The workspace doesn't have it yet.
     pub incoming: bool,
@@ -70,7 +70,7 @@ pub fn target_commits(
 }
 
 /// The newest `limit` of the target's commits the workspace doesn't have yet, each named by
-/// the pull request it landed, as the project's page names them, with the pull requests the
+/// the pull request it merged, as the project's page names them, with the pull requests the
 /// forge cache has, `cached`.
 pub(super) fn incoming(
     ctx: &but_ctx::Context,
@@ -144,7 +144,7 @@ fn target_page(
                         ..Review::default()
                     },
                 };
-                // It landed, whatever the cache saw last.
+                // It merged, whatever the cache saw last.
                 found.state = ReviewState::Merged;
                 found
             });
@@ -200,7 +200,7 @@ fn local_target_page(
 }
 
 /// `commit` as a target's history lists it. Whether it's incoming, and the pull request it
-/// landed, are for the caller to set.
+/// merged, are for the caller to set.
 pub(super) fn target_commit(
     mailmap: &gix::mailmap::Snapshot,
     commit: &gix::Commit<'_>,
@@ -248,37 +248,39 @@ fn offset_at(seconds: i64) -> i64 {
         .map_or(0, |at| at.offset().local_minus_utc().into())
 }
 
-/// The target as the project's page sums it up: what landed on it, and who's been committing
+/// The target as the project's page sums it up: what merged into it, and who's been committing
 /// to it.
 #[derive(Debug, Clone, Default)]
 pub struct Overview {
-    /// How many commits landed on the target's own line, as its history lists them, each of
+    /// How many commits merged into the target's own line, as its history lists them, each of
     /// the last [`ACTIVITY_DAYS`] days here, oldest first.
     pub daily: Vec<u32>,
-    /// Whose commits landed on it in those days, merges left out, the most landings first.
+    /// Whose commits merged into it in those days, merge commits left out, the most merges
+    /// first.
     pub people: Vec<Person>,
     /// The commits of its own line in those days, newest first.
-    pub landings: Vec<Landing>,
+    pub merges: Vec<Merge>,
     /// The tags on its own line in those days, newest first.
     pub releases: Vec<Release>,
     /// The day the first of `daily` counts, as [`day_of`] numbers days.
     pub first_day: i64,
 }
 
-/// A commit of the target's own line: one of its own, or a merge bringing others in.
+/// A commit merged into the target's own line: one of its own, or a merge bringing others
+/// in.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Landing {
+pub struct Merge {
     pub id: CommitId,
     /// What it's called: its pull request's title when it merged one, else its own.
     pub title: String,
-    /// The day it landed, as [`day_of`] numbers days.
+    /// The day it merged, as [`day_of`] numbers days.
     pub day: i64,
-    /// It landed a pull request: a merge, or a commit whose message names the one it merged.
+    /// It merged a pull request: a merge, or a commit whose message names the one it merged.
     pub pull: bool,
     /// How many commits it brought in, merges left out.
     pub commits: u32,
-    /// For a merge, seconds from the first commit it brought being written to it landing. A
-    /// squashed pull request's commit was written as it landed, so it has none.
+    /// For a merge, seconds from the first commit it brought being written to it merging. A
+    /// squashed pull request's commit was written as it merged, so it has none.
     pub took: Option<i64>,
     /// Who wrote the newest commit it brought in, by email as [`Person`]s are keyed: a pull
     /// request's author, most likely.
@@ -295,18 +297,18 @@ pub struct Release {
     pub day: i64,
 }
 
-/// Someone whose commits landed on the target lately, by [`super::byline`].
+/// Someone whose commits merged into the target lately, by [`super::byline`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Person {
     pub name: String,
     pub email: String,
-    /// How many times theirs landed each day, as [`Overview::daily`] counts them: a merge of
-    /// many of their commits counts once, as hundreds landing in one pull request isn't
+    /// How many times theirs merged each day, as [`Overview::daily`] counts them: a merge of
+    /// many of their commits counts once, as hundreds merging in one pull request isn't
     /// hundreds of changes to the target.
     pub daily: Vec<u32>,
-    /// The commits of the target's own line that landed theirs: one of theirs, or a merge
+    /// The commits of the target's own line that merged theirs: one of theirs, or a merge
     /// bringing theirs in.
-    pub landed: HashSet<CommitId>,
+    pub merged: HashSet<CommitId>,
 }
 
 /// The target summed up as of `now`, in seconds since the epoch, or nothing without one. A
@@ -326,29 +328,47 @@ pub fn overview(path: &Path, now: i64) -> Result<Option<Overview>> {
     let since = day_start(first_day);
     let mut daily = vec![0; ACTIVITY_DAYS];
     let mut people: Vec<Person> = Vec::new();
-    let mut landings = Vec::new();
+    let mut merges = Vec::new();
     // People go by the names and emails `.mailmap` gives them, as one with a work and a
     // personal email is one person.
     let mailmap = repo.open_mailmap();
-    // A walk of first parents only ignores a time cutoff, so it stops at the first commit
-    // from before the window itself rather than reading the whole history.
-    let line: Vec<_> = (repo.rev_walk([tip.id]).first_parent_only().all()?)
+    // A walk of first parents only ignores a time cutoff, so it stops itself rather than
+    // reading the whole history. One commit from before the window doesn't stop it, as a
+    // test's fixed clock can date one wrong with the window going on past it, but a run of
+    // `OLD_RUN` does. One with a commit from the window after it stays in the line, so a later
+    // merge doesn't take what it brought.
+    const OLD_RUN: usize = 64;
+    let mut line = Vec::new();
+    let mut old = 0;
+    for commit in (repo.rev_walk([tip.id]).first_parent_only().all()?)
         .filter_map(|info| info.ok()?.object().ok())
-        .take_while(|commit| commit.time().is_ok_and(|time| time.seconds >= since))
-        .collect();
+    {
+        match commit.time().is_ok_and(|time| time.seconds >= since) {
+            true => old = 0,
+            false if old + 1 == OLD_RUN => break,
+            false => old += 1,
+        }
+        line.push(commit);
+    }
+    line.truncate(line.len() - old);
     let mut brought = brought_in(&repo, tip.id, &line)?;
-    for landed in &line {
-        let day = landed.time().map_or(first_day, |time| day_of(time.seconds));
-        // A clock ahead of this one counts as today.
-        let day = ((day - first_day) as usize).min(ACTIVITY_DAYS - 1);
+    // One dated before the window, or with no date to read, counts on the day the commit
+    // after it merged, as it was on the line by then.
+    let mut later = ACTIVITY_DAYS - 1;
+    for merged in &line {
+        let day = (merged.time().ok())
+            .and_then(|time| usize::try_from(day_of(time.seconds) - first_day).ok())
+            // A clock ahead of this one counts as today.
+            .map_or(later, |day| day.min(ACTIVITY_DAYS - 1));
+        later = day;
         if let Some(count) = daily.get_mut(day) {
             *count += 1;
         }
-        // Theirs land on the day it did: the commit itself, or what a merge brought in.
-        let first = present_first_parent(landed);
-        let brought = match first.is_some() && landed.parent_ids().count() > 1 {
-            true => brought.remove(&landed.id).unwrap_or_default(),
-            false => vec![landed.clone()],
+        // Theirs merge on the day it did: the commit itself, or what a merge brought in.
+        let first = present_first_parent(merged);
+        let brought = match first.is_some() && merged.parent_ids().count() > 1 {
+            true => brought.remove(&merged.id).unwrap_or_default(),
+            false => vec![merged.clone()],
         };
         for commit in brought.iter().filter(|c| c.parent_ids().count() < 2) {
             let Ok(((name, email), _)) = super::commit_byline(&mailmap, commit) else {
@@ -359,12 +379,12 @@ pub fn overview(path: &Path, now: i64) -> Result<Option<Overview>> {
                 Some(at) => at,
                 None => {
                     let daily = vec![0; ACTIVITY_DAYS];
-                    let landed = HashSet::new();
+                    let merged = HashSet::new();
                     people.push(Person {
                         name,
                         email,
                         daily,
-                        landed,
+                        merged,
                     });
                     people.len() - 1
                 }
@@ -372,27 +392,27 @@ pub fn overview(path: &Path, now: i64) -> Result<Option<Overview>> {
             let Some(person) = people.get_mut(at) else {
                 continue;
             };
-            if person.landed.insert(CommitId(landed.id))
+            if person.merged.insert(CommitId(merged.id))
                 && let Some(count) = person.daily.get_mut(day)
             {
                 *count += 1;
             }
         }
-        landings.push(landing(
+        merges.push(merge_of(
             &repo,
             &mailmap,
-            landed,
+            merged,
             first,
             &brought,
             first_day + day as i64,
         ));
     }
-    let releases = releases(&repo, &landings);
+    let releases = releases(&repo, &merges);
     people.sort_by_key(|person| std::cmp::Reverse(person.daily.iter().sum::<u32>()));
     Ok(Some(Overview {
         daily,
         people,
-        landings,
+        merges,
         releases,
         first_day,
     }))
@@ -421,8 +441,8 @@ fn brought_in<'repo>(
         .collect();
     let mut taken: HashSet<gix::ObjectId> = line.iter().map(|c| c.id).collect();
     let mut brought = HashMap::new();
-    for landed in line.iter().rev() {
-        let mut next: Vec<gix::ObjectId> = (landed.parent_ids().skip(1))
+    for merged in line.iter().rev() {
+        let mut next: Vec<gix::ObjectId> = (merged.parent_ids().skip(1))
             .map(|id| id.detach())
             .collect();
         let mut theirs = Vec::new();
@@ -435,7 +455,7 @@ fn brought_in<'repo>(
             next.extend(parents.into_iter().rev());
             theirs.push(commit.clone());
         }
-        brought.insert(landed.id, theirs);
+        brought.insert(merged.id, theirs);
     }
     Ok(brought)
 }
@@ -507,26 +527,28 @@ fn differing(
         .collect()
 }
 
-/// `landed` summed up as it landed on `day`: from its `first` parent, `brought` in.
-fn landing(
+/// `merged` summed up as it merged on `day`: from its `first` parent, `brought` in.
+fn merge_of(
     repo: &gix::Repository,
     mailmap: &gix::mailmap::Snapshot,
-    landed: &gix::Commit<'_>,
+    merged: &gix::Commit<'_>,
     first: Option<gix::ObjectId>,
     brought: &[gix::Commit<'_>],
     day: i64,
-) -> Landing {
-    let message = (landed.message_raw().ok()).map_or(String::new(), |m| m.to_str_lossy().into());
-    let merge = landed.parent_ids().count() > 1;
+) -> Merge {
+    let message = (merged.message_raw().ok()).map_or(String::new(), |m| m.to_str_lossy().into());
+    let merge = merged.parent_ids().count() > 1;
     let review = but_forge::merged_review_from_message(&but_forge::ForgeName::GitHub, &message);
     let own = brought.iter().filter(|c| c.parent_ids().count() < 2);
     let written = (own.clone())
         .filter_map(|c| Some(c.author().ok()?.time().ok()?.seconds))
         .min();
-    let took = (landed.time().ok())
+    // None for a merge a wrong clock dated before what it brought.
+    let took = (merged.time().ok())
         .zip(written)
         .filter(|_| merge)
-        .map(|(t, w)| t.seconds - w);
+        .map(|(t, w)| t.seconds - w)
+        .filter(|took| *took >= 0);
     let by = (own.clone().next())
         .and_then(|c| super::commit_byline(mailmap, c).ok())
         .map(|((_, email), _)| email.to_lowercase());
@@ -534,16 +556,16 @@ fn landing(
     // for a commit whose parent this clone doesn't have, as a shallow one's oldest, which
     // didn't add everything it has.
     let tree = |id: gix::ObjectId| Some(repo.find_commit(id).ok()?.tree_id().ok()?.detach());
-    let areas = match first.is_none() && landed.parent_ids().next().is_some() {
+    let areas = match first.is_none() && merged.parent_ids().next().is_some() {
         true => Vec::new(),
         false => areas(
             repo,
             first.and_then(tree),
-            landed.tree_id().ok().map(|id| id.detach()),
+            merged.tree_id().ok().map(|id| id.detach()),
         ),
     };
-    Landing {
-        id: CommitId(landed.id),
+    Merge {
+        id: CommitId(merged.id),
         title: (review.as_ref())
             .map(|r| r.title)
             .filter(|t| !t.is_empty())
@@ -557,9 +579,9 @@ fn landing(
     }
 }
 
-/// The tags on the commits of `landings`, newest first.
-fn releases(repo: &gix::Repository, landings: &[Landing]) -> Vec<Release> {
-    let at: HashMap<CommitId, (usize, i64)> = (landings.iter().enumerate())
+/// The tags on the commits of `merges`, newest first.
+fn releases(repo: &gix::Repository, merges: &[Merge]) -> Vec<Release> {
+    let at: HashMap<CommitId, (usize, i64)> = (merges.iter().enumerate())
         .map(|(ix, l)| (l.id, (ix, l.day)))
         .collect();
     let Ok(references) = repo.references() else {
@@ -969,14 +991,16 @@ fn integrate_remote(
 /// What [`Update`] did.
 #[derive(Debug)]
 pub enum UpdateOutcome {
+    /// Nothing it picks is behind the target, so nothing changed.
+    UpToDate,
     /// It would have left these conflicted that aren't now, so nothing changed.
     WouldConflict(UpdateConflicts),
     Updated {
         /// Branches (full refs) left with conflicted commits they didn't have, each with
         /// how many.
         conflicted: Vec<(Option<super::FullName>, usize)>,
-        /// Branches (full refs) that landed on the target, which the update removed.
-        landed: Vec<super::FullName>,
+        /// Branches (full refs) that merged into the target, which the update removed.
+        merged: Vec<super::FullName>,
     },
 }
 
@@ -984,8 +1008,9 @@ pub enum UpdateOutcome {
 pub use but_api::workspace::UpdateScope;
 
 /// Rebase what `scope` picks onto the target as it is now. Doesn't fetch first; see
-/// [`Fetch`]. A dry run goes first, and when the rebase would leave anything conflicted that
-/// isn't now, it stops there, unless that's what was `accepted`: a fetch since can bring more.
+/// [`Fetch`]. Nothing behind, it does nothing, as `but pull` doesn't. A dry run goes first,
+/// and when the rebase would leave anything conflicted that isn't now, it stops there, unless
+/// that's what was `accepted`: a fetch since can bring more.
 pub struct Update {
     pub scope: UpdateScope,
     pub accepted: Option<UpdateConflicts>,
@@ -997,6 +1022,26 @@ impl Intent for Update {
     fn apply(self, run: &mut Run) -> Result<UpdateOutcome> {
         run.locked(|ctx, perm| {
             let info = but_api::legacy::workspace::head_info(ctx)?;
+            let behind = {
+                let repo = ctx.repo.get()?;
+                let meta = ctx.project_meta()?;
+                match super::target_source(&repo, &meta)
+                    .and_then(|source| super::ref_tip(&repo, source.as_ref()))
+                {
+                    Some(tip) => but_api::workspace::is_behind_target(
+                        &repo,
+                        &info,
+                        self.scope,
+                        tip,
+                        meta.resolve_target_commit(&repo)?,
+                    )?,
+                    // Without a target to read, the update says what's wrong.
+                    None => true,
+                }
+            };
+            if !behind {
+                return Ok(UpdateOutcome::UpToDate);
+            }
             let preview = but_api::workspace::workspace_integrate_upstream_scoped_with_perm(
                 ctx,
                 &info,
@@ -1032,7 +1077,7 @@ impl Intent for Update {
             let remaining = names(&after);
             Ok(UpdateOutcome::Updated {
                 conflicted: newly_conflicted(&info, &updated.workspace_state.conflicted_commits),
-                landed: (names(&info).into_iter())
+                merged: (names(&info).into_iter())
                     .filter(|name| !remaining.contains(name))
                     .collect(),
             })
@@ -1103,16 +1148,16 @@ impl Intent for Fetch {
 /// Put `branch`, or with `whole_stack` it and every branch below it, straight onto the target
 /// and push the target, or with no upstream, just move it. Done is what that left for the
 /// other branches.
-pub struct Land {
+pub struct MergeIntoTarget {
     pub branch: super::FullName,
     pub tip: CommitId,
     pub whole_stack: bool,
 }
 
-impl Intent for Land {
-    type Done = Landed;
+impl Intent for MergeIntoTarget {
+    type Done = MergedIntoTarget;
 
-    fn apply(self, run: &mut Run) -> Result<Landed> {
+    fn apply(self, run: &mut Run) -> Result<MergedIntoTarget> {
         // `branch_land` takes GitButler's lock itself, around its fetch and push, so it's
         // watched rather than locked.
         run.watched(|ctx| {
@@ -1120,7 +1165,7 @@ impl Intent for Land {
             // A merge commit when the branch has diverged, as `but land` makes one without its
             // flags. Only at `tip`, the one the user was asked about: a push can't be undone,
             // so not of commits an agent added since.
-            let landed = but_api::land::branch_land(
+            let merged = but_api::land::branch_land(
                 ctx,
                 self.branch.shorten().to_string(),
                 false,
@@ -1128,17 +1173,17 @@ impl Intent for Land {
                 self.whole_stack,
                 Some(self.tip.0),
             )?;
-            Ok(Landed {
-                update_needed: landed.reconcile_skipped,
-                conflicted: newly_conflicted(&info, &landed.workspace.conflicted_commits),
-                marked: landed.workspace.checkout_conflict_occurred,
+            Ok(MergedIntoTarget {
+                update_needed: merged.reconcile_skipped,
+                conflicted: newly_conflicted(&info, &merged.workspace.conflicted_commits),
+                marked: merged.workspace.checkout_conflict_occurred,
             })
         })
     }
 }
 
-/// What [`Land`] left for the other branches.
-pub struct Landed {
+/// What [`MergeIntoTarget`] left for the other branches.
+pub struct MergedIntoTarget {
     /// They still need an update to sit on the moved target.
     pub update_needed: bool,
     /// Branches (full refs) the update after it left with conflicted commits they didn't
@@ -1325,6 +1370,29 @@ mod tests {
     }
 
     #[test]
+    fn an_update_with_nothing_behind_records_nothing() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let dir = crate::backend::ops::tests::repo_with("one\n");
+            let path = dir.path();
+            crate::backend::ops::tests::target_origin_main(path);
+            crate::backend::apply(path, crate::backend::ops::tests::branch_named("feature"))
+                .unwrap();
+            assert!(!needs_update(path), "nothing new on the target");
+
+            let update = Update {
+                scope: UpdateScope::All,
+                accepted: None,
+            };
+            let (outcome, ran) = crate::backend::apply(path, update).unwrap();
+            assert!(matches!(outcome, UpdateOutcome::UpToDate), "{outcome:?}");
+            assert!(
+                ran.recorded.is_none(),
+                "no undo step for an update that did nothing"
+            );
+        })
+    }
+
+    #[test]
     fn a_local_target_behind_its_upstream_needs_an_update() {
         but_testsupport::isolated_app_data_dir(|| {
             let dir = crate::backend::ops::tests::repo_with("one\n");
@@ -1460,6 +1528,57 @@ refs/heads/wt
     }
 
     #[test]
+    fn a_commit_dated_before_the_window_does_not_end_it() {
+        but_testsupport::isolated_app_data_dir(|| {
+            use std::process::Command;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path();
+            let git = |args: &[&str], at: i64| {
+                let date = format!("@{at} +0000");
+                let out = Command::new("git")
+                    .current_dir(path)
+                    .args(["-c", "commit.gpgsign=false", "-c", "user.name=Ann"])
+                    .args(["-c", "user.email=ann@example.com"])
+                    .args(args)
+                    .env("GIT_AUTHOR_DATE", &date)
+                    .env("GIT_COMMITTER_DATE", &date)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}: {out:?}");
+            };
+            let now = 2_000_000_000;
+            let commit = |at: i64| git(&["commit", "-q", "--allow-empty", "-m", "c"], at);
+            git(&["init", "-q", "-b", "main"], now);
+            commit(now - 40 * DAY);
+            commit(now - 20 * DAY);
+            git(&["checkout", "-q", "-b", "side"], now - 10 * DAY);
+            commit(now - 10 * DAY);
+            git(&["checkout", "-q", "main"], now - 10 * DAY);
+            // Merged by a test's fixed clock, after the one 20 days ago.
+            git(&["merge", "-q", "--no-ff", "-m", "merge side", "side"], 100);
+            commit(now - 5 * DAY);
+
+            crate::backend::settings::set_target(path, &full("refs/heads/main")).unwrap();
+            let summed = overview(path, now).unwrap().expect("a target");
+            let counted: Vec<(usize, u32)> = (summed.daily.iter().copied().enumerate())
+                .filter(|(_, n)| *n > 0)
+                .collect();
+            assert_eq!(
+                counted,
+                [(ACTIVITY_DAYS - 21, 1), (ACTIVITY_DAYS - 6, 2)],
+                "the walk goes on past the merge dated 1970, which counts on the day the one \
+                 after it merged, and stops before the commit from before the window"
+            );
+            let merge = &summed.merges[1];
+            assert_eq!(
+                (merge.title.as_str(), merge.commits, merge.took),
+                ("merge side", 1, None),
+                "the merge dated 1970 keeps what it brought, and took no time it can say"
+            );
+        })
+    }
+
+    #[test]
     fn sums_up_the_target_by_day_and_author() {
         but_testsupport::isolated_app_data_dir(|| {
             use std::process::Command;
@@ -1554,26 +1673,26 @@ refs/heads/wt
                     ("Cat", "cat@example.com", 1),
                     ("Bob", "bob@example.com", 1),
                 ],
-                "most landings first, the merged branches' authors too and the merges left out; \
-                 Dan's two commits landed in one merge, once"
+                "most merges first, the merged branches' authors too and the merge commits left \
+                 out; Dan's two commits merged in one merge commit, once"
             );
             let repo = gix::open(path).unwrap();
-            let landed_by = |name: &str| {
+            let merged_by = |name: &str| {
                 let person = summed.people.iter().find(|p| p.name == name).unwrap();
-                person.landed.clone()
+                person.merged.clone()
             };
             let main = |back: usize| {
                 let at = repo.rev_parse_single(format!("main~{back}").as_str());
                 [super::CommitId(at.unwrap().detach())].into()
             };
             assert_eq!(
-                landed_by("Cat"),
+                merged_by("Cat"),
                 main(2),
-                "the first merge landed Cat's commit, which the target's own line lists in its \
-                 place, and the later merge, whose branch holds it too, didn't land it again"
+                "the first merge merged Cat's commit, which the target's own line lists in its \
+                 place, and the later merge, whose branch holds it too, didn't merge it again"
             );
-            assert_eq!(landed_by("Dan"), main(1), "the later merge landed Dan's");
-            let landings: Vec<(&str, u32, Vec<&str>)> = (summed.landings.iter())
+            assert_eq!(merged_by("Dan"), main(1), "the later merge merged Dan's");
+            let merges: Vec<(&str, u32, Vec<&str>)> = (summed.merges.iter())
                 .map(|l| {
                     (
                         l.title.as_str(),
@@ -1583,7 +1702,7 @@ refs/heads/wt
                 })
                 .collect();
             assert_eq!(
-                landings,
+                merges,
                 [
                     ("by Ann", 1, vec![]),
                     ("merge later", 2, vec!["crates/but", "docs"]),

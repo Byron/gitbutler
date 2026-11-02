@@ -21,8 +21,6 @@ import waving from "./illustrations/waving.svg?raw";
  * - enclosed areas are `--bg-1`, the app's paper, so a shape occludes whatever
  *   it overlaps instead of staying white in the dark.
  * - shaded faces are `--bg-2`, the ground these illustrations sit on.
- * - a darker face, where a drawing needs one more step between the ground
- *   and its outline, is `--border-2` — the token ⚛️ Core binds it to.
  *
  * An illustration works on either ground. On `--bg-2` (the sidebar's panels,
  * the details pane's empty state) a `--bg-2` face paints in the ground's own
@@ -33,8 +31,10 @@ import waving from "./illustrations/waving.svg?raw";
  * for text. `terminal` has no shaded face at all: its screen is solid
  * `currentColor` with the prompt cut out of it in `--bg-1`.
  *
- * Each asset keeps the width and height Figma gave it and renders at that size,
- * never scaled.
+ * ⚛️ Core's Illustrations section is the source of truth: each colour here is
+ * the token Figma binds there, and a change is made in Figma first. Each asset
+ * keeps the width and height Figma gave it and renders at that size, never
+ * scaled.
  *
  * Separate from `Illustration.tsx` for the same reason `icons.ts` is separate
  * from `Icon.tsx`: a module that exports anything but components loses fast

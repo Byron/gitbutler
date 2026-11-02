@@ -459,10 +459,6 @@ pub enum Subcommands {
     #[cfg_attr(feature = "raw-clap-docs", clap(verbatim_doc_comment))]
     Apply(apply::Platform),
 
-    #[cfg(feature = "legacy")]
-    #[cfg_attr(feature = "raw-clap-docs", clap(verbatim_doc_comment))]
-    Open(open::Platform),
-
     /// Push changes in a branch to remote.
     ///
     /// `but push` will update the remote with the latest commits from the
@@ -871,7 +867,7 @@ pub enum Subcommands {
     #[cfg_attr(feature = "raw-clap-docs", clap(verbatim_doc_comment))]
     Skill(skill::Platform),
 
-    /// Set up GitButler for AI coding agents.
+    /// Set up or remove GitButler for AI coding agents.
     ///
     /// Runs a guided setup wizard for installing GitButler agent skills and
     /// writing workflow steering instructions into supported agent instruction
@@ -1039,8 +1035,6 @@ pub mod discard;
 pub mod mcp;
 #[cfg(feature = "legacy")]
 pub mod r#move;
-#[cfg(feature = "legacy")]
-pub mod open;
 #[cfg(feature = "legacy")]
 pub mod pick;
 #[cfg(feature = "legacy")]

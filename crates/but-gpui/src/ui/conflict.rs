@@ -434,6 +434,7 @@ fn side_line(
             &look,
             None,
             None,
+            last,
             theme,
         ))
         .child(text_cell(
@@ -539,7 +540,8 @@ fn editor(input: Entity<TextInput>, row: &Row, theme: &Theme) -> AnyElement {
             field(&input, row.focused, theme)
                 .p(dp(6.))
                 .rounded(dp(6.))
-                .font_family(theme.mono_font.clone())
+                .font_family(theme.diff_font.clone())
+                .font_features(theme.diff_features.clone())
                 .text_size(dp(theme.code_text))
                 .line_height(dp(theme.code_line)),
         )
@@ -617,6 +619,7 @@ mod tests {
                 hunks: vec![Hunk {
                     key: HunkKey(header),
                     header: String::new(),
+                    patch: "".into(),
                     lines: vec![line(30)],
                     scope: Vec::new(),
                     lead: Vec::new(),

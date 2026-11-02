@@ -363,50 +363,6 @@ export type BranchListing = {
   hasLocal: boolean;
 };
 
-/** Represents a fat struct with all the data associated with a branch */
-export type BranchListingDetails = {
-  /** The name of the branch (e.g. `main`, `feature/branch`), excluding the remote name */
-  name: string;
-  /**
-   * The number of lines added within the branch
-   * Since the virtual branch, local branch and the remote one can have different number of lines removed,
-   * the value from the virtual branch (if present) takes the highest precedence,
-   * followed by the local branch and then the remote branches (taking the max if there are multiple).
-   * If this branch has a virtual branch, lines_added does NOT include the uncommitted lines.
-   */
-  linesAdded: number;
-  /**
-   * The number of lines removed within the branch
-   * Since the virtual branch, local branch and the remote one can have different number of lines removed,
-   * the value from the virtual branch (if present) takes the highest precedence,
-   * followed by the local branch and then the remote branches (taking the max if there are multiple)
-   * If this branch has a virtual branch, lines_removed does NOT include the uncommitted lines.
-   */
-  linesRemoved: number;
-  /**
-   * The number of files that were modified within the branch
-   * Since the virtual branch, local branch and the remote one can have different number files modified,
-   * the value from the virtual branch (if present) takes the highest precedence,
-   * followed by the local branch and then the remote branches (taking the max if there are multiple)
-   */
-  numberOfFiles: number;
-  /**
-   * The number of commits associated with a branch
-   * Since the virtual branch, local branch and the remote one can have different number of commits,
-   * the value from the virtual branch (if present) takes the highest precedence,
-   * followed by the local branch and then the remote branches (taking the max if there are multiple)
-   */
-  numberOfCommits: number;
-  /**
-   * A list of authors that have contributes commits to this branch.
-   * In the case of multiple remote tracking branches, or branches whose commits are evaluated,
-   * it takes the full list of unique authors, without applying a mailmap.
-   */
-  authors: Array<BranchAuthor>;
-  /** The branch may or may not have a virtual branch associated with it. */
-  stack: StackReference | null;
-};
-
 /** A filter that can be applied to the branch listing */
 export type BranchListingFilter = {
   /**
@@ -1426,10 +1382,6 @@ export type HeadAndMode = {
   operatingMode: OperatingMode;
 };
 
-export type HeadSha = {
-  headSha: string;
-};
-
 /**
  * A type that deserializes a hexadecimal hash into a string, unchanged.
  * This is to workaround `schemars` which doesn't (always) work with transformations.
@@ -2405,42 +2357,6 @@ export type Stack = {
   segments: Array<Segment>;
 };
 
-/**
- * **Temporary type to help transitioning to the optional version of stack-entry** and ultimately, to [`crate::RefInfo`].
- * WARNING: for use by parts in the code that can rely on having a non-optional `stack_id`. The goal is to have none of these.
- */
-export type StackEntryNoOpt = {
-  /** The ID of the stack. */
-  id: string;
-  /**
-   * The list of the branch information that are part of the stack.
-   * The list is never empty.
-   * The first entry in the list is always the most recent branch on top the stack.
-   */
-  heads: Array<StackHeadInfo>;
-  /** The tip of the top-most branch, i.e., the most recent commit that would become the parent of new commits of the topmost stack branch. */
-  tip: string;
-  /** The zero-based index for sorting stacks. */
-  order: number | null;
-  /** If `true`, then any head in this stack is checked directly so `HEAD` points to it, and this is only ever `true` for a single stack. */
-  isCheckedOut: boolean;
-};
-
-/** The information about the branch inside a stack */
-export type StackHeadInfo = {
-  /** The name of the branch. */
-  name: string;
-  /** The tip of the branch. */
-  tip: string;
-  /** The associated forge review with this branch, e.g. GitHub PRs or GitLab MRs */
-  reviewId: number | null;
-  /**
-   * If `true`, then this head is checked directly so `HEAD` points to it, and this is only ever `true` for a single head.
-   * This is `false` if the worktree is checked out.
-   */
-  isCheckedOut: boolean;
-};
-
 /** Represents a reference to an associated virtual branch */
 export type StackReference = {
   /** A non-normalized name of the branch, set by the user */
@@ -2738,26 +2654,6 @@ export type UnifiedPatch = {
   };
 };
 
-/** Parameters for updating the user profile. */
-export type UpdateUserParams = {
-  name: string | null;
-  website: string | null;
-  twitter: string | null;
-  bluesky: string | null;
-  timezone: string | null;
-  location: string | null;
-  email_share: boolean | null;
-  /** Base64-encoded avatar image bytes. */
-  avatar_base64: string | null;
-  /** Original filename of the avatar (e.g. "photo.png"). */
-  avatar_filename: string | null;
-  /**
-   * Remove the uploaded avatar, so the picture falls back to the sign-in one or
-   * Gravatar. Ignored when a new avatar is sent in the same update.
-   */
-  remove_avatar: boolean | null;
-};
-
 /**
  * Commit that is only at the remote.
  * Unlike the `Commit` struct, there is no knowledge of GitButler concepts like conflicted state etc.
@@ -2777,13 +2673,7 @@ export type UpstreamCommit = {
   changeId: string | null;
 };
 
-/**
- * The signed-in account, without any credential.
- *
- * `json::UserWithSecretsSensitive` carries the GitButler and GitHub access tokens
- * because desktop calls the GitButler API from its frontend. A client that does not
- * should not be handed long-lived credentials to display a name and a picture.
- */
+/** The signed-in account, without any credential. */
 export type UserProfile = {
   id: number;
   name: string | null;

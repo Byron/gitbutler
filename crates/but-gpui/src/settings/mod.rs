@@ -19,10 +19,11 @@ mod metrics;
 mod project;
 
 use crate::app::{AppHandle, AppView, SelectNext, SelectPrevious};
+use crate::backend::InactiveAfter;
 use crate::backend::settings::{self as backend, Program, ProjectSettings};
 use crate::overlays::MenuItem;
-use crate::state::{Prefs, ProjectEntry, ProjectId, ScopeLines, Store};
-use crate::theme::{Appearance, CodeSize, Theme, UiScale};
+use crate::state::{Prefs, ProjectEntry, ProjectId, ScopeLines, Store, TerminalRuns};
+use crate::theme::{Appearance, CodeSize, ColorScheme, Theme, UiScale};
 use crate::ui::fold::{self, Folds};
 use crate::ui::modal::{MODAL_RADIUS, ModalSize, modal};
 use crate::ui::scrollbar::{Scroll, scrolled};
@@ -34,7 +35,7 @@ use crate::ui::{
 
 pub use cli::welcome_card;
 
-actions!(settings, [OpenSettings, OpenKeyboardShortcuts]);
+actions!(settings, [OpenSettings, OpenKeyboardShortcuts, FocusSearch]);
 
 /// " ⌥Z in a diff turns it on and off.", with the keys bound to `action`, or nothing when no key
 /// is, as the user's keymap can leave it.
@@ -247,6 +248,8 @@ pub struct SettingsView {
     name: Entity<TextInput>,
     editors: Vec<Program>,
     terminals: Vec<Program>,
+    /// The command terminals opened here run, as typed until saved.
+    terminal_command: Entity<TextInput>,
     fetch_interval: Option<u64>,
     /// The desktop app opens this client at start: GitButler's `featureFlags.gpui`. `None`
     /// while first read, as the metrics are, and their switches aren't drawn until then: one
@@ -299,6 +302,12 @@ impl SettingsView {
     ) -> Self {
         let search = cx.new(|cx| TextInput::new("Search settings", false, cx));
         let name = cx.new(|cx| TextInput::new("Project name", false, cx));
+        let command = store.read(cx).prefs.terminal_command.clone();
+        let terminal_command = cx.new(|cx| {
+            let mut input = TextInput::new("Command", false, cx);
+            input.load(command, cx);
+            input
+        });
         let ai = ai::Ai::new(window, cx);
         let subscriptions = vec![
             cx.subscribe_in(&search, window, |this, search, event, _, cx| match event {
@@ -323,6 +332,26 @@ impl SettingsView {
                     this.back_to_search(window, cx);
                 }
             }),
+            cx.subscribe_in(
+                &terminal_command,
+                window,
+                |this, _, event, window, cx| match event {
+                    InputEvent::Submit => {
+                        this.save_terminal_command(cx);
+                        this.back_to_search(window, cx);
+                    }
+                    InputEvent::Changed => {}
+                    InputEvent::Cancel => {
+                        this.reset_terminal_command(cx);
+                        this.back_to_search(window, cx);
+                    }
+                },
+            ),
+            // The command saves as the field's left, and as Settings closes with it focused.
+            cx.on_blur(&terminal_command.focus_handle(cx), window, |this, _, cx| {
+                this.save_terminal_command(cx)
+            }),
+            cx.on_release(|this, cx| this.save_terminal_command(cx)),
         ];
         let unwatched = (page
             .project()
@@ -338,6 +367,7 @@ impl SettingsView {
             name,
             editors: Vec::new(),
             terminals: Vec::new(),
+            terminal_command,
             fetch_interval: None,
             open_at_start: None,
             usage_metrics: None,
@@ -511,6 +541,54 @@ impl SettingsView {
         ]
     }
 
+    /// What terminals opened here start, with the command they run under it while it's picked.
+    fn terminal_run_row(&self, window: &Window, cx: &Context<Self>) -> Row {
+        let prefs = &self.store.read(cx).prefs;
+        let store = self.store.clone();
+        let runs = segmented(
+            "terminal-runs",
+            [
+                (TerminalRuns::LoginShell, "Login shell"),
+                (TerminalRuns::Command, "Custom command"),
+            ],
+            prefs.terminal_runs,
+            move |runs, _, cx| {
+                store.update(cx, |store, cx| {
+                    store.set_prefs(|p| p.terminal_runs = runs, cx)
+                });
+            },
+            Theme::get(cx),
+        );
+        let row = Row::new(
+            "New terminals run",
+            "What terminals opened here start. A command runs through your shell, and its \
+             terminal closes when it exits.",
+            runs,
+        )
+        .with_keywords("shell command");
+        if prefs.terminal_runs != TerminalRuns::Command {
+            return row;
+        }
+        let focused = self.terminal_command.focus_handle(cx).is_focused(window);
+        row.with_below(field(&self.terminal_command, focused, Theme::get(cx)))
+    }
+
+    /// Save the command as typed, unless it's what's saved already.
+    fn save_terminal_command(&self, cx: &mut App) {
+        let command = self.terminal_command.read(cx).text().trim().to_owned();
+        if command == self.store.read(cx).prefs.terminal_command {
+            return;
+        }
+        (self.store).update(cx, |store, cx| {
+            store.set_prefs(|p| p.terminal_command = command, cx)
+        });
+    }
+
+    fn reset_terminal_command(&mut self, cx: &mut Context<Self>) {
+        let command = self.store.read(cx).prefs.terminal_command.clone();
+        (self.terminal_command).update(cx, |input, cx| input.set_text(command, cx));
+    }
+
     /// The theme, then how diffs show.
     fn appearance_cards(&self, cx: &Context<Self>) -> Vec<Card> {
         let theme = Theme::get(cx);
@@ -550,9 +628,27 @@ impl SettingsView {
         );
         let appearance = Row::new(
             "Appearance",
-            "Light, dark, or whichever macOS is set to.",
+            match &prefs.color_scheme {
+                ColorScheme::Named(_) => "Your colour scheme is light or dark itself.",
+                ColorScheme::GitButler | ColorScheme::Ghostty => {
+                    "Light, dark, or whichever macOS is set to."
+                }
+            },
             appearance,
         );
+        let app = self.app.clone();
+        let scheme = dropdown("color-scheme", prefs.color_scheme.label().to_owned(), theme)
+            .on_click(move |_, window, cx| {
+                app.update_later(window, cx, |app, window, cx| {
+                    app.pick_color_scheme(window, cx)
+                })
+            });
+        let scheme = Row::new(
+            "Colour scheme",
+            "GitButler's colours, or a Ghostty theme for the app and its terminals alike.",
+            scheme,
+        )
+        .with_keywords("color theme ghostty");
         let percent = |scale: UiScale| format!("{}%", scale.percent());
         let size = self.choice(
             "ui-scale",
@@ -570,14 +666,24 @@ impl SettingsView {
             ),
             size,
         );
+        let app = self.app.clone();
+        let diff_font = (prefs.diff_font.clone()).unwrap_or_else(|| theme.mono_font.to_string());
+        let diff_font = dropdown("diff-font", diff_font, theme).on_click(move |_, window, cx| {
+            app.update_later(window, cx, |app, window, cx| app.pick_diff_font(window, cx))
+        });
+        let app = self.app.clone();
         let mut diff = vec![
             Row::new("Code size", "How large code shows in diffs.", code),
+            Row::new("Font", "The font of code in diffs.", diff_font),
             Row::new(
                 "Font ligatures",
                 "Code joins pairs of characters like != and == into one symbol.",
                 self.pref_switch("ligatures", prefs.ligatures, |p| p.ligatures ^= true, cx)
-                    // The diff is a cached view, which only a refresh draws again.
-                    .on_click(|_, _, cx| cx.refresh_windows()),
+                    .on_click(move |_, window, cx| {
+                        app.update_later(window, cx, |app, window, cx| {
+                            app.apply_appearance(window, cx)
+                        })
+                    }),
             ),
             Row::new(
                 "Wrap long lines",
@@ -598,6 +704,17 @@ impl SettingsView {
                 switch("split", prefs.split, theme).on_click(cx.listener(|this, _, _, cx| {
                     this.detail.update(cx, |detail, cx| detail.toggle_split(cx));
                 })),
+            ),
+            Row::new(
+                "All-in-one diff",
+                "The diff runs through every changed file, one after another. Off, it shows only \
+                 the file selected in the file list, and Space at its end goes on to the next.",
+                self.pref_switch(
+                    "all-in-one",
+                    !prefs.one_file_diff,
+                    |p| p.one_file_diff ^= true,
+                    cx,
+                ),
             ),
             Row::new(
                 "Semantic context",
@@ -673,11 +790,72 @@ impl SettingsView {
                     cx,
                 ),
             ),
+            Row::new(
+                "Worktrees go inactive after",
+                "A linked worktree with nothing uncommitted moves under Inactive worktrees once \
+                 it's gone this long without a commit or checkout.",
+                self.choice(
+                    "inactive-after",
+                    prefs.inactive_after.label(),
+                    InactiveAfter::ALL.map(|after| (after, after.label().to_owned())),
+                    |this, after, _, cx| {
+                        this.store
+                            .update(cx, |store, cx| store.set_inactive_after(after, cx))
+                    },
+                    cx,
+                ),
+            )
+            .with_keywords("stale"),
         ];
+        let folder_counts = Row::new(
+            "Show folders' line counts",
+            "Folders in a file tree always show the lines their files add and remove. Off, they \
+             show them only under the pointer.",
+            self.pref_switch(
+                "folder-line-counts",
+                prefs.folder_line_counts,
+                |p| p.folder_line_counts ^= true,
+                cx,
+            ),
+        );
+        let text_label = |size: Option<u8>| match size {
+            Some(size) => format!("{size} pt"),
+            None => "As Ghostty's".to_owned(),
+        };
+        let sizes = std::iter::once(None).chain((9..=28).map(Some));
+        let terminal_text = self.choice(
+            "terminal-text",
+            text_label(prefs.terminal_text),
+            sizes.map(|size| (size, text_label(size))),
+            |this, size, _, cx| {
+                (this.store).update(cx, |store, cx| store.set_terminal_text(size, cx))
+            },
+            cx,
+        );
+        let terminal_text = Row::new(
+            "Text size",
+            "How large text shows in terminals opened here. Their colours follow the colour scheme.",
+            terminal_text,
+        );
+        let app = self.app.clone();
+        let terminal_font = (prefs.terminal_font.clone()).unwrap_or_else(|| "As Ghostty's".into());
+        let terminal_font =
+            dropdown("terminal-font", terminal_font, theme).on_click(move |_, window, cx| {
+                app.update_later(window, cx, |app, window, cx| {
+                    app.pick_terminal_font(window, cx)
+                })
+            });
+        let terminal_font = Row::new(
+            "Font",
+            "The font of terminals opened here. As Ghostty's follows your Ghostty config.",
+            terminal_font,
+        );
         vec![
-            Card::new(None, vec![appearance, size]),
+            Card::new(None, vec![scheme, appearance, size]),
             Card::new(Some("Navigator"), navigator),
+            Card::new(Some("File list"), vec![folder_counts]),
             Card::new(Some("Diff"), diff),
+            Card::new(Some("Terminal"), vec![terminal_font, terminal_text]),
         ]
     }
 
@@ -785,6 +963,7 @@ impl SettingsView {
                     vec![self.gitbutler_row(window, cx), self.mesh_row(cx)],
                 ),
                 Card::new(None, self.program_rows(cx)),
+                Card::new(None, vec![self.terminal_run_row(window, cx)]),
                 // Only once it's been looked for, which only macOS does.
                 Card::new(None, self.cli_row(cx).into_iter().collect()),
                 // Last, out of the way, as the desktop app keeps it on a page of its own.
@@ -1246,6 +1425,12 @@ impl Render for SettingsView {
             );
         modal(ModalSize::Large, &theme)
             .id("settings")
+            .key_context("Settings")
+            // From a page link or a control, as / goes to the navigator's filter.
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                (this.search).update(cx, |search, cx| search.select_all_text(cx));
+                this.back_to_search(window, cx);
+            }))
             .h(dp(height))
             .flex_row()
             .child(

@@ -11,7 +11,7 @@ use but_core::{GitConfigSettings, GitHubStackingMode};
 use but_core::{
     RepositoryExt,
     git_config::{remove_config_value, set_config_value},
-    ref_metadata::{UnresolvedLegacyTargetReason, UnresolvedLegacyTargetRefError},
+    ref_metadata::{LocalRefName, UnresolvedLegacyTargetReason, UnresolvedLegacyTargetRefError},
 };
 use but_ctx::Context;
 use but_llm::{
@@ -1118,23 +1118,17 @@ async fn display_authenticated_github_accounts(
     let mut some_accounts_invalid = false;
 
     for account in known_gh_accounts {
-        let account_status = but_api::github::check_github_credentials(account.clone())
-            .await
-            .ok();
-
-        let message = match account_status {
-            Some(but_github::CredentialCheckResult::Valid) => {
-                t.success.paint("(valid credentials)")
-            }
-            Some(but_github::CredentialCheckResult::Invalid) => {
+        let message = match but_api::github::check_github_credentials(account.clone()).await {
+            Ok(but_github::CredentialCheckResult::Valid) => t.success.paint("(valid credentials)"),
+            Ok(but_github::CredentialCheckResult::Invalid) => {
                 some_accounts_invalid = true;
                 t.attention.paint("(invalid credentials)")
             }
-            Some(but_github::CredentialCheckResult::NoCredentials) => {
+            Ok(but_github::CredentialCheckResult::NoCredentials) => {
                 some_accounts_invalid = true;
                 t.attention.paint("(no credentials)")
             }
-            None => t.error.paint("(unknown status)"),
+            Err(err) => t.error.paint(format!("(unknown status: {err:#})")),
         };
 
         writeln!(out, "  • {account} {message}")?;
@@ -1162,23 +1156,17 @@ async fn display_authenticated_gitlab_accounts(
     let mut some_accounts_invalid = false;
 
     for account in known_gl_accounts {
-        let account_status = but_api::gitlab::check_gitlab_credentials(account.clone())
-            .await
-            .ok();
-
-        let message = match account_status {
-            Some(but_gitlab::CredentialCheckResult::Valid) => {
-                t.success.paint("(valid credentials)")
-            }
-            Some(but_gitlab::CredentialCheckResult::Invalid) => {
+        let message = match but_api::gitlab::check_gitlab_credentials(account.clone()).await {
+            Ok(but_gitlab::CredentialCheckResult::Valid) => t.success.paint("(valid credentials)"),
+            Ok(but_gitlab::CredentialCheckResult::Invalid) => {
                 some_accounts_invalid = true;
                 t.attention.paint("(invalid credentials)")
             }
-            Some(but_gitlab::CredentialCheckResult::NoCredentials) => {
+            Ok(but_gitlab::CredentialCheckResult::NoCredentials) => {
                 some_accounts_invalid = true;
                 t.attention.paint("(no credentials)")
             }
-            None => t.error.paint("(unknown status)"),
+            Err(err) => t.error.paint(format!("(unknown status: {err:#})")),
         };
 
         writeln!(out, "  • {account} {message}")?;
@@ -1206,23 +1194,19 @@ async fn display_authenticated_bitbucket_accounts(
     let mut some_accounts_invalid = false;
 
     for account in known_bb_accounts {
-        let account_status = but_api::bitbucket::check_bitbucket_credentials(account.clone())
-            .await
-            .ok();
-
-        let message = match account_status {
-            Some(but_bitbucket::CredentialCheckResult::Valid) => {
+        let message = match but_api::bitbucket::check_bitbucket_credentials(account.clone()).await {
+            Ok(but_bitbucket::CredentialCheckResult::Valid) => {
                 t.success.paint("(valid credentials)")
             }
-            Some(but_bitbucket::CredentialCheckResult::Invalid) => {
+            Ok(but_bitbucket::CredentialCheckResult::Invalid) => {
                 some_accounts_invalid = true;
                 t.attention.paint("(invalid credentials)")
             }
-            Some(but_bitbucket::CredentialCheckResult::NoCredentials) => {
+            Ok(but_bitbucket::CredentialCheckResult::NoCredentials) => {
                 some_accounts_invalid = true;
                 t.attention.paint("(no credentials)")
             }
-            None => t.error.paint("(unknown status)"),
+            Err(err) => t.error.paint(format!("(unknown status: {err:#})")),
         };
 
         writeln!(out, "  • {account} {message}")?;
@@ -1891,7 +1875,8 @@ async fn target_config(
                     .with_context(|| format!("Failed to find push remote '{push_remote}'"))?;
             }
 
-            let target_ref = {
+            let mut guard = ctx.exclusive_worktree_access();
+            let (target_ref, created) = {
                 let repo = ctx.repo.get()?;
                 let ref_name: gix::refs::FullName = if new_branch.starts_with("refs/") {
                     new_branch
@@ -1915,24 +1900,41 @@ async fn target_config(
                         .with_context(|| format!("Target branch '{new_branch}' not found"))?;
                 }
                 match but_core::ref_metadata::resolve_local_target(ref_name.as_ref(), &repo) {
-                    Ok(target_ref) => target_ref,
+                    Ok(target_ref) => (target_ref, false),
                     // The remote name is shorthand for the local branch tracking it, not a stored
                     // legacy target, so the error describes the input rather than a migration.
-                    Err(err)
-                        if err
-                            .downcast_ref::<UnresolvedLegacyTargetRefError>()
-                            .is_some_and(|unresolved| {
-                                unresolved.reason == UnresolvedLegacyTargetReason::NoTrackingBranch
-                            }) =>
-                    {
-                        let target_ref = ref_name.shorten();
-                        return Err(bad_input(format!("No local branch tracks {target_ref}"))
-                            .hint(track_remote_target_hint(target_ref))
-                            .into());
+                    Err(err) => {
+                        if let Some(unresolved) =
+                            err.downcast_ref::<UnresolvedLegacyTargetRefError>()
+                            && unresolved.reason == UnresolvedLegacyTargetReason::NoTrackingBranch
+                        {
+                            // The branch is left out of the undo timeline, as setting the target is:
+                            // a snapshot needs a target to read, and there is often none yet.
+                            match create_branch_to_track(&repo, ref_name.as_ref())? {
+                                Some(target_ref) => (target_ref, true),
+                                None => {
+                                    let target_ref = ref_name.shorten();
+                                    return Err(bad_input(format!(
+                                        "No local branch tracks {target_ref}"
+                                    ))
+                                    .hint(track_remote_target_hint(unresolved))
+                                    .into());
+                                }
+                            }
+                        } else {
+                            return Err(err.into());
+                        }
                     }
-                    Err(err) => return Err(err.into()),
                 }
             };
+            if created {
+                // Setting the target makes a branch without an upstream track the default remote,
+                // so it must see the upstream the new branch got, which the cached repository
+                // reads only once reloaded.
+                ctx.reload_repo_and_invalidate_workspace(guard.write_permission())?;
+            }
+            // Setting the target takes the lock itself.
+            drop(guard);
             but_api::workspace::set_target_ref_and_init_project(
                 ctx,
                 target_ref.as_local_full_name_ref(),
@@ -1942,6 +1944,30 @@ async fn target_config(
     }
 
     Ok(())
+}
+
+/// Create the local branch named as the remote-tracking `target`, like main for origin/main, to
+/// track it as `git switch main` does. `None` if a branch has that name already, `target` is
+/// symbolic like origin/HEAD, or no single remote fetches into `target` to name one.
+fn create_branch_to_track(
+    repo: &gix::Repository,
+    target: &gix::refs::FullNameRef,
+) -> Result<Option<LocalRefName>> {
+    if matches!(
+        repo.find_reference(target)?.target(),
+        gix::refs::TargetRef::Symbolic(_)
+    ) {
+        return Ok(None);
+    }
+    let Ok(Some((local, _remote))) = repo.upstream_branch_and_remote_for_tracking_branch(target)
+    else {
+        return Ok(None);
+    };
+    if repo.try_find_reference(local.as_ref())?.is_some() {
+        return Ok(None);
+    }
+    let local = but_workspace::branch::local_tracking_branch(repo, target)?;
+    Ok(Some(LocalRefName::new(local)?))
 }
 
 /// Handle push remote config subcommand.

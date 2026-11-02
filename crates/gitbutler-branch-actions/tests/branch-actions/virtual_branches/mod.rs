@@ -273,6 +273,5 @@ fn set_head_detached(repo: &gix::Repository, target: gix::ObjectId) {
 
 mod init;
 mod list;
-mod list_details;
 mod set_base_branch;
 mod workspace_migration;

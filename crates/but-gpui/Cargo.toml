@@ -14,23 +14,31 @@ rust-version = "1.98"
 name = "gitbutler-gpui"
 path = "src/main.rs"
 
+[[bin]]
+name = "gitbutler-gpui-stories"
+path = "src/bin/gitbutler-gpui-stories.rs"
+required-features = ["stories"]
+
 [lints]
 workspace = true
 
 [features]
 ## Scripted input and frame screenshots for development, see `src/dev.rs`.
 dev-script = ["gpui/test-support", "gpui_platform/test-support"]
+## A window of the shared controls in their states, as `gitbutler-gpui-stories`, see
+## `src/stories`.
+stories = []
 
 [target.'cfg(unix)'.dependencies]
 # Build and restart's Cancel stops the build's whole process group.
 libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Text drawn as the web apps draw it and the Dock icon (see `run`), scripted runs kept out of
-# App Nap, and the cursor shown again when the window becomes key.
+# The Dock icon (see `run`), scripted runs kept out of App Nap, the cursor shown again when the
+# window becomes key, and the window's least width lowered while it's narrowed to the navigator.
 objc2 = "0.6.4"
 raw-window-handle = "0.6.2"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData", "NSDictionary", "NSObject", "NSProcessInfo", "NSString", "NSUserDefaults", "NSValue"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData", "NSProcessInfo", "NSString", "objc2-core-foundation"] }
 
 [dependencies]
 anyhow.workspace = true
@@ -43,7 +51,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # The log files, in the desktop app's log folder.
 tracing-appender = "0.2.5"
 unicode-segmentation.workspace = true
-bstr.workspace = true
+bstr = { workspace = true, features = ["serde"] }
 # The forge cache's timestamps.
 chrono = { workspace = true, features = ["clock"] }
 gix = { workspace = true, features = ["sha1", "blame", "mailmap"] }
@@ -81,7 +89,7 @@ but-oplog.workspace = true
 but-rebase.workspace = true
 but-secret.workspace = true
 but-settings.workspace = true
-but-transaction.workspace = true
+but-transaction = { workspace = true, features = ["legacy"] }
 but-workspace = { workspace = true, features = ["legacy"] }
 gitbutler-operating-modes.workspace = true
 gitbutler-project.workspace = true
@@ -101,6 +109,10 @@ image = { version = "0.25.1", default-features = false, features = ["png", "jpeg
 deltoids = { git = "https://github.com/juanibiapina/deltoids", rev = "b797d011ecc6b733025461cc98fae6f9f8719429" }
 # Pull request descriptions as formatted text. Only its parser: none of its HTML output.
 pulldown-cmark = { version = "0.13.4", default-features = false }
+# The embedded terminals: shells on pseudo-terminals, emulated by libghostty-vt.
+but-tty.workspace = true
+# Quotes the paths of files dropped on a terminal for the shell.
+shell-words.workspace = true
 
 [build-dependencies]
 # The Windows executable's icon; it adds nothing to builds for elsewhere.

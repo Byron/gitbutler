@@ -324,6 +324,55 @@ Hint: Run `but worktree list` for the worktrees and their IDs.
 "#]]);
 }
 
+/// Agent harnesses make a worktree before their first `but` call, so the first read adopts it as
+/// archived. Running `but` in it unarchives it, or no command there could see its changes.
+#[test]
+fn running_but_in_an_archived_worktree_unarchives_it() {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks");
+    env.setup_metadata(&["A", "B"]);
+    let wt_dir = add_dirty_worktree(&env, "wt-feature", "A");
+    env.but("worktree list")
+        .assert()
+        .success()
+        .stderr_eq(snapbox::str![])
+        .stdout_eq(snapbox::str![[r#"
+Active worktrees
+(none)
+
+Archived worktrees
+wt-feature - [..]/worktrees/wt-feature
+
+"#]]);
+
+    env.but("diff")
+        .current_dir(&wt_dir)
+        .assert()
+        .success()
+        .stderr_eq(snapbox::str![])
+        .stdout_eq(snapbox::str![[r#"
+─────────────────╮
+ nl:a A note.txt │
+─────────────────╯
+
+@@ -1,0 +1,1 @@
+───────────────
+  ┊ 1 │ +dirty
+
+"#]]);
+    env.but("worktree list")
+        .assert()
+        .success()
+        .stderr_eq(snapbox::str![])
+        .stdout_eq(snapbox::str![[r#"
+Active worktrees
+wt wt-feature - [..]/worktrees/wt-feature
+
+Archived worktrees
+(none)
+
+"#]]);
+}
+
 #[test]
 fn remove_requires_force_for_a_dirty_checkout() {
     let env = adopted_sandbox();
@@ -403,6 +452,88 @@ Active worktrees
 wt wt-clean - [..]/worktrees/wt-clean
 
 "#]]);
+}
+
+/// `git worktree remove` takes the checkout's path, so `but worktree remove` does too.
+#[test]
+fn remove_by_path() {
+    let env = adopted_sandbox();
+    let absolute = add_worktree_with_commit(&env, "wt-absolute", "A");
+    // Like the worktrees agent harnesses make inside the main checkout.
+    invoke_bash_at_dir(
+        "git worktree add -q -b wt-relative .claude/worktrees/wt-relative B",
+        env.projects_root(),
+    );
+
+    env.but(format!("worktree remove '{}'", absolute.display()))
+        .assert()
+        .success()
+        .stderr_eq(snapbox::str![])
+        .stdout_eq(snapbox::str![[r#"
+Removed worktree wt-absolute
+
+"#]]);
+    // A relative path is taken from the directory `-C` names, with or without a trailing slash.
+    env.but(format!(
+        "-C '{}' worktree remove .claude/worktrees/wt-relative/",
+        env.projects_root().display()
+    ))
+    .current_dir(env.app_data_dir())
+    .assert()
+    .success()
+    .stderr_eq(snapbox::str![])
+    .stdout_eq(snapbox::str![[r#"
+Removed worktree wt-relative
+
+"#]]);
+    // Either way the branch survives.
+    snapbox::assert_data_eq!(
+        env.invoke_git("branch --list --format=%(refname:short) wt-*"),
+        snapbox::str![[r#"
+wt-absolute
+wt-relative
+"#]]
+    );
+
+    // A directory that isn't a worktree, like the main checkout, still isn't one.
+    env.but(format!(
+        "worktree remove '{}'",
+        env.projects_root().display()
+    ))
+    .assert()
+    .failure()
+    .stdout_eq(snapbox::str![])
+    .stderr_eq(snapbox::str![[r#"
+Error: Could not find worktree: '[..]'
+
+Hint: Run `but worktree list` for the worktrees and their IDs.
+
+"#]]);
+}
+
+/// `git worktree move` keeps a worktree's name, so a name can also be the relative path of another
+/// worktree's checkout. The name wins, or `--force` could discard the wrong checkout.
+#[test]
+fn remove_prefers_a_name_over_a_path() {
+    let env = adopted_sandbox();
+    add_worktree_with_commit(&env, "new", "A");
+    invoke_bash_at_dir(
+        "git worktree add -q -b moved a-moved B && git worktree move a-moved new",
+        env.projects_root(),
+    );
+
+    env.but("worktree remove new")
+        .assert()
+        .success()
+        .stderr_eq(snapbox::str![])
+        .stdout_eq(snapbox::str![[r#"
+Removed worktree new
+
+"#]]);
+    assert!(
+        env.projects_root().join("new").is_dir(),
+        "the worktree `a-moved`, checked out at ./new, is left alone"
+    );
 }
 
 #[test]
@@ -493,13 +624,28 @@ Hint: run `but help` for all commands
         "the branch starts where the applied stacks rest"
     );
 
-    // A branch in the workspace stays there.
-    env.but("worktree new A")
-        .assert()
-        .failure()
-        .stdout_eq(snapbox::str![])
-        .stderr_eq(snapbox::str![[r#"
+    // A branch in the workspace stays there, with or without --above.
+    for args in ["A", "A --above 0dc3733"] {
+        env.but(format!("worktree new {args}"))
+            .assert()
+            .failure()
+            .stdout_eq(snapbox::str![])
+            .stderr_eq(snapbox::str![[r#"
 Error: Branch 'A' is already in the workspace
+
+"#]]);
+    }
+}
+
+#[test]
+fn new_accepts_the_git_worktree_add_spelling() {
+    let env = adopted_sandbox();
+    env.but("worktree add -b git-habit")
+        .assert()
+        .success()
+        .stderr_eq(snapbox::str![])
+        .stdout_eq(snapbox::str![[r#"
+Created worktree git-habit on 'git-habit' from 0dc3733 at [..]/home/.gitbutler-worktrees/[..]/git-habit
 
 "#]]);
 }
@@ -517,26 +663,86 @@ Created worktree loose on 'loose' from 0dc3733 at [..]/home/.gitbutler-worktrees
 
 "#]]);
 
-    // A branch checked out in a worktree is part of the workspace too.
+    // A branch can be checked out in one worktree only.
     env.but("worktree new loose")
         .assert()
         .failure()
         .stdout_eq(snapbox::str![])
         .stderr_eq(snapbox::str![[r#"
-Error: Branch 'loose' is already in the workspace
+Error: Bad input 'loose' for '<NAME>'
+
+Branch 'loose' is already checked out in worktree 'loose'
+
+Hint: Run `but worktree list` for its path, or pass a new name
 
 "#]]);
     // An existing branch keeps its own history, so it can't be placed.
-    env.but("worktree new loose --above 0dc3733")
+    env.invoke_git("branch spare main");
+    env.but("worktree new spare --above 0dc3733")
         .assert()
         .failure()
         .stdout_eq(snapbox::str![])
         .stderr_eq(snapbox::str![[r#"
-Error: Bad input '0dc3733' for '--above'
+Error: Bad input 'spare' for '<NAME>'
 
-Cannot place the existing branch 'loose' above a commit
+Branch 'spare' already exists
+
+Hint: Omit --above to check out the existing branch, or pass a new name
 
 "#]]);
+}
+
+#[test]
+fn new_retried_after_a_failing_post_checkout_hook_names_the_worktree() {
+    let env = adopted_sandbox();
+    env.file(
+        ".git/hooks/post-checkout",
+        "#!/bin/sh\necho hook-failed >&2\nexit 1\n",
+    );
+    env.invoke_bash("chmod +x .git/hooks/post-checkout");
+
+    // Like Git, a failing hook keeps the worktree, so the error says it exists.
+    env.but("worktree new w --above tpm")
+        .assert()
+        .failure()
+        .stdout_eq(snapbox::str![])
+        .stderr_eq(snapbox::str![[r#"
+Error: Created the worktree at [..]/home/.gitbutler-worktrees/[..]/w, but its post-checkout hook failed
+
+Caused by:
+    Post-checkout hook failed (exit status: 1): hook-failed
+
+"#]]);
+    // The same command again blames the name, not `--above`, and says where to look.
+    env.but("worktree new w --above tpm")
+        .assert()
+        .failure()
+        .stdout_eq(snapbox::str![])
+        .stderr_eq(snapbox::str![[r#"
+Error: Bad input 'w' for '<NAME>'
+
+Branch 'w' is already checked out in worktree 'w'
+
+Hint: Run `but worktree list` for its path, or pass a new name
+
+"#]]);
+    env.but("worktree list")
+        .assert()
+        .success()
+        .stderr_eq(snapbox::str![])
+        .stdout_eq(snapbox::str![[r#"
+Active worktrees
+[..] w - [..]/home/.gitbutler-worktrees/[..]/w
+
+Archived worktrees
+(none)
+
+"#]]);
+    assert_eq!(
+        env.invoke_git("rev-parse w"),
+        env.invoke_git("rev-parse A"),
+        "the kept worktree's branch starts at the --above commit"
+    );
 }
 
 #[cfg(unix)]
@@ -1345,16 +1551,37 @@ Created worktree a-branch-1 on 'a-branch-1' from [..] at [..]/home/.gitbutler-wo
 }
 
 #[test]
-fn new_above_rejects_a_branch() {
+fn new_above_any_revision() {
     let env = adopted_sandbox();
-    env.but("worktree new feature --above A")
+    env.invoke_bash("git branch loose $(git commit-tree -m loose 'main^{tree}')");
+    // The base that `but status` prints, an applied branch, and a branch outside the workspace.
+    for (index, rev) in ["0dc3733", "A", "loose"].into_iter().enumerate() {
+        let name = format!("wt-{index}");
+        env.but(format!("worktree new {name} -A {rev}"))
+            .assert()
+            .success()
+            .stderr_eq(snapbox::str![]);
+        assert_eq!(
+            env.invoke_git(&format!("rev-parse {name}")),
+            env.invoke_git(&format!("rev-parse {rev}")),
+            "the new branch starts at what `{rev}` names"
+        );
+    }
+}
+
+#[test]
+fn new_above_rejects_the_workspace_commit() {
+    let env = adopted_sandbox();
+    env.but("worktree new feature --above HEAD")
         .assert()
         .failure()
         .stdout_eq(snapbox::str![])
         .stderr_eq(snapbox::str![[r#"
-Error: Could not find commit: 'A'
+Error: Bad input 'HEAD' for '--above'
 
-Hint: Run `but status` for applicable targets.
+Cannot create a worktree from the GitButler workspace commit
+
+Hint: Pass a branch or commit instead, or omit --above to start at the workspace base
 
 "#]]);
 }

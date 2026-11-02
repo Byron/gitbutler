@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::fmt::Display;
+use std::panic::Location;
 
 use crate::theme::{self, Paint};
 
@@ -19,16 +20,23 @@ pub struct BadInput {
     arg_value: Option<String>,
     /// A hint to guide the user to proper usage of the command
     hint: Option<String>,
+    /// A stable code that telemetry can filter on
+    code: Option<&'static str>,
+    /// Where the bad input was raised, which tells failures apart in telemetry
+    location: &'static Location<'static>,
 }
 
 impl BadInput {
-    /// Create a new [`BadInput`]
+    /// Create a new [`BadInput`] that was raised by the caller.
+    #[track_caller]
     pub fn new<S: AsRef<str>>(message: S) -> Self {
         Self {
             message: message.as_ref().to_string(),
             arg_name: None,
             arg_value: None,
             hint: None,
+            code: None,
+            location: Location::caller(),
         }
     }
 
@@ -50,8 +58,30 @@ impl BadInput {
         self
     }
 
+    /// Add a stable code that telemetry can filter on.
+    pub fn code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
+
     pub(crate) fn argument_name(&self) -> Option<&str> {
         self.arg_name.as_deref()
+    }
+
+    pub(crate) fn error_code(&self) -> Option<&'static str> {
+        self.code
+    }
+
+    /// The `file:line` that raised this, with `/` separators on every platform.
+    ///
+    /// Lines move between builds, so sites only compare within one version. A failure that
+    /// must be found across versions needs a [code](Self::code).
+    pub(crate) fn site(&self) -> String {
+        format!(
+            "{}:{}",
+            self.location.file().replace('\\', "/"),
+            self.location.line()
+        )
     }
 
     pub(crate) fn has_hint(&self) -> bool {
@@ -59,16 +89,22 @@ impl BadInput {
     }
 }
 
-/// The hint for a remote-tracking `target_ref` that no local branch tracks.
-pub(crate) fn track_remote_target_hint(target_ref: impl Display) -> String {
-    format!(
-        "Make a local branch track {target_ref} with \
-        `git branch --set-upstream-to={target_ref} <branch>`, \
-        or choose a local target branch with `but config target <branch>`"
-    )
+/// The hint for a remote-tracking target that no local branch tracks.
+pub(crate) fn track_remote_target_hint(
+    unresolved: &but_core::ref_metadata::UnresolvedLegacyTargetRefError,
+) -> String {
+    match &unresolved.track_command {
+        Some(command) => format!(
+            "Make a local branch track {} with `{command}`, \
+            or choose a local target branch with `but config target <branch>`",
+            unresolved.target_ref.shorten()
+        ),
+        None => "Choose a local target branch with `but config target <branch>`".to_owned(),
+    }
 }
 
 /// Convenience wrapper around [`BadInput::new`].
+#[track_caller]
 pub(crate) fn bad_input<S: AsRef<str>>(message: S) -> BadInput {
     BadInput::new(message)
 }
@@ -147,6 +183,17 @@ where
                 "Run `but switch --workspace` and start conflict resolution with `but resolve`",
             ));
         }
+        // A linked worktree refuses a checkout only when its uncommitted changes are in the way.
+        if error.is::<but_rebase::graph_rebase::materialize::LinkedWorktreeCheckout>()
+            && error
+                .downcast_ref::<but_error::Context>()
+                .is_some_and(|ctx| ctx.code == but_error::Code::PreconditionFailed)
+        {
+            return CliError::BadInput(
+                bad_input(format!("{error:#}"))
+                    .hint("Run `but commit` or `but discard` in that worktree, then retry"),
+            );
+        }
         if let Some(unresolved) =
             error.downcast_ref::<but_core::ref_metadata::UnresolvedLegacyTargetRefError>()
         {
@@ -160,7 +207,7 @@ where
                         "GitButler now requires the target to be a local branch, \
                         but no local branch tracks your current target, {target_ref}"
                     ),
-                    track_remote_target_hint(target_ref),
+                    track_remote_target_hint(unresolved),
                 ),
                 UnresolvedLegacyTargetReason::MultipleTrackingBranches => (
                     format!("Multiple local branches track {target_ref}"),
@@ -168,6 +215,13 @@ where
                 ),
             };
             return CliError::BadInput(bad_input(message).hint(hint));
+        }
+        // A precondition says why the request can't be done right now. The context around it
+        // names refs and hashes the user didn't type, so only its own message is shown.
+        if let Some(refusal) = error.downcast_ref::<but_error::Context>()
+            && refusal.code == but_error::Code::PreconditionFailed
+        {
+            return CliError::BadInput(bad_input(refusal.to_string()).code("PreconditionFailed"));
         }
         CliError::Internal(error)
     }

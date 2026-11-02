@@ -1,5 +1,6 @@
 //! Dropping what's dragged on the navigator's rows: where on a row it lands, the line or
 //! outline that shows it, the zone for a new branch, and scrolling while it's near an edge.
+//! A linked worktree dragged by its heading moves as the move of it does (see `order.rs`).
 
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use gpui::{
 };
 
 use super::Navigator;
+use super::order::worktree_held;
 use crate::state::{Cut, ProjectId, Selection};
 use crate::theme::Theme;
 use crate::transfer::{Place, Transfer};
@@ -18,7 +20,8 @@ impl Navigator {
     /// Make a row take what's dragged or cut where it has a meaning for it, and offer its
     /// right-click menu. While dragging, the row under the pointer shows where letting go
     /// lands: a line above or below a commit, or an outline around what it goes into. While
-    /// something is cut, the selected row shows where ⌘V puts it. Rows it can't go on step back.
+    /// something is cut, the selected row shows where ⌘V puts it. Rows it can't go on step back,
+    /// but while a linked worktree is dragged by its heading, which goes anywhere else.
     pub(super) fn drop_target(
         &self,
         el: AnyElement,
@@ -34,9 +37,12 @@ impl Navigator {
             true => store.dragging.as_ref(),
             false => store.cut.as_ref(),
         };
+        let takes = !dragging || self.takes_drop(&target, store);
         let lands = |place: Place| {
-            pending
-                .is_some_and(|payload| Transfer::resolve(payload, &target, place, store).is_some())
+            takes
+                && pending.is_some_and(|payload| {
+                    Transfer::resolve(payload, &target, place, store).is_some()
+                })
         };
         let landing = match dragging {
             true => (store.drop_at.as_ref())
@@ -54,10 +60,12 @@ impl Navigator {
             _ => place,
         });
         let steps_back = pending.is_some()
+            && !(dragging && self.dragged_worktree.is_some())
             && ![Place::Above, Place::Into, Place::Below]
                 .into_iter()
                 .any(lands);
         let highlight = theme.pop;
+        let dragged_worktree = self.dragged_worktree.clone();
         let (store, move_target, can_drop_target, menu_target) = (
             self.store.clone(),
             target.clone(),
@@ -93,16 +101,14 @@ impl Navigator {
                     let store = this.store.read(cx);
                     let next = if bounds.contains(&at) {
                         let y = (at.y - bounds.top()) / bounds.size.height;
-                        (store.dragging.as_ref()).and_then(|payload| {
-                            let place = place_at(payload, &move_target, y, window.modifiers());
-                            Transfer::resolve(payload, &move_target, place, store)
-                                .map(|_| (move_target.clone(), place))
-                        })
-                    } else if store
-                        .drop_at
-                        .as_ref()
-                        .is_some_and(|(t, _)| *t == move_target)
-                    {
+                        (store.dragging.as_ref())
+                            .filter(|_| this.takes_drop(&move_target, store))
+                            .and_then(|payload| {
+                                let place = place_at(payload, &move_target, y, window.modifiers());
+                                Transfer::resolve(payload, &move_target, place, store)
+                                    .map(|_| (move_target.clone(), place))
+                            })
+                    } else if (store.drop_at.as_ref()).is_some_and(|(t, _)| *t == move_target) {
                         None
                     } else {
                         return;
@@ -114,14 +120,19 @@ impl Navigator {
             )
             .can_drop(move |_, _, cx| {
                 let store = store.read(cx);
-                (store.dragging.as_ref()).is_some_and(|payload| {
-                    (store.drop_at.as_ref()).is_some_and(|(at, place)| {
-                        *at == can_drop_target
-                            && Transfer::resolve(payload, at, *place, store).is_some()
+                // A worktree moving lands where it's shown, which the row holds the drop for.
+                worktree_held(dragged_worktree.as_ref(), store)
+                    || (store.dragging.as_ref()).is_some_and(|payload| {
+                        (store.drop_at.as_ref()).is_some_and(|(at, place)| {
+                            *at == can_drop_target
+                                && Transfer::resolve(payload, at, *place, store).is_some()
+                        })
                     })
-                })
             })
-            .on_drop(cx.listener(move |this, _: &Cut, window, cx| {
+            .on_drop(cx.listener(move |this, dropped: &Cut, window, cx| {
+                if worktree_held(this.dragged_worktree.as_ref(), this.store.read(cx)) {
+                    return this.drop_worktree(dropped, window, cx);
+                }
                 let store = this.store.read(cx);
                 let (Some(payload), Some((_, place))) =
                     (store.dragging.clone(), store.drop_at.clone())
@@ -209,12 +220,16 @@ impl Navigator {
                     return;
                 }
                 match store.dragging.clone() {
-                    Some(Cut::Commit(from, ids)) if from == project => this
-                        .store
-                        .update(cx, |store, cx| store.move_to_new_branch(&from, ids, cx)),
-                    Some(Cut::Branch(from, branch)) if from == project => this
-                        .store
-                        .update(cx, |store, cx| store.unstack(&from, branch, cx)),
+                    Some(Cut::Commit(from, ids)) if from == project => {
+                        this.store.update(cx, |store, cx| {
+                            store.move_to_new_branch(&from, ids, None, false, None, cx)
+                        })
+                    }
+                    Some(Cut::Branch(from, branch)) if from == project => {
+                        this.store.update(cx, |store, cx| {
+                            store.unstack(&from, branch, false, None, cx)
+                        })
+                    }
                     _ => {}
                 }
             }));
@@ -308,7 +323,7 @@ fn place_at(payload: &Cut, target: &Selection, y: f32, held: Modifiers) -> Place
 
 /// The line a drop lands on, along the row's top edge or its bottom one, so the rows either
 /// side of a gap draw it in the same place.
-pub(super) fn insertion_line(above: bool, color: Hsla) -> Div {
+fn insertion_line(above: bool, color: Hsla) -> Div {
     let line = div()
         .absolute()
         .left(dp(10.))

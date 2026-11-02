@@ -1,17 +1,18 @@
 use bstr::BString;
+use but_core::TreeStatusKind;
 use but_ctx::Context;
 use gix::refs::FullName;
 use nonempty::NonEmpty;
 use serde::Serialize;
 
 use crate::{
-    CliResult, IdMap,
+    CliError, CliResult, IdMap,
     args::{
-        atoms::{Purpose, ResolvedCliIdArg},
+        atoms::{CliIdArg, Purpose, ResolvedCliIdArg},
         diff::Platform,
     },
     bad_input,
-    id::{CommitId, CommittedFileId, IdAndHunk, UncommittedHunkOrFile},
+    id::{CommitId, CommittedFileId, CommittedHunk, IdAndHunk, UncommittedHunkOrFile},
     theme::{Paint as _, Theme},
     utils::{
         CliOutput, CliOutputHuman, IntermediateChannel, WriteWithUtils,
@@ -107,6 +108,9 @@ impl CliOutputHuman for DiffOutcome<'_> {
                     &mut writer,
                 )?;
             }
+            DiffOperation::CommittedHunk { hunk } => {
+                diff_rendering::render_committed_hunk(*hunk, theme, &mut id_gen, &mut writer)?;
+            }
             DiffOperation::PathPrefix { id, hunks } => {
                 diff_rendering::render_path_prefix(
                     &id,
@@ -180,7 +184,11 @@ impl CliOutput for DiffOutcome<'_> {
             }
         }
 
-        fn hunk_to_change(id: Option<&str>, hunk: &but_core::SingleHunk) -> Change {
+        fn hunk_to_change(
+            id: Option<&str>,
+            hunk: &but_core::SingleHunk,
+            status: TreeStatusKind,
+        ) -> Change {
             use bstr::ByteSlice as _;
 
             let diff = if let (Some(diff), Some(header)) = (&hunk.diff, &hunk.hunk_header) {
@@ -204,14 +212,22 @@ impl CliOutput for DiffOutcome<'_> {
             Change {
                 id: id.map(str::to_owned),
                 path: hunk.path.to_str_lossy().into_owned(),
-                status: "modified".to_owned(),
+                status: match status {
+                    TreeStatusKind::Addition => "added",
+                    TreeStatusKind::Deletion => "deleted",
+                    TreeStatusKind::Modification => "modified",
+                    TreeStatusKind::Rename => "renamed",
+                }
+                .to_owned(),
                 old_path: None,
                 diff,
             }
         }
 
-        fn hunk_changes(mut hunks: Vec<(&str, &but_core::SingleHunk)>) -> Vec<Change> {
-            hunks.sort_by(|(_, a_hunk), (_, b_hunk)| {
+        fn hunk_changes(
+            mut hunks: Vec<(&str, &but_core::SingleHunk, TreeStatusKind)>,
+        ) -> Vec<Change> {
+            hunks.sort_by(|(_, a_hunk, _), (_, b_hunk, _)| {
                 a_hunk
                     .path
                     .cmp(&b_hunk.path)
@@ -219,7 +235,7 @@ impl CliOutput for DiffOutcome<'_> {
             });
             hunks
                 .into_iter()
-                .map(|(id, hunk)| hunk_to_change(Some(id), hunk))
+                .map(|(id, hunk, status)| hunk_to_change(Some(id), hunk, status))
                 .collect()
         }
 
@@ -288,7 +304,7 @@ impl CliOutput for DiffOutcome<'_> {
                             .uncommitted_hunks
                             .iter()
                             .filter(|(_, hunk)| hunk.source == *source)
-                            .map(|(id, hunk)| (id.as_str(), &hunk.hunk))
+                            .map(|(id, hunk)| (id.as_str(), &hunk.hunk, hunk.tree_status))
                             .collect(),
                     )
                 }
@@ -305,16 +321,19 @@ impl CliOutput for DiffOutcome<'_> {
                 DiffOperation::UncommittedHunkOrFile { hunk } => hunk_changes(
                     hunk.hunks
                         .iter()
-                        .map(|hunk| (hunk.id.as_str(), &hunk.hunk))
+                        .map(|hunk| (hunk.id.as_str(), &hunk.hunk, hunk.tree_status))
                         .collect(),
                 ),
                 DiffOperation::CommittedFile { commit, path } => {
                     commit_changes(ctx, commit.commit_id, Some(path))?
                 }
+                DiffOperation::CommittedHunk { hunk } => {
+                    hunk_changes(vec![(hunk.id.as_str(), &hunk.hunk, hunk.tree_status)])
+                }
                 DiffOperation::PathPrefix { hunks, .. } => hunk_changes(
                     hunks
                         .iter()
-                        .map(|hunk| (hunk.id.as_str(), &hunk.hunk))
+                        .map(|hunk| (hunk.id.as_str(), &hunk.hunk, hunk.tree_status))
                         .collect(),
                 ),
             };
@@ -429,7 +448,9 @@ fn resolve(
 
     let resolved_target = if let Some(target) = target {
         let repo = ctx.repo.get()?;
-        target.resolve_in_workspace(&repo, id_map, Purpose::Target, None)?
+        target
+            .try_resolve(&repo, id_map, Purpose::Target, None)?
+            .ok_or_else(|| unresolved_target_error(&target, &repo))?
     } else {
         ResolvedCliIdArg::Uncommitted(invoked_from.managed_source(id_map)?)
     };
@@ -458,9 +479,7 @@ fn resolve(
             },
             path,
         }),
-        ResolvedCliIdArg::CommittedHunk(..) => {
-            Err(bad_input("viewing diffs for committed hunks is not supported").into())
-        }
+        ResolvedCliIdArg::CommittedHunk(hunk) => Ok(DiffOperation::CommittedHunk { hunk }),
         ResolvedCliIdArg::PathPrefix {
             id,
             hunks,
@@ -469,6 +488,22 @@ fn resolve(
         ResolvedCliIdArg::Stack { .. } => {
             Err(bad_input("viewing diffs for stack assignments is not supported").into())
         }
+    }
+}
+
+/// Agents often pass Git revisions like `HEAD~1` or `main...HEAD`, which are not CLI IDs.
+/// When a target fails to resolve but Git can parse it, point at `git diff` in addition
+/// to the generic missing-target hint.
+fn unresolved_target_error(target: &CliIdArg, repo: &gix::Repository) -> CliError {
+    let err = bad_input(format!("Could not find target: '{target}'"));
+    if repo.rev_parse(target.0.as_str()).is_ok() {
+        err.hint(format!(
+            "To diff it as a Git revision, run `git diff {target}`. {}",
+            CliIdArg::TARGET_MISSING_HINT
+        ))
+        .into()
+    } else {
+        err.hint(CliIdArg::TARGET_MISSING_HINT).into()
     }
 }
 
@@ -491,6 +526,9 @@ enum DiffOperation {
     CommittedFile {
         commit: CommitId,
         path: BString,
+    },
+    CommittedHunk {
+        hunk: Box<CommittedHunk>,
     },
     PathPrefix {
         id: String,

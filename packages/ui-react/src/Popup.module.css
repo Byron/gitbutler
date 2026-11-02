@@ -1,4 +1,4 @@
-/* The one surface every overlay in Lite wears — modals, dropdowns and the toolbox alike. A modal
+/* The one surface every overlay in the library wears — modals, dropdowns and the toolbox alike. A modal
    adds a backdrop and centres itself in the window; a dropdown anchors to its trigger. Nothing
    else about the container differs between them. */
 .popup {
@@ -335,6 +335,8 @@
 	background: none;
 	color: var(--text-1);
 	text-align: start;
+	/* A row can render as a link, as a breadcrumb's folded levels do: it still reads as a row. */
+	text-decoration: none;
 
 	/* `data-highlighted` is what Base UI's list primitives set as the keyboard walks them, so
 	   pointer and keyboard land on the same tint. A menu highlights a disabled row too; it still

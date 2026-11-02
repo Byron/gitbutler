@@ -10,6 +10,7 @@ pub mod fold;
 mod format;
 pub mod illustration;
 pub mod markdown;
+pub mod message_editor;
 pub mod modal;
 pub mod person;
 pub mod review;
@@ -22,10 +23,10 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use gpui::{
-    Action, AnyElement, App, AssetSource, ClickEvent, Context, CursorStyle, Div, DragMoveEvent,
-    ElementId, EmptyView, Entity, HighlightStyle, Hsla, MouseButton, MouseDownEvent, Pixels, Point,
-    Rems, Role, SharedString, Stateful, StyledText, Svg, Toggled, UnderlineStyle, Window, div,
-    prelude::*, rems, svg,
+    Action, AnyElement, App, AssetSource, ClickEvent, Context, CursorStyle, DispatchPhase, Div,
+    DragMoveEvent, ElementId, EmptyView, Entity, HighlightStyle, Hsla, MouseButton, MouseDownEvent,
+    Pixels, Point, Rems, Role, SharedString, Stateful, StyledText, Svg, TextLayout, Toggled,
+    UnderlineStyle, Window, div, prelude::*, rems, svg,
 };
 
 use crate::state::{Pane, Store};
@@ -58,6 +59,14 @@ pub const fn fixed(n: f32) -> Pixels {
 /// menu, as GNOME's title bars do.
 pub fn drags_window(el: Div) -> Div {
     let el = el.window_control_area(gpui::WindowControlArea::Drag);
+    // `holds_back_first_click` lets this one through, so the window drags from here straight
+    // away, as from a title bar.
+    #[cfg(target_os = "macos")]
+    let el = el.capture_any_mouse_down(|event, _, _| {
+        if event.first_mouse {
+            FIRST_CLICK_ON_HEADER.set(true);
+        }
+    });
     #[cfg(not(windows))]
     let el = {
         use std::cell::Cell;
@@ -87,6 +96,50 @@ pub fn drags_window(el: Div) -> Div {
     el
 }
 
+thread_local! {
+    /// The click that brought the window in front landed on a header (`drags_window`).
+    static FIRST_CLICK_ON_HEADER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The window wasn't active when last drawn (`holds_back_first_click`).
+    static DRAWN_INACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `event` is the press that brings the window in front, on macOS, which
+/// `holds_back_first_click` holds back unless it's on a header. GPUI marks it `first_mouse`, but
+/// leaves that on a later press too when a ctrl-click brought the window in front, so it counts
+/// only while the window was last drawn inactive: GPUI hears that the window is active only after
+/// handling the press that made it so.
+pub fn brings_window_in_front(event: &MouseDownEvent) -> bool {
+    cfg!(target_os = "macos") && event.first_mouse && DRAWN_INACTIVE.get()
+}
+
+/// Holds back the click that brings the window in front, as macOS apps do, so it doesn't also
+/// press what's under it: GPUI passes it on (`acceptsFirstMouse`). A header still takes it, to
+/// drag the window. Drawn after everything else, as listeners run in the order they're drawn
+/// while an event is captured, so the headers' run first, as does a menu's that closes it on a
+/// press outside. Other capture listeners see it too, so one that acts checks
+/// `brings_window_in_front`.
+pub fn holds_back_first_click() -> impl IntoElement {
+    gpui::deferred(
+        gpui::canvas(
+            |_, _, _| {},
+            |_, (), window, _| {
+                DRAWN_INACTIVE.set(!window.is_window_active());
+                window.on_mouse_event(|event: &MouseDownEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Capture && event.first_mouse {
+                        let on_header = FIRST_CLICK_ON_HEADER.take();
+                        if brings_window_in_front(event) && !on_header {
+                            cx.stop_propagation();
+                        }
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0(),
+    )
+    .with_priority(usize::MAX)
+}
+
 /// `el`, in a header the window is dragged by, still taking its own clicks: the drag area under
 /// it would take them, and a double click there would zoom the window.
 pub fn above_drag<E: InteractiveElement>(el: E) -> E {
@@ -101,6 +154,12 @@ pub fn draws_window_controls(window: &Window) -> bool {
             window.window_decorations(),
             gpui::Decorations::Client { .. }
         )
+}
+
+/// Whether macOS's traffic lights are at the window's top left, where the headers leave room for
+/// them: not in full screen, where they come down with the menu bar, over the app.
+pub fn has_traffic_lights(window: &Window) -> bool {
+    cfg!(target_os = "macos") && !window.is_fullscreen()
 }
 
 /// What "Reveal in Finder" is called where the file manager isn't Finder.
@@ -132,6 +191,10 @@ macro_rules! icons {
         }
 
         impl Icon {
+            /// Every icon, for the stories' grid.
+            #[cfg(feature = "stories")]
+            pub const ALL: &[Icon] = &[$(Icon::$variant,)* $(Icon::$own,)*];
+
             pub fn path(self) -> &'static str {
                 match self {
                     $(Icon::$variant => concat!("icons/", $name, ".svg"),)*
@@ -192,12 +255,14 @@ icons! {
     FilesSidebar => "files-sidebar",
     Folder => "folder",
     FolderCopy => "folder-copy",
+    Fork => "fork",
     Globe => "globe",
     Hash => "hash",
     Kebab => "kebab",
     Lab => "lab",
     Link => "link",
     Lock => "lock",
+    Minus => "minus",
     Mixer => "mixer",
     Plug => "plug",
     Plus => "plus",
@@ -210,6 +275,7 @@ icons! {
     Settings => "settings",
     Sidebar => "sidebar",
     SidebarNarrow => "sidebar-narrow",
+    Spinner => "spinner",
     Stack => "stack",
     Tag => "tag",
     TextBlock => "text-block",
@@ -222,6 +288,8 @@ icons! {
     own: FolderFill => "folder-fill",
     // ui-svelte's keyboard, which ui-react doesn't have.
     Keyboard => "keyboard",
+    // ui-react's sidebar, mirrored, for the detail on the window's right.
+    SidebarRight => "sidebar-right",
     // ui-react's eye, struck through, for a project not watched.
     EyeOff => "eye-off",
     // ui-react's folders with their top right corner cut away, for a dot there while a
@@ -241,21 +309,31 @@ icons! {
 }
 
 /// GitButler's fonts, compiled into the binary so the client looks the same everywhere.
-/// Embedded fonts are as fast as system ones; a user-installed variable font isn't, as
-/// CoreText asks the font daemon about it for every line it lays out.
 pub fn fonts() -> Vec<Cow<'static, [u8]>> {
     macro_rules! fonts {
         ($($name:literal),* $(,)?) => {
-            vec![$(Cow::Borrowed(include_bytes!(concat!("../../assets/fonts/", $name, ".ttf")).as_slice()),)*]
+            vec![$(Cow::Borrowed(include_bytes!(concat!("../../assets/fonts/", $name)).as_slice()),)*]
         };
     }
     fonts!(
-        "Inter-Regular",
-        "Inter-Medium",
-        "Inter-SemiBold",
-        "GeistMono-Regular",
-        "GeistMono-SemiBold",
+        "Inter-Regular.ttf",
+        "Inter-Medium.ttf",
+        "Inter-SemiBold.ttf",
+        "GeistMono-Regular.ttf",
+        "GeistMono-SemiBold.ttf",
+        "GeistMonoNerdFontMono-Regular.otf",
+        "GeistMonoNerdFontMono-SemiBold.otf",
     )
+}
+
+/// How wide a digit of `family` is in ems, or `None` when the machine hasn't got it, as GPUI
+/// would quietly draw it in its own fallback.
+pub fn digit_advance(family: &str, text_system: &gpui::TextSystem) -> Option<f32> {
+    let id = text_system.resolve_font(&gpui::font(family.to_owned()));
+    (text_system.get_font_for_id(id)?.family == family).then_some(())?;
+    let size = fixed(100.);
+    let advance = text_system.advance(id, size, '0').ok()?;
+    Some(advance.width / size)
 }
 
 /// Match each of `fonts`' faces against the installed fonts in the background, as Zed does.
@@ -436,6 +514,50 @@ pub fn matched(
     StyledText::new(text).with_highlights(found.into_iter().map(|range| (range, underline)))
 }
 
+/// A place in text drawn as rows, as the diff's lines or a description's blocks: the row, and
+/// a byte of its text.
+pub type TextPoint = (usize, usize);
+
+/// Where in `text`, laid out as `layout`, the pointer at `position` is: over a character, the
+/// edge of it nearer the pointer, as text selection goes everywhere; off the text, where the
+/// text stops, as its start above it and a line's end beside or below it.
+pub fn text_index(layout: &TextLayout, text: &str, position: Point<Pixels>) -> usize {
+    let ix = match layout.index_for_position(position) {
+        Ok(ix) => ix,
+        Err(ix) => return ix,
+    };
+    let next = (text.get(ix..))
+        .and_then(|rest| rest.chars().next())
+        .map(|c| ix + c.len_utf8());
+    let edges = next.and_then(|next| {
+        Some((
+            layout.position_for_index(ix)?,
+            layout.position_for_index(next)?,
+            next,
+        ))
+    });
+    match edges {
+        Some((start, end, next)) if position.x > (start.x + end.x) / 2. => next,
+        _ => ix,
+    }
+}
+
+/// What a selection from `start` to `end`, in order, takes of `text`, row `row`'s. Nothing
+/// when the text changed under it so its ends no longer fall in the text, as after an edit.
+pub fn selected_part(
+    text: &str,
+    row: usize,
+    (start, end): (TextPoint, TextPoint),
+) -> Option<Range<usize>> {
+    if row < start.0 || row > end.0 {
+        return None;
+    }
+    let from = if row == start.0 { start.1 } else { 0 };
+    let to = if row == end.0 { end.1 } else { text.len() };
+    let fits = text.is_char_boundary(from) && text.is_char_boundary(to);
+    (from < to && fits).then_some(from..to)
+}
+
 /// The heading over a group of rows.
 pub fn section_label(text: impl IntoElement, theme: &Theme) -> Div {
     faint(text, theme).font_weight(gpui::FontWeight::SEMIBOLD)
@@ -539,6 +661,13 @@ pub fn side_row(
 pub fn quiet(el: Div, on: bool, theme: &Theme) -> Div {
     el.flex_none()
         .when(on, |el| el.text_color(theme.muted_on_solid()))
+}
+
+/// Where row `ix` of `list` was last drawn, while some of it shows: where ⇧F10 opens the menu
+/// of the row selected.
+pub fn shown_row(list: &gpui::ListState, ix: usize) -> Option<gpui::Bounds<Pixels>> {
+    let (row, view) = (list.bounds_for_item(ix)?, list.viewport_bounds());
+    (row.bottom() > view.top() && row.top() < view.bottom()).then_some(row)
 }
 
 /// A row of a list or menu, shaded when `selected` and otherwise under the pointer.
@@ -658,12 +787,25 @@ pub struct Switch {
     on: bool,
     el: Stateful<Div>,
     grounds: [gpui::Rgba; 2],
+    disabled: bool,
 }
 
 /// An on/off switch, for a setting that applies at once.
 pub fn switch(id: impl Into<ElementId>, on: bool, theme: &Theme) -> Switch {
     let id = id.into();
-    let el = tab_stop(h_flex().id(id.clone()), theme)
+    Switch {
+        el: tab_stop(switch_track(id.clone(), on), theme).hover(|el| el.opacity(0.9)),
+        id,
+        on,
+        grounds: switch_grounds(theme),
+        disabled: false,
+    }
+}
+
+/// A switch's track, before it takes the keys or the pointer.
+fn switch_track(id: ElementId, on: bool) -> Stateful<Div> {
+    h_flex()
+        .id(id)
         .role(Role::Switch)
         .aria_toggled(if on { Toggled::True } else { Toggled::False })
         .flex_none()
@@ -671,21 +813,28 @@ pub fn switch(id: impl Into<ElementId>, on: bool, theme: &Theme) -> Switch {
         .h(dp(18.))
         .p(dp(2.))
         .rounded_full()
-        .hover(|el| el.opacity(0.9));
-    Switch {
-        id,
-        on,
-        el,
-        grounds: switch_grounds(theme),
-    }
 }
 
 impl Switch {
+    /// Dimmed, out of the tab order and taking no clicks, with `why` in its tooltip, as a
+    /// disabled [`button`] is.
+    pub fn disabled_because(mut self, why: Option<impl Into<SharedString>>) -> Self {
+        if let Some(why) = why {
+            self.el = switch_track(self.id.clone(), self.on)
+                .opacity(0.5)
+                .tooltip(Tooltip::text(why));
+            self.disabled = true;
+        }
+        self
+    }
+
     pub fn on_click(
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.el = self.el.on_click(handler);
+        if !self.disabled {
+            self.el = self.el.on_click(handler);
+        }
         self
     }
 }
@@ -732,9 +881,9 @@ pub fn checkbox(id: impl Into<ElementId>, check: Toggled, theme: &Theme) -> Stat
             Toggled::True => el.child(
                 small_icon(Icon::Tick)
                     .size(dp(10.))
-                    .text_color(gpui::white()),
+                    .text_color(theme.on_pop),
             ),
-            Toggled::Mixed => el.child(div().w(dp(8.)).h(dp(2.)).rounded(dp(1.)).bg(gpui::white())),
+            Toggled::Mixed => el.child(div().w(dp(8.)).h(dp(2.)).rounded(dp(1.)).bg(theme.on_pop)),
             Toggled::False => el,
         })
 }
@@ -765,9 +914,11 @@ pub fn dropdown(
 pub fn field(input: &Entity<text_input::TextInput>, focused: bool, theme: &Theme) -> Div {
     let clicked = input.clone();
     div()
-        // Its padding is part of the field to click.
+        // Its padding is part of the field to click, and keeps the keys from a focusable
+        // parent, which would take them as the press goes on to it.
         .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
-            window.focus(&gpui::Focusable::focus_handle(&clicked, cx), cx)
+            window.focus(&gpui::Focusable::focus_handle(&clicked, cx), cx);
+            window.prevent_default();
         })
         .px(dp(8.))
         .py(dp(5.))
@@ -819,6 +970,8 @@ pub struct Button {
     /// Why it can't be pressed now, shown in place of its tooltip.
     disabled: Option<SharedString>,
     small: bool,
+    /// At least this wide, its label centred.
+    min_width: Option<Rems>,
     /// On an inverted ground, like a selected row.
     inverted: bool,
     /// The colour of the ground it sits on, as a banner's action takes its banner's.
@@ -848,6 +1001,7 @@ pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Butto
         style: ButtonStyle::Outline,
         disabled: None,
         small: false,
+        min_width: None,
         inverted: false,
         tint: None,
         on_click: None,
@@ -896,6 +1050,12 @@ impl Button {
 
     pub fn small(mut self) -> Self {
         self.small = true;
+        self
+    }
+
+    /// At least `width` wide, so buttons that stand in for each other cover the same place.
+    pub fn min_width(mut self, width: Rems) -> Self {
+        self.min_width = Some(width);
         self
     }
 
@@ -966,7 +1126,7 @@ impl RenderOnce for Button {
                 theme.fill_gray.opacity(0.16),
             ),
             ButtonStyle::Pop => (
-                gpui::white(),
+                theme.on_pop,
                 Some(theme.pop_button),
                 None,
                 theme.pop_button.opacity(0.9),
@@ -1004,6 +1164,7 @@ impl RenderOnce for Button {
             .gap(dp(if self.small { 4. } else { 6. }))
             .when(has_label, |el| el.px(dp(if self.small { 6. } else { 10. })))
             .when(!has_label, |el| el.w(width).justify_center())
+            .when_some(self.min_width, |el, width| el.min_w(width).justify_center())
             .text_size(dp(if self.small { 12. } else { 13. }))
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .whitespace_nowrap()
@@ -1190,12 +1351,22 @@ pub fn bindings_of(action: &dyn gpui::Action, cx: &App) -> Vec<(SharedString, Op
 }
 
 /// The keys that run `action` where the keys go now, unless the same keys do something else
-/// there, as [`shortcut`] writes them.
+/// there, as [`shortcut`] writes them. Keys bound to several actions there run the first one
+/// handled, so one with no handler here doesn't take them: r is Reword's on a commit and Rename
+/// branch's on a branch.
 pub fn shortcut_here(action: &dyn gpui::Action, window: &Window, cx: &App) -> Option<SharedString> {
-    let focused = window.focused(cx)?;
-    Some(keys_of(&window.highest_precedence_binding_for_action_in(
-        action, &focused,
-    )?))
+    window.focused(cx)?;
+    let context = window.context_stack();
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let runs = |binding: &gpui::KeyBinding| {
+        let (bound, _) = keymap.bindings_for_input(binding.keystrokes(), &context);
+        (bound.iter())
+            .find(|b| b.action().partial_eq(action) || window.is_action_available(b.action(), cx))
+            .is_some_and(|b| b.action().partial_eq(action))
+    };
+    let binding = keymap.bindings_for_action(action).rev().find(|b| runs(b))?;
+    Some(keys_of(binding))
 }
 
 fn keys_of(binding: &gpui::KeyBinding) -> SharedString {
@@ -1317,6 +1488,19 @@ pub fn dot(color: Hsla) -> Div {
     div().flex_none().size(dp(6.)).rounded_full().bg(color)
 }
 
+/// An unread row's mark: a hairline in `color` in the row's left padding, out of its flow so
+/// nothing moves when it's read. The row must be `relative`.
+pub fn unread_line(color: Hsla) -> Div {
+    div()
+        .absolute()
+        .left(dp(2.))
+        .top_0()
+        .bottom_0()
+        .flex()
+        .items_center()
+        .child(div().w(fixed(1.)).h(dp(14.)).bg(color))
+}
+
 /// How long ago `seconds` (since the epoch) was, faint, in a slot as wide as the longest
 /// ("11mo"), so what sits before it lines up from row to row; empty without a time. It starts
 /// at the slot's left, beside what comes before.
@@ -1340,6 +1524,7 @@ pub fn meta_count(glyph: Icon, n: usize, color: Hsla, tip: String) -> Option<Sta
             .text_color(color)
             .child(small_icon(glyph).text_color(color))
             .child(n.to_string())
+            .aria_label(tip.clone())
             .tooltip(Tooltip::text(tip))
     })
 }
@@ -1371,6 +1556,45 @@ pub fn pulsing<E: IntoElement + Styled + 'static>(el: E) -> impl IntoElement {
             .with_easing(gpui::pulsating_between(0.35, 1.)),
         |el, delta| el.opacity(delta),
     )
+}
+
+/// How long [`spinning`] takes to turn its glyph once, and in how many steps.
+const SPIN_TURN: std::time::Duration = std::time::Duration::from_millis(800);
+const SPIN_STEPS: u32 = 24;
+
+/// `el` turning, as ui-react's spinning icons do, while what it stands for is under way. It
+/// turns a step at a time, 30 a second, each step drawing the view it's in again, rather than
+/// every display frame as `with_animation` would: an agent's spinner turns for minutes, and
+/// redrawing the navigator at 120Hz all that while kept the window from ever going idle, which
+/// left every frame queued behind others and scrolling the diff sticky.
+pub fn spinning(el: Svg) -> impl IntoElement {
+    use gpui::{Transformation, canvas, percentage};
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(crate::clock::now);
+    let step = SPIN_TURN / SPIN_STEPS;
+    let since = crate::clock::now().saturating_duration_since(*START);
+    let steps = since.as_nanos() / step.as_nanos();
+    let turned = (steps % u128::from(SPIN_STEPS)) as f32 / SPIN_STEPS as f32;
+    let due = step - std::time::Duration::from_nanos((since.as_nanos() % step.as_nanos()) as u64);
+    div()
+        .flex_none()
+        .child(el.with_transformation(Transformation::rotate(percentage(turned))))
+        // The next step asked for as this one is drawn, so a spinner that's gone, or one in a
+        // view that isn't drawn, asks for no more.
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, cx| {
+                    let view = window.current_view();
+                    (cx.spawn(async move |cx| {
+                        cx.background_executor().timer(due).await;
+                        cx.update(|cx| cx.notify(view));
+                    }))
+                    .detach();
+                },
+            )
+            .absolute(),
+        )
 }
 
 /// A faint pop wash over a `list_row`'s ground that fades out once, as for a commit that just

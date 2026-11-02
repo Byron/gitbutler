@@ -6,7 +6,7 @@ import { ViewHeader } from "./ViewHeader.tsx";
 const tones: Array<MetaPartTone> = ["neutral", "green", "amber", "blue", "red"];
 
 const meta = preview.meta({
-	title: "Preview/MetaPart",
+	title: "Content & status/MetaPart",
 	id: "components-metapart",
 	component: MetaPart,
 	parameters: {

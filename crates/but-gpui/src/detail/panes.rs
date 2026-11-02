@@ -3,35 +3,39 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::Instant;
 
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, Div, Entity, FocusHandle, Focusable as _,
-    ListAlignment, ListOffset, ListState, MouseDownEvent, Pixels, Point, SharedString, Stateful,
-    Window, div, list, prelude::*,
+    ListAlignment, ListOffset, ListState, MouseDownEvent, Pixels, Point, Role, SharedString,
+    Stateful, Window, div, list, prelude::*,
 };
 
 use super::upstream::noon;
 use super::{Detail, PageFold, machine};
 use crate::app::{
-    AppHandle, Collapse, Confirm, Expand, SelectNext, SelectPrevious, StartCommit, ToggleFold,
+    AppHandle, Collapse, Expand, SelectNext, SelectPrevious, StartCommit, ToggleFold,
 };
 use crate::backend::upstream::{self, ACTIVITY_DAYS};
-use crate::backend::{self, Checkout, CommitId, CommitState, FullName, PushState, short_ref};
+use crate::backend::{
+    self, Branch, Checkout, CommitId, CommitState, FullName, PushState, short_ref,
+};
+use crate::clock;
+use crate::edits::{NameBranch, RenameBranch, Reword};
 use crate::navigator::{SelectFirst, SelectLast};
-use crate::overlays::MenuItem;
+use crate::overlays::{MenuItem, has_keys};
 use crate::state::{ProjectId, Section, Selection};
 use crate::theme::Theme;
 use crate::ui::fold::{MOVING_ROWS, Moved, clipped};
 use crate::ui::illustration::Illustration;
+use crate::ui::message_editor::MessageEditor;
 use crate::ui::person::{author_avatar, byline};
 use crate::ui::scrollbar::{Scroll, scrollbar, scrolled};
 use crate::ui::text_input::{InputEvent, TextInput};
 use crate::ui::{
     Button, ButtonStyle, HEADER_HEIGHT, Icon, ROW_HEIGHT, Tooltip, WINDOW_CONTROLS_WIDTH,
     above_drag, age_column, button, commit_title, dp, empty_state, faint, field, fixed, fold_row,
-    h_flex, icon, icon_button, list_row, plural, quiet, section_label, side_row, small_icon,
-    v_flex,
+    h_flex, icon, icon_button, list_row, plural, quiet, section_label, shortcut, side_row,
+    small_icon, v_flex,
 };
 
 impl Detail {
@@ -53,33 +57,54 @@ impl Detail {
                 Some(Selection::Project(entry.id.clone()).into()),
             ));
             let workspace = entry.workspace.as_ref();
-            // The worktree a branch, stack or commit is in, named as its navigator heading is.
+            // The worktree a branch, stack, commit or the changes are in, named as its navigator
+            // heading is.
             let heading = |item: &Selection| -> Crumb {
                 let project = item.project().clone();
                 match store.worktree_for(item) {
                     Some(worktree) => (
                         worktree.name.to_string().into(),
-                        Some(Selection::Worktree(project, worktree.name.clone()).into()),
+                        Some(
+                            Selection::Checkout(project, Checkout::Linked(worktree.name.clone()))
+                                .into(),
+                        ),
                     ),
                     None => (
                         "Main worktree".into(),
-                        Some(Selection::Uncommitted(project).into()),
+                        Some(Selection::Checkout(project, Checkout::Main).into()),
                     ),
                 }
             };
             match selection {
                 Selection::Project(project) => self.upstream_crumbs(project, &mut crumbs, cx),
-                Selection::Uncommitted(_) => match workspace.and_then(|ws| ws.editing.as_ref()) {
+                Selection::Terminal(project, id) => {
+                    if let Some(checkout) = store.terminals.checkout_of(selection) {
+                        let name = checkout
+                            .linked()
+                            .map_or("Main worktree".into(), |name| name.to_string().into());
+                        let worktree = Selection::Checkout(project.clone(), checkout.clone());
+                        crumbs.push((name, Some(worktree.into())));
+                    }
+                    if let Some(title) = store.terminals.title(*id) {
+                        crumbs.push((title.clone(), None));
+                    }
+                }
+                Selection::Uncommitted(..) => match workspace.and_then(|ws| ws.editing.as_ref()) {
                     Some(editing) => {
                         let title = commit_title(&editing.title);
                         crumbs.push((format!("Editing {title}").into(), None));
                     }
-                    // While its changes show, it goes back to its overview, as Esc does.
-                    None => crumbs.push((
-                        "Main worktree".into(),
-                        (!self.showing_now(cx)).then(|| selection.clone().into()),
-                    )),
+                    None => {
+                        crumbs.push(heading(selection));
+                        crumbs.push(("Uncommitted changes".into(), None));
+                    }
                 },
+                Selection::Checkout(_, checkout) => {
+                    let name = checkout
+                        .linked()
+                        .map_or("Main worktree".into(), |name| name.to_string());
+                    crumbs.push((name.into(), None));
+                }
                 Selection::Branch(project, ref_name) => {
                     let branch = workspace.and_then(|ws| ws.find_branch(ref_name.as_ref()));
                     let name = match (branch, ref_name) {
@@ -94,10 +119,6 @@ impl Detail {
                     crumbs.push(("Branches".into(), Some(selection.clone().into())));
                     self.branches_crumbs(project, &mut crumbs);
                 }
-                Selection::Worktree(_, name) => {
-                    let back = (!self.showing_now(cx)).then(|| selection.clone().into());
-                    crumbs.push((name.to_string().into(), back));
-                }
                 Selection::Mesh(project, id, pick) => {
                     machine::mesh_crumbs(store, project, id, pick, &mut crumbs)
                 }
@@ -108,6 +129,7 @@ impl Detail {
                     crumbs.push(heading(selection));
                     crumbs.push((format!("Stack of {n}").into(), None));
                 }
+                Selection::Graph(_) => crumbs.push(("Graph".into(), None)),
                 // Then the operation picked, as the Branches page names its branch.
                 Selection::History(project) => {
                     let operation = self.selected_operation(project);
@@ -215,9 +237,9 @@ impl Detail {
             .px(dp(12.))
             // Clear of macOS's traffic lights while the navigator leaves them over the header,
             // the toggle gliding up to them as it slides away.
-            .when(cfg!(target_os = "macos"), |el| {
+            .when(crate::ui::has_traffic_lights(window), |el| {
                 let navigator =
-                    self.navigator_shown.get() * self.navigator_width(Instant::now(), window, cx);
+                    self.navigator_shown.get() * self.navigator_width(clock::now(), window, cx);
                 el.pl((fixed(84.) - theme.scaled(navigator)).max(theme.scaled(12.)))
             })
             // Clear of the window's buttons, where the app draws them over its right end.
@@ -375,7 +397,7 @@ impl Detail {
                     });
                     // What's picked goes in first, as finishing means the picking is done;
                     // finishing waits for it, so a resolve that fails finishes nothing.
-                    let at = Selection::Uncommitted(project.clone());
+                    let at = Selection::Uncommitted(project.clone(), Checkout::Main);
                     let finish = move |this: &mut Self, cx: &mut Context<Self>| {
                         if !this.apply_resolutions(true, cx) {
                             (this.store).update(cx, |store, cx| store.finish_editing(&project, cx))
@@ -441,16 +463,18 @@ impl Detail {
                 theme,
             )
         } else if !self.composing {
-            let target = self.effective_target(project, cx);
+            // Where c or this would place it first, as the navigator then shows it.
+            let target = self.start_target(project, checkout, cx);
             let target = match (target.as_ref(), checkout) {
                 (Some(target), _) => format!("Commit to {}", short_ref(target)),
-                (None, Checkout::Main) => "Commit to a new branch".to_owned(),
+                (None, Checkout::Main) => "Commit to a new independent branch".to_owned(),
                 (None, Checkout::Linked(_)) => "No branch of its own checked out".to_owned(),
             };
             let open = button("open-composer", "Commit…")
                 .small()
-                .tooltip_for("Write a commit message", &StartCommit)
-                .on_click(cx.listener(|this, _, window, cx| this.focus_message(window, cx)));
+                .min_width(dp(super::COMMIT_BUTTON_WIDTH))
+                .tooltip_for("Commit, choosing where in the navigator", &StartCommit)
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(StartCommit), cx));
             footer(target, [open], theme)
         } else {
             self.render_composer(project, files, theme, window, cx)
@@ -499,7 +523,6 @@ impl Detail {
         project: &ProjectId,
         id: backend::CommitId,
         theme: &Theme,
-        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let store = self.store.read(cx);
@@ -517,7 +540,15 @@ impl Detail {
         };
         // A long title wraps rather than hiding its end, as it's shown nowhere else, and
         // scrolls past a dozen lines.
-        let title = page_title(Icon::Commit, theme).child(self.message_title(title, &body, cx));
+        let name = editable_title(
+            "commit-title",
+            commit_title(title),
+            "Edit message",
+            shortcut(&Reword, cx),
+            theme,
+        )
+        .on_click(cx.listener(|this, _, window, cx| this.start_reword(window, cx)));
+        let title = page_title(Icon::Commit, theme).child(self.message_title(name, &body, cx));
         let meta = meta_row(theme)
             .child(byline(
                 &commit.author,
@@ -544,8 +575,9 @@ impl Detail {
         let rewording = (self.rewording.as_ref())
             .filter(|(reworded, ..)| super::composer::rewords(reworded, project, commit, store));
         let title = match rewording {
-            Some((_, input, _)) => self.reword_editor(input, theme, window, cx),
-            // A double-click on its title or body edits the message.
+            Some((_, input, _)) => reword_editor(input, false, theme),
+            // A click on its title starts editing the message, and so does a double-click on
+            // its body.
             None => (self.message(title, body, theme))
                 .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                     if event.click_count() == 2 {
@@ -559,8 +591,8 @@ impl Detail {
         self.page_header(title, meta, target, apply, None, theme, cx)
     }
 
-    /// A commit's title, with a button that shows the rest of its message, `body`, if any.
-    fn message_title(&self, title: &str, body: &str, cx: &Context<Self>) -> Div {
+    /// A commit's `title`, with a button that shows the rest of its message, `body`, if any.
+    fn message_title(&self, title: impl IntoElement, body: &str, cx: &Context<Self>) -> Div {
         let open = self.message_open;
         let toggle = (!body.is_empty()).then(|| {
             icon_button("full-message", Icon::TextBlock)
@@ -577,7 +609,7 @@ impl Detail {
                 }))
         });
         (h_flex().items_start().min_w_0().gap(dp(6.)))
-            .child(title_text(commit_title(title)))
+            .child(title)
             .children(toggle)
     }
 
@@ -693,6 +725,7 @@ impl Detail {
         ref_name: Option<&FullName>,
         id: backend::CommitId,
         theme: &Theme,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let store = self.store.read(cx);
@@ -730,7 +763,8 @@ impl Detail {
                 .and_then(|b| b.remote.clone()),
             None => ws.target.as_ref().map(|target| target.name.clone()),
         };
-        let title = page_title(Icon::ArrowDown, theme).child(self.message_title(title, body, cx));
+        let name = title_text(commit_title(title));
+        let title = page_title(Icon::ArrowDown, theme).child(self.message_title(name, body, cx));
         let meta = meta_row(theme)
             .child(byline(author, email, agent, time, theme))
             .child(self.sha_chip(id, theme, cx))
@@ -740,7 +774,8 @@ impl Detail {
             }));
         let message = self.message(title, body.clone(), theme);
         let target = Selection::Upstream(project.clone(), ref_name.cloned(), id);
-        let tabs = (self.selected_review(cx)).map(|review| self.review_tabs(review, theme, cx));
+        let tabs =
+            (self.selected_review(cx)).map(|review| self.review_tabs(review, theme, window, cx));
         self.page_header(message, meta, target, None, tabs, theme, cx)
     }
 
@@ -818,6 +853,7 @@ impl Detail {
         project: &ProjectId,
         ref_name: Option<&FullName>,
         theme: &Theme,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let store = self.store.read(cx);
@@ -856,21 +892,44 @@ impl Detail {
                 .dispatch(&crate::pr::CreatePullRequest)
                 .disabled_because(offer.err())
         });
-        let force = ref_name.is_some_and(|r| ws.needs_force(r));
-        let push = button("header-push", ref_name.map_or("Push", |r| ws.push_label(r)))
-            .small()
-            .tooltip(match force {
-                true => "Replace the remote's version",
-                false => "Push to the remote",
-            })
-            .dispatch(&crate::app::Push)
-            .disabled_because(ws.push_blocked(ref_name));
-        let meta = meta
-            .child(div().flex_1())
-            .child(h_flex().gap(dp(8.)).children(create).child(push));
-        let title = page_title(Icon::Branch, theme).child(title_text(name.to_owned()));
-        let tabs = (branch.review.as_ref()).map(|review| self.review_tabs(review, theme, cx));
+        let meta = meta.child(div().flex_1()).children(create);
+        let name = match self.rename_field(project, ref_name, theme) {
+            Some(field) => field,
+            None => self.branch_title(project, ref_name, branch, name, theme, cx),
+        };
+        let title = page_title(Icon::Branch, theme).child(name);
+        let tabs =
+            (branch.review.as_ref()).map(|review| self.review_tabs(review, theme, window, cx));
         self.page_header(title, meta, target, None, tabs, theme, cx)
+    }
+
+    /// A branch's `name` in its header, which a click starts editing, unless it's an unnamed
+    /// branch with no commit to name it at.
+    fn branch_title(
+        &self,
+        project: &ProjectId,
+        ref_name: Option<&FullName>,
+        branch: &Branch,
+        name: &str,
+        theme: &Theme,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        if ref_name.is_none() && branch.commits.is_empty() {
+            return title_text(name.to_owned()).into_any_element();
+        }
+        let (tip, key) = match ref_name {
+            Some(_) => ("Rename branch", shortcut(&RenameBranch, cx)),
+            None => ("Name branch", shortcut(&NameBranch, cx)),
+        };
+        let (project, ref_name) = (project.clone(), ref_name.cloned());
+        editable_title("branch-title", name.to_owned(), tip, key, theme)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                let (project, ref_name) = (project.clone(), ref_name.clone());
+                (this.app).update_later(window, cx, move |app, window, cx| {
+                    app.rename_branch_in_header(project, ref_name, window, cx)
+                });
+            }))
+            .into_any_element()
     }
 
     /// A stack's header: how many branches it has, which, and their commits.
@@ -904,54 +963,6 @@ impl Detail {
         let title = page_title(Icon::Stack, theme).child(title_text(title));
         let target = Selection::Stack(project.clone(), bottom.cloned());
         self.page_header(title, meta, target, None, None, theme, cx)
-    }
-
-    /// The box editing a commit's message, with how to save or leave it.
-    fn reword_editor(
-        &self,
-        input: &Entity<TextInput>,
-        theme: &Theme,
-        window: &Window,
-        cx: &App,
-    ) -> AnyElement {
-        let focused = input.focus_handle(cx).is_focused(window);
-        v_flex()
-            .gap(dp(8.))
-            .child(
-                field(input, focused, theme)
-                    .px(dp(10.))
-                    .py(dp(8.))
-                    .rounded(dp(6.))
-                    .line_height(dp(19.))
-                    .id("reword-box")
-                    .max_h(dp(260.))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.reword_scroll),
-            )
-            .child(
-                h_flex()
-                    .gap(dp(8.))
-                    .justify_end()
-                    .child(faint(crate::ui::keys_text("⌘↩ to save, esc to cancel"), theme).flex_1())
-                    .child({
-                        let input = input.clone();
-                        button("cancel-reword", "Cancel")
-                            .small()
-                            .on_click(move |_, _, cx| {
-                                input.update(cx, |_, cx| cx.emit(InputEvent::Cancel))
-                            })
-                    })
-                    .child({
-                        let input = input.clone();
-                        button("save-reword", "Save")
-                            .small()
-                            .style(ButtonStyle::Pop)
-                            .on_click(move |_, _, cx| {
-                                input.update(cx, |_, cx| cx.emit(InputEvent::Submit))
-                            })
-                    }),
-            )
-            .into_any_element()
     }
 
     pub(super) fn render_branch_side(
@@ -1067,6 +1078,26 @@ pub(super) fn title_text(text: impl IntoElement) -> Div {
         .text_size(dp(16.))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .child(text)
+}
+
+/// A page's title that a click starts editing in place, which `tip` and `key` say.
+pub(super) fn editable_title(
+    id: &'static str,
+    text: impl IntoElement,
+    tip: &'static str,
+    key: Option<SharedString>,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let hover = theme.hover();
+    title_text(text)
+        .id(id)
+        .role(Role::Button)
+        .aria_label(tip)
+        .mx(dp(-4.))
+        .px(dp(4.))
+        .rounded(dp(4.))
+        .hover(move |el| el.bg(hover))
+        .tooltip(Tooltip::keyed(tip, key))
 }
 
 /// The line under a page's title saying what it is.
@@ -1240,6 +1271,18 @@ pub(super) fn side_header(theme: &Theme) -> Div {
         .border_color(theme.border_3)
 }
 
+/// The bar along the bottom of a checkout's uncommitted changes, and the composer's row of
+/// buttons, so Commit opens where Commit… was and a double click commits. Its top rule takes
+/// its room in both, drawn only where given a colour.
+pub(super) fn footer_bar() -> Div {
+    h_flex()
+        .flex_none()
+        .h(dp(super::FOOTER_HEIGHT))
+        .px(dp(12.))
+        .gap(dp(8.))
+        .border_t_1()
+}
+
 /// The bar along the bottom of a checkout's uncommitted changes: what committing there does,
 /// in `label`, and the buttons that do it.
 fn footer(
@@ -1247,12 +1290,7 @@ fn footer(
     actions: impl IntoIterator<Item = impl IntoElement>,
     theme: &Theme,
 ) -> AnyElement {
-    h_flex()
-        .flex_none()
-        .h(dp(super::FOOTER_HEIGHT))
-        .px(dp(12.))
-        .gap(dp(8.))
-        .border_t_1()
+    footer_bar()
         .border_color(theme.border_3)
         .child(
             div()
@@ -1450,14 +1488,15 @@ pub(super) fn step_from<T>(items: &[T], at: Option<usize>, delta: isize) -> Opti
 }
 
 /// For `on_mouse_down_out` of a card on a list page that takes the focus with `focus`, as the
-/// People card does: a click anywhere else gives the focus back to the page's list.
+/// People card does: a click anywhere else gives the focus back to the page's list, but for the
+/// one that only brings the window in front.
 pub(super) fn back_to_list(
     focus: &FocusHandle,
     cx: &Context<Detail>,
 ) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
     let focus = focus.clone();
-    cx.listener(move |this, _, window, cx| {
-        if focus.is_focused(window) {
+    cx.listener(move |this, event, window, cx| {
+        if focus.is_focused(window) && !crate::ui::brings_window_in_front(event) {
             window.focus(&this.side_focus, cx);
         }
     })
@@ -1506,11 +1545,6 @@ impl Detail {
                     (None, None) => {}
                 }
             }))
-            .when_some(confirm, |el, confirm| {
-                el.on_action(
-                    cx.listener(move |this, _: &Confirm, window, cx| confirm(this, window, cx)),
-                )
-            })
     }
 
     /// A People card, under a list, with a focus of its own: a click in it takes the focus,
@@ -1530,7 +1564,7 @@ impl Detail {
         cx: &Context<Self>,
     ) -> AnyElement {
         let theme = Theme::get(cx);
-        let solid = self.people_focus.is_focused(window);
+        let solid = has_keys(&self.people_focus, window, cx);
         let most = people.first().map_or(1, |(.., n)| (*n).max(1));
         let keys: Vec<String> = people.iter().map(|(key, ..)| key.clone()).collect();
         // Clear shows while someone's picked, listed or not.
@@ -1809,7 +1843,7 @@ pub(super) fn overview_column(text: String, width: f32, theme: &Theme) -> Div {
     faint(text, theme).flex_none().w(dp(width)).text_right()
 }
 
-/// A row of an overview's counted list, as the files committed most or the areas landed in:
+/// A row of an overview's counted list, as the files committed most or the areas merged in:
 /// its `label`, a bar of its `n` against the `most` any has in `bar`'s box, then `n`. Picked,
 /// it's a filter on, its selection `solid` while its list has the focus.
 pub(super) fn share_row(
@@ -1964,4 +1998,41 @@ fn person_row(
                     ),
                 ),
         )
+}
+
+/// The box editing a commit's or a pull request's message, with how to save or leave it, and
+/// while `saving`, that the forge has yet to take it.
+pub(super) fn reword_editor(
+    input: &Entity<MessageEditor>,
+    saving: bool,
+    theme: &Theme,
+) -> AnyElement {
+    v_flex()
+        .gap(dp(8.))
+        .child(input.clone())
+        .child(
+            h_flex()
+                .gap(dp(8.))
+                .justify_end()
+                .child(faint(crate::ui::keys_text("⌘↩ to save, esc to cancel"), theme).flex_1())
+                .child({
+                    let input = input.clone();
+                    button("cancel-reword", "Cancel")
+                        .small()
+                        .on_click(move |_, _, cx| {
+                            input.update(cx, |_, cx| cx.emit(InputEvent::Cancel))
+                        })
+                })
+                .child({
+                    let input = input.clone();
+                    button("save-reword", if saving { "Saving…" } else { "Save" })
+                        .small()
+                        .style(ButtonStyle::Pop)
+                        .disabled_because(saving.then_some("Waiting for the forge"))
+                        .on_click(move |_, _, cx| {
+                            input.update(cx, |_, cx| cx.emit(InputEvent::Submit))
+                        })
+                }),
+        )
+        .into_any_element()
 }

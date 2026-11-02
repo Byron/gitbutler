@@ -30,7 +30,7 @@ pub fn writable_context(script_name: &str, repo_name: &str) -> Result<(Context, 
         } else {
             gix_testtools::Creation::CopyFromReadOnly
         },
-        5,
+        6,
         move |fixture| {
             if fixture.is_uninitialized() {
                 let repo = open_repo(&fixture.path().join(&repo_name_for_post))?;
@@ -44,25 +44,16 @@ pub fn writable_context(script_name: &str, repo_name: &str) -> Result<(Context, 
     Ok((Context::from_repo_for_testing(repo)?, tmp))
 }
 
-pub fn read_only_context(script_name: &str, repo_name: &str) -> Result<Context> {
-    let script_name = script_name.to_owned();
-    let repo_name = repo_name.to_owned();
-    let repo_name_for_post = repo_name.clone();
-    let script_name_for_post = script_name.clone();
+pub fn read_only_context(repo_name: &str) -> Result<Context> {
     let (root, _) =
-        gix_testtools::scripted_fixture_read_only_with_post(script_name, 5, move |fixture| {
+        gix_testtools::scripted_fixture_read_only_with_post("for-listing.sh", 6, |fixture| {
             if fixture.is_uninitialized() {
-                if script_name_for_post == "for-listing.sh" {
-                    for repo_name in [
-                        "one-vbranch-in-workspace",
-                        "one-vbranch-in-workspace-one-commit",
-                    ] {
-                        let repo = open_repo(&fixture.path().join(repo_name))?;
-                        seed_fixture(&repo, &script_name_for_post, repo_name)?;
-                    }
-                } else {
-                    let repo = open_repo(&fixture.path().join(&repo_name_for_post))?;
-                    seed_fixture(&repo, &script_name_for_post, &repo_name_for_post)?;
+                for repo_name in [
+                    "one-vbranch-in-workspace",
+                    "one-vbranch-in-workspace-one-commit",
+                ] {
+                    let repo = open_repo(&fixture.path().join(repo_name))?;
+                    seed_fixture(&repo, "for-listing.sh", repo_name)?;
                 }
             }
             Ok(())
@@ -89,11 +80,6 @@ fn seed_fixture(repo: &gix::Repository, script_name: &str, repo_name: &str) -> R
         ("for-listing.sh", "one-vbranch-in-workspace-one-commit") => vec![StackSpec {
             id: 1,
             branches_base_to_top: &["virtual"],
-            in_workspace: true,
-        }],
-        ("for-details.sh", "complex-repo") => vec![StackSpec {
-            id: 1,
-            branches_base_to_top: &["a-branch-1"],
             in_workspace: true,
         }],
         ("workspace-commit.sh", "conflicting-stacks") => vec![

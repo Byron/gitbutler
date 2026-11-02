@@ -4,7 +4,7 @@
 //! with the output on screen. Hidden, the modal keeps building.
 
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
@@ -14,7 +14,7 @@ use gpui::{
     Window, div, list, prelude::*,
 };
 
-use crate::app::{AppView, BuildAndRestart};
+use crate::app::{AppView, BuildAndRestart, BuildAndRestartFromHere};
 use crate::backend::{
     self,
     rebuild::{Build, Printed, Rebuild},
@@ -58,7 +58,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(rebuild) = self.rebuild.clone() else {
+        let Some(rebuild) = cx.try_global::<Rebuild>().cloned() else {
             return;
         };
         if self.show_running_build(window, cx) {
@@ -77,15 +77,14 @@ impl AppView {
             sources.sort_by_key(|source| source.dir != rebuild.checkout());
             this.update_in(cx, |app, window, cx| {
                 if sources.len() < 2 {
-                    let dir = rebuild.checkout().to_owned();
+                    let dir = sources
+                        .pop()
+                        .map_or_else(|| rebuild.checkout().to_owned(), |source| source.dir);
                     return app.start_build(rebuild, dir, window, cx);
                 }
                 let choices = (sources.into_iter())
                     .map(|source| {
-                        let folder = match source.dir.file_name() {
-                            Some(name) => name.to_string_lossy().into_owned(),
-                            None => source.dir.display().to_string(),
-                        };
+                        let folder = folder_name(&source.dir);
                         let detail = match source.dir == rebuild.checkout() {
                             true => format!("{folder} · running"),
                             false => folder.clone(),
@@ -102,6 +101,29 @@ impl AppView {
             .ok();
         })
         .detach();
+    }
+
+    /// Build the client again and restart on it, from the checkout the selection is in, even
+    /// with the keys in the detail or the diff.
+    pub fn build_and_restart_from_here(
+        &mut self,
+        _: &BuildAndRestartFromHere,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rebuild) = cx.try_global::<Rebuild>().cloned() else {
+            return;
+        };
+        let store = self.store.read(cx);
+        let Some(dir) = (store.selection.as_ref()).and_then(|at| store.checkout_dir(at)) else {
+            return;
+        };
+        if !rebuild.builds_in(&dir) {
+            let message = format!("{} doesn't have the client to build", folder_name(&dir));
+            self.store.update(cx, |store, cx| store.snack(message, cx));
+            return;
+        }
+        self.start_build(rebuild, dir, window, cx);
     }
 
     /// Show the build under way, if there is one. Another would wait on cargo's lock for it,
@@ -144,6 +166,14 @@ impl AppView {
         );
         self.building = Some((output.clone(), ended));
         self.open_modal(output, window, cx);
+    }
+}
+
+/// What a checkout is called here: its folder's name.
+fn folder_name(dir: &Path) -> String {
+    match dir.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => dir.display().to_string(),
     }
 }
 
@@ -304,13 +334,16 @@ impl BuildOutput {
                     .await;
             }
             // The quit handlers save what the app remembers and write out the log, as
-            // quitting would, before the new binary takes this process's place.
+            // quitting would, before the new binary takes over.
             cx.update(|cx| {
                 cx.shutdown();
-                // The Dock keeps a binary's tile, by its path, until its process quits, which
-                // this one doesn't: built in another worktree, the new binary would get a
-                // tile of its own beside it, left there for good. Out of the Dock first.
+                // The Dock shows a tile for each binary running, by its path: built in another
+                // worktree, the new binary's would show beside this one's while this one waits
+                // for it to take the terminals over. Out of the Dock first.
                 cx.set_activation_policy(gpui::ActivationPolicy::Accessory);
+                #[cfg(unix)]
+                let err = built.restart(store.update(cx, |store, cx| store.hand_off_terminals(cx)));
+                #[cfg(not(unix))]
                 let err = built.restart();
                 tracing::error!("couldn't restart on the new build: {err:#}");
                 cx.quit();
@@ -404,10 +437,7 @@ impl Render for BuildOutput {
             State::Failed => ("Build failed".to_owned(), theme.danger),
             State::Cancelled => ("Build cancelled".to_owned(), theme.text_2),
         };
-        let folder = match self.dir.file_name() {
-            Some(name) => name.to_string_lossy().into_owned(),
-            None => self.dir.display().to_string(),
-        };
+        let folder = folder_name(&self.dir);
         let header = v_flex()
             .flex_none()
             .px(dp(20.))

@@ -1,26 +1,11 @@
 use std::str::FromStr;
 
 use anyhow::{Context as _, Result};
-use bstr::ByteSlice;
 use but_api_macros::but_api;
 use but_core::RepositoryExt;
 use but_ctx::{Context, ThreadSafeContext};
-use but_rebase::{
-    RebaseOutput,
-    graph_rebase::{
-        Editor, LookupStep as _,
-        mutate::{InsertSide, RelativeToRef},
-    },
-};
-use but_workspace::commit_engine;
 use gitbutler_commit::commit_ext::CommitExt;
-use gitbutler_oplog::{
-    OplogExt, SnapshotExt,
-    entry::{OperationKind, SnapshotDetails},
-};
 use tracing::instrument;
-
-use crate::commit::json::ChangesSource;
 
 #[but_api(try_from = but_workspace::ui::RefInfo)]
 #[instrument(err(Debug))]
@@ -70,21 +55,6 @@ pub fn head_info(ctx: &but_ctx::Context) -> Result<but_workspace::RefInfo> {
     )?);
 
     Ok(info)
-}
-
-#[cfg(unix)]
-#[but_api]
-#[instrument(err(Debug))]
-pub fn show_graph_svg(ctx: &Context) -> Result<()> {
-    let mut options = but_graph::init::Options::limited();
-    options.collect_tags = true;
-    options.worktrees = true;
-    let repo = ctx.open_isolated_repo()?;
-    let meta = ctx.meta()?;
-    let mut db = ctx.db.get_cache_mut()?;
-    let graph = but_graph::Graph::from_head(&repo, &meta, ctx.project_meta()?, &mut db, options)?;
-    graph.open_as_svg();
-    Ok(())
 }
 
 fn update_push_status(branch: &mut but_workspace::ui::BranchDetails) {
@@ -210,138 +180,6 @@ pub fn branch_details(
         update_push_status(&mut details);
     }
     Ok(details)
-}
-
-/// Discard all worktree changes that match the specs in `worktree_changes`.
-///
-/// If whole files should be discarded, be sure to not pass any hunks
-///
-/// `changes_source` selects the checkout to discard in. A linked worktree has to be active, see
-/// `worktrees::open_changes_source()`, and is not snapshotted as the oplog can't restore it.
-///
-/// Returns the `worktree_changes` that couldn't be applied,
-#[but_api]
-#[instrument(err(Debug))]
-pub fn discard_worktree_changes(
-    ctx: &mut but_ctx::Context,
-    changes_source: ChangesSource,
-    worktree_changes: Vec<but_core::DiffSpec>,
-) -> Result<Vec<but_core::DiffSpec>> {
-    let mut guard = ctx.exclusive_worktree_access();
-
-    let context_lines = ctx.settings.context_lines;
-    let refused = match crate::worktrees::open_changes_source(ctx, &changes_source)? {
-        Some((_name, wt_repo)) => {
-            but_workspace::discard_workspace_changes(&wt_repo, worktree_changes, context_lines)?
-        }
-        None => {
-            let _ = ctx.create_snapshot(
-                SnapshotDetails::new(OperationKind::DiscardChanges),
-                guard.write_permission(),
-            );
-            but_workspace::discard_workspace_changes(
-                &*ctx.repo.get()?,
-                worktree_changes,
-                context_lines,
-            )?
-        }
-    };
-    if !refused.is_empty() {
-        tracing::warn!(?refused, "Failed to discard at least one hunk");
-    }
-    Ok(refused)
-}
-
-/// This API allows the user to quickly "stash" a bunch of uncommitted changes - getting them out of the worktree.
-/// Unlike the regular stash, the user specifies a new branch where those changes will be 'saved'/committed.
-/// Immediately after the changes are committed, the branch is unapplied from the workspace, and the "stash" branch can be re-applied at a later time
-/// In theory it should be possible to specify an existing "dumping" branch for this, but currently this endpoint expects a new branch.
-#[but_api(commit_engine::ui::CreateCommitOutcome)]
-#[instrument(err(Debug))]
-pub fn stash_into_branch(
-    ctx: &mut Context,
-    branch_name: String,
-    worktree_changes: Vec<but_core::DiffSpec>,
-) -> Result<commit_engine::CreateCommitOutcome> {
-    let mut guard = ctx.exclusive_worktree_access();
-    let perm = guard.write_permission();
-
-    let _ = ctx.snapshot_stash_into_branch(branch_name.clone(), perm);
-
-    let full_ref_name = gix::refs::Category::LocalBranch
-        .to_full_name(but_core::branch::normalize_short_name(branch_name.as_str())?.as_bstr())?;
-    crate::branch::branch_create_with_perm(
-        ctx,
-        Some(full_ref_name.clone()),
-        crate::branch::json::BranchCreatePlacement::Independent { order: None },
-        perm,
-    )?;
-    let stack_id = {
-        let (_, ws, _) = ctx.workspace_mut_and_db_mut_with_perm(perm)?;
-        ws.find_segment_and_stack_by_refname(full_ref_name.as_ref())
-            .and_then(|(stack, _)| stack.id)
-            .context("created stash branch is missing its stack id")?
-    };
-
-    ctx.reload_repo_and_invalidate_workspace(perm)?;
-
-    let outcome = {
-        let context_lines = ctx.settings.context_lines;
-        let mut meta = ctx.meta()?;
-        let (repo, mut ws, mut db) = ctx.workspace_mut_and_db_mut_with_perm(perm)?;
-        let editor = Editor::create(&mut ws, &mut meta, &repo, &mut db)?;
-        let but_workspace::commit::CommitCreateOutcome {
-            rebase,
-            commit_selector,
-            rejected_specs,
-        } = but_workspace::commit::commit_create(
-            editor,
-            worktree_changes,
-            RelativeToRef::Reference(full_ref_name.as_ref()),
-            InsertSide::Below,
-            "Mo-Stashed changes",
-            context_lines,
-            but_workspace::commit::ChangeSource::Head,
-        )?;
-
-        let new_commit = commit_selector
-            .map(|selector| rebase.lookup_pick(selector))
-            .transpose()?;
-        let rebase_output = if let Some(new_commit) = new_commit {
-            let materialized = rebase.materialize(Default::default())?;
-            let commit_mapping: Vec<_> = materialized
-                .history
-                .commit_mappings()
-                .into_iter()
-                .map(|(old, new)| (None, old, new))
-                .collect();
-            (!commit_mapping.is_empty()).then_some(RebaseOutput {
-                top_commit: new_commit,
-                references: Vec::new(),
-                commit_mapping,
-            })
-        } else {
-            None
-        };
-
-        Ok(commit_engine::CreateCommitOutcome {
-            rejected_specs,
-            new_commit,
-            changed_tree_pre_cherry_pick: None,
-            references: Vec::new(),
-            rebase_output,
-            index: None,
-        })
-    };
-
-    ctx.reload_repo_and_invalidate_workspace(perm)?;
-
-    gitbutler_branch_actions::update_workspace_commit_with_perm(ctx, false, perm)
-        .context("failed to update gitbutler workspace")?;
-
-    super::virtual_branches::unapply_stack_with_perm(ctx, stack_id, perm)?;
-
-    outcome
 }
 
 /// Push a branch and any parent references that lie within the current workspace projection.
