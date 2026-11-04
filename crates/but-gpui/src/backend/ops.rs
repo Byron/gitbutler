@@ -1,11 +1,11 @@
 //! Mutations of commits, branches and uncommitted changes; the UI reloads the workspace
 //! afterwards. An [`Intent`], such as [`Squash`], runs under the one lock [`Run::locked`] takes,
-//! in one `but_transaction` transaction, one `_with_perm` call, or work wrapped in [`recorded`],
-//! recording one oplog entry. [`DiscardChanges`] records its own before it writes, as does
+//! in one `but_transaction` transaction or one `_with_perm` call, recording one oplog entry. One
+//! that makes or moves a branch runs as the CLI's do outside the workspace
+//! ([`SingleBranchMode`]). [`DiscardChanges`] records its own before it writes, as does
 //! [`super::conflicts::ResolveMarkers`].
 
 use gitbutler_repo::hooks::{ErrorData, HookResult, MessageHookResult};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -14,9 +14,11 @@ use bstr::{BStr, ByteSlice as _};
 use but_api::commit::json::ChangesSource;
 use but_core::commit::CommitIdentifiers;
 use but_core::tree::create_tree::RejectionReason;
-use but_core::{DiffSpec, DryRun};
+use but_core::{DiffSpec, DryRun, RefMetadata};
 use but_oplog::legacy::{OperationKind, SnapshotDetails, Trailer};
 use but_rebase::graph_rebase::mutate::{InsertSide, RelativeTo};
+use but_transaction::single_branch_mode::SingleBranchMode;
+use but_transaction::{DynamicOutcome, Transaction};
 use but_workspace::commit::ChangeSource;
 
 use super::intent::Run;
@@ -118,29 +120,6 @@ fn refuse_changed(repo: &gix::Repository, selected: &[Selected], whole: bool) ->
         );
     }
     Ok(())
-}
-
-/// Record the project as it is in one oplog entry naming `refs`, once `work` succeeded. One
-/// that can't be recorded only logs: the work stands, without its undo step.
-fn recorded<T>(
-    ctx: &mut but_ctx::Context,
-    perm: &mut but_ctx::access::RepoExclusive,
-    details: SnapshotDetails,
-    refs: &[&gix::refs::FullNameRef],
-    work: impl FnOnce(&mut but_ctx::Context, &mut but_ctx::access::RepoExclusive) -> Result<T>,
-) -> Result<T> {
-    let snapshot = but_oplog::UnmaterializedOplogSnapshot::from_details_with_refs_and_perm(
-        ctx,
-        details,
-        refs,
-        perm.read_permission(),
-        DryRun::No,
-    );
-    let value = work(ctx, perm)?;
-    if let Some(Err(err)) = snapshot.map(|snapshot| snapshot.commit(ctx, perm)) {
-        tracing::warn!(?err, "couldn't record the operation for undo");
-    }
-    Ok(value)
 }
 
 /// Where changes are read from: the main checkout, or the linked `worktree`.
@@ -327,6 +306,7 @@ fn commit_first(
     branch: FullName,
     changes: Vec<DiffSpec>,
     message: String,
+    leave_out: bool,
 ) -> Result<(FullName, Made, Rejected)> {
     use gix::prelude::ObjectIdExt as _;
     let repo = ctx.repo.get()?;
@@ -347,11 +327,9 @@ fn commit_first(
         changes,
         ctx.settings.context_lines,
     )?;
-    let Some(id) = outcome.new_commit else {
-        bail!(
-            "Nothing could be committed.\n{}",
-            left_out(&outcome.rejected_specs).join("\n")
-        );
+    let id = match outcome.new_commit {
+        Some(id) if leave_out || outcome.rejected_specs.is_empty() => id,
+        made => return Err(refused(outcome.rejected_specs, made.is_some())),
     };
     but_workspace::init::publish_first_commit(&repo, branch.as_ref(), id)?;
     let made = Made {
@@ -365,12 +343,22 @@ fn commit_first(
     Ok((branch, made, outcome.rejected_specs))
 }
 
-/// The branch a commit goes on.
+/// The branch a commit goes on, and where in it.
+#[derive(Debug, Clone)]
 pub enum CommitTo {
+    /// On top of it.
     Branch(FullName),
-    /// A new one with a made-up name, placed as [`CreateBranch`] places it, and made in the
-    /// commit's own oplog entry, so one undo takes back both.
-    NewBranch,
+    /// Right below `commit`, in `branch`, which has it.
+    BelowCommit { commit: CommitId, branch: FullName },
+    /// A new one named `name`, or with a made-up name, made in the commit's own oplog entry, so
+    /// one undo takes back both, and placed as [`MoveToNewBranch`] places one: `beside` a branch
+    /// in its stack, below it with the flag, or with `None` in a stack of its own, before the
+    /// others with `first`.
+    NewBranchAt {
+        beside: Option<(FullName, bool)>,
+        first: bool,
+        name: Option<String>,
+    },
 }
 
 /// Commit the `changes` of `checkout` to `to`. With `run_hooks`, the repository's hooks run in
@@ -378,12 +366,325 @@ pub enum CommitTo {
 /// commit-msg can also rewrite the message. post-commit runs once the commit is made, which
 /// stands even if the hook fails. Hooks run outside GitButler's lock, so one that runs `but`
 /// doesn't wait on it.
+///
+/// A change it can't take, as one building on another branch's commits, leaves the commit
+/// unmade, [`CommitOutcome::Blocked`] saying why, unless `leave_out`, as the user agreed to
+/// commit without such changes.
+///
+/// With `restack`, its branch is stacked first, in the same oplog entry, as [`Blocked::stack`]
+/// offers: only for a commit on top of that branch or a new branch beside one, and only if that
+/// stacks cleanly still.
+#[derive(Clone)]
 pub struct CommitChanges {
     pub to: CommitTo,
     pub changes: Arc<[Selected]>,
     pub checkout: Checkout,
     pub message: String,
     pub run_hooks: bool,
+    pub leave_out: bool,
+    pub restack: Option<Stacking>,
+}
+
+pub use but_hunk_dependency::rejection::Stacking;
+
+/// How a commit went.
+#[derive(Debug)]
+pub enum CommitOutcome {
+    Committed(Committed),
+    /// Not made, as some of its changes couldn't go where it was asked to.
+    Blocked(Blocked),
+}
+
+/// A commit not made as some of its changes couldn't go where it was asked to: those, and
+/// where they could all go instead.
+#[derive(Debug)]
+pub struct Blocked {
+    pub changes: Vec<BlockedChange>,
+    /// The branch every one of them builds on, the topmost of those in their one stack, so
+    /// that committing to it, or to a new branch on it, takes them all.
+    pub builds_on: Option<FullName>,
+    /// Whether `builds_on` has been merged, so it takes no commits: only a new branch above it
+    /// can take them.
+    pub builds_on_merged: bool,
+    /// Whether the commit would still take some of what was asked, without them.
+    pub takes_others: bool,
+    /// Where they build on two stacks: stacking one on the other, after which a new branch
+    /// above it takes them all, tried and found to conflict nothing.
+    pub stack: Option<Stacking>,
+}
+
+/// A file's change a commit couldn't take: its hunks that build on other commits, the
+/// branches those are in, or why else not.
+#[derive(Debug)]
+pub struct BlockedChange {
+    pub path: String,
+    /// Its hunks that build on commits in the workspace, where those could be told.
+    pub hunks: Vec<BlockedHunk>,
+    /// Branches whose commits change the file too, when no hunk could be told to build on one.
+    pub suspects: Vec<FullName>,
+    /// Every branch it builds on, those of `hunks` and `suspects`.
+    pub builds_on: Vec<FullName>,
+    pub why: &'static str,
+}
+
+/// How many of the files a [`Blocked`] commit left out the dialog draws the hunks of. It counts
+/// the rest, as an agent's move of a folder can leave thousands out.
+pub const BLOCKED_FILES_SHOWN: usize = 20;
+/// How many of each of those files' hunks it draws.
+pub const BLOCKED_HUNKS_SHOWN: usize = 4;
+
+/// A hunk that builds on commits in the workspace: where it is, what it changes, and on what.
+#[derive(Debug)]
+pub struct BlockedHunk {
+    /// Where it was in the file before, as a range of lines; empty where it only adds.
+    pub old_start: u32,
+    pub old_lines: u32,
+    /// Where it is in the file as it is now, as a range of lines; empty where it only removes.
+    pub new_start: u32,
+    pub new_lines: u32,
+    /// Its lines as the diff shows them: numbered, highlighted and with the changed words
+    /// marked. Empty past the hunks the dialog draws, [`BLOCKED_HUNKS_SHOWN`] of the first
+    /// [`BLOCKED_FILES_SHOWN`] files, as reading them all could take long for thousands.
+    pub lines: Vec<super::DiffLine>,
+    pub builds_on: Vec<BuiltOn>,
+}
+
+/// A commit a hunk builds on.
+#[derive(Debug)]
+pub struct BuiltOn {
+    /// What it's shown by: see [`super::short_reference`].
+    pub reference: String,
+    pub title: String,
+    /// The branch that has it, if it could be told.
+    pub branch: Option<FullName>,
+}
+
+/// What a commit couldn't take of a file, as `change` explains it, reading the titles of the
+/// commits it builds on from `repo`, and the lines of its hunks if it's `shown`.
+fn blocked_change(
+    repo: &gix::Repository,
+    change: &but_hunk_dependency::rejection::RejectedChange,
+    shown: bool,
+) -> BlockedChange {
+    let mut builds_on: Vec<FullName> = Vec::new();
+    for name in change.branches().flatten() {
+        if !builds_on.iter().any(|known| known.as_ref() == name) {
+            builds_on.push(name.to_owned());
+        }
+    }
+    let hunks = (change.dependencies.iter().enumerate())
+        .map(|(ix, dependency)| {
+            let header = &dependency.hunk;
+            let lines = match shown && ix < BLOCKED_HUNKS_SHOWN {
+                true => {
+                    let mut hunk = super::diff::parse_hunk(&but_core::unified_diff::DiffHunk {
+                        old_start: header.old_start,
+                        old_lines: header.old_lines,
+                        new_start: header.new_start,
+                        new_lines: header.new_lines,
+                        diff: dependency.diff.clone(),
+                    });
+                    super::annotate::emphasize(&mut hunk);
+                    let path = change.path.to_str_lossy();
+                    super::diff::highlight_lines(&path, hunk.lines.iter_mut());
+                    hunk.lines
+                }
+                false => Vec::new(),
+            };
+            let builds_on = (dependency.commits.iter())
+                .map(|commit| BuiltOn {
+                    reference: super::short_reference(repo, CommitId(commit.commit_id)),
+                    title: commit_title(repo, commit.commit_id),
+                    branch: commit.branch.clone(),
+                })
+                .collect();
+            BlockedHunk {
+                old_start: header.old_start,
+                old_lines: header.old_lines,
+                new_start: header.new_start,
+                new_lines: header.new_lines,
+                lines,
+                builds_on,
+            }
+        })
+        .collect();
+    BlockedChange {
+        path: change.path.to_string(),
+        hunks,
+        suspects: change.suspected_branches.clone(),
+        builds_on,
+        why: why(&change.reason),
+    }
+}
+
+/// The title of commit `id`, or nothing if it can't be read.
+fn commit_title(repo: &gix::Repository, id: gix::ObjectId) -> String {
+    let message = (repo.find_commit(id).ok()).and_then(|commit| {
+        let message = commit.message_raw().ok()?;
+        Some(message.to_str_lossy().into_owned())
+    });
+    message.map_or_else(String::new, |message| super::subject_and_body(&message).0)
+}
+
+/// Changes a commit couldn't take, which roll it back unless the user agreed to leave them
+/// out, and whether it would have taken the rest.
+#[derive(Debug)]
+struct Refused {
+    rejected: Rejected,
+    takes_others: bool,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Nothing was committed.\n{}",
+            left_out(&self.rejected).join("\n")
+        )
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The commit refused for `rejected`, or, if nothing was rejected, for taking nothing.
+fn refused(rejected: Rejected, takes_others: bool) -> anyhow::Error {
+    match rejected.is_empty() {
+        true => anyhow::anyhow!("Nothing could be committed."),
+        false => anyhow::Error::new(Refused {
+            rejected,
+            takes_others,
+        }),
+    }
+}
+
+/// What a commit to `into` (`None` for a new branch) that was rolled back for `refused` left
+/// out, and which branch it could all go on instead. That's read only with `explain`, for the
+/// main checkout, whose changes the workspace's commits are what they build on.
+fn blocked(
+    ctx: &mut but_ctx::Context,
+    perm: &mut but_ctx::access::RepoExclusive,
+    Refused {
+        rejected,
+        takes_others,
+    }: Refused,
+    into: Option<&FullName>,
+    explain: bool,
+    specs: &[DiffSpec],
+) -> Blocked {
+    use but_hunk_dependency::rejection::{dependency_branch, explain_rejections, stackings};
+    // The transaction rolled back, so the workspace is as the dependencies are read against.
+    let explained = explain.then(|| -> Result<_> {
+        ctx.invalidate_workspace_cache()?;
+        let merged = merged_branches(&but_api::legacy::workspace::head_info(ctx)?);
+        let (repo, ws, _db) = ctx.workspace_and_db_with_perm(perm.read_permission())?;
+        let changes = explain_rejections(&repo, &ws, &rejected, into.map(|name| name.as_ref()));
+        let builds_on = dependency_branch(&ws, &changes);
+        let stackings = stackings(&ws, &changes, &merged);
+        let merged = (builds_on.as_ref()).is_some_and(|branch| merged.contains(branch));
+        let changes: Vec<_> = (changes.iter().enumerate())
+            .map(|(ix, change)| blocked_change(&repo, change, ix < BLOCKED_FILES_SHOWN))
+            .collect();
+        Ok((changes, (builds_on, merged), stackings))
+    });
+    let explained = match explained.transpose() {
+        Ok(explained) => explained,
+        // Saying why it failed must never hide that it did.
+        Err(err) => {
+            tracing::warn!(?err, "couldn't read what the changes left out build on");
+            None
+        }
+    };
+    let (changes, (builds_on, builds_on_merged), stackings) = explained.unwrap_or_else(|| {
+        let changes = (rejected.iter())
+            .map(|(reason, spec)| BlockedChange {
+                path: spec.path.to_string(),
+                hunks: Vec::new(),
+                suspects: Vec::new(),
+                builds_on: Vec::new(),
+                why: why(reason),
+            })
+            .collect();
+        (changes, (None, false), Vec::new())
+    });
+    // The first that works, as each is tried in full.
+    let stack = (stackings.into_iter()).find(|stacking| {
+        stacks_cleanly(ctx, perm, stacking, specs.to_vec()).unwrap_or_else(|err| {
+            tracing::warn!(
+                ?err,
+                "couldn't try stacking the branches the changes build on"
+            );
+            false
+        })
+    });
+    Blocked {
+        changes,
+        builds_on,
+        builds_on_merged,
+        takes_others,
+        stack,
+    }
+}
+
+/// The branches of the workspace that have been merged, as the app shows them: a commit of
+/// theirs is in the target, by its id or, after a squash or rebase merge, by its changes.
+fn merged_branches(info: &but_workspace::RefInfo) -> Vec<FullName> {
+    (info.lanes())
+        .flat_map(|lane| lane.segments)
+        .filter(|segment| {
+            (segment.commits.iter()).any(|commit| {
+                matches!(
+                    commit.relation,
+                    but_workspace::ref_info::LocalCommitRelation::Integrated(_)
+                )
+            })
+        })
+        .filter_map(|segment| segment.ref_name().map(ToOwned::to_owned))
+        .collect()
+}
+
+/// Whether stacking as `stacking` says, then committing `specs` of the main checkout on top of
+/// the branch stacked, takes them all and leaves no commit conflicted that wasn't. Tried in a
+/// dry run, which changes nothing.
+fn stacks_cleanly(
+    ctx: &mut but_ctx::Context,
+    perm: &mut but_ctx::access::RepoExclusive,
+    stacking: &Stacking,
+    specs: Vec<DiffSpec>,
+) -> Result<bool> {
+    use but_transaction::DynamicOutcome;
+    let before = but_api::legacy::workspace::head_info(ctx)?;
+    let mut meta = ctx.meta()?;
+    let (_, outcome) = but_transaction::with_transaction_with_perm_only(
+        ctx,
+        &mut meta,
+        perm,
+        DryRun::Yes,
+        |mut tx| {
+            stack_in(&mut tx, Some(stacking))?;
+            let on_top = RelativeTo::Reference(stacking.top.clone());
+            let made = tx.create_commit(
+                on_top,
+                InsertSide::Below,
+                specs,
+                String::new(),
+                ChangeSource::Head,
+            )?;
+            Ok(
+                match made.new_commit.filter(|_| made.rejected_specs.is_empty()) {
+                    Some(_) => DynamicOutcome::Commit(()),
+                    None => DynamicOutcome::Rollback(()),
+                },
+            )
+        },
+    )?;
+    // What the dry run read of the workspace isn't what's there.
+    ctx.invalidate_workspace_cache()?;
+    Ok(match outcome {
+        DynamicOutcome::Commit(((), workspace)) => {
+            super::upstream::newly_conflicted(&before, &workspace.conflicted_commits).is_empty()
+        }
+        DynamicOutcome::Rollback(()) => false,
+    })
 }
 
 /// A commit made on `branch`, with the changes left out of it and what a failing post-commit
@@ -415,18 +716,37 @@ impl From<CommitIdentifiers> for Made {
 type Rejected = Vec<(RejectionReason, DiffSpec)>;
 
 impl Intent for CommitChanges {
-    type Done = Committed;
+    type Done = CommitOutcome;
 
-    fn apply(self, run: &mut Run) -> Result<Committed> {
+    fn apply(self, run: &mut Run) -> Result<CommitOutcome> {
         let Self {
             to,
             changes,
             checkout,
             message,
             run_hooks,
+            leave_out,
+            restack,
         } = self;
         let worktree = checkout.linked();
-        if matches!(to, CommitTo::NewBranch) && worktree.is_some() {
+        if let Some(stacking) = &restack {
+            let goes_on_it = match &to {
+                CommitTo::NewBranchAt {
+                    beside: Some((branch, below)),
+                    ..
+                } => !below && *branch == stacking.top,
+                CommitTo::Branch(branch) => *branch == stacking.top,
+                CommitTo::BelowCommit { .. } | CommitTo::NewBranchAt { beside: None, .. } => false,
+            };
+            if worktree.is_some() || !goes_on_it {
+                bail!(
+                    "Only {} or a new branch in the workspace goes on branches stacked for it",
+                    short_ref(&stacking.top)
+                );
+            }
+        }
+        // A new branch goes where the main checkout's would, unless it's placed beside one.
+        if matches!(to, CommitTo::NewBranchAt { beside: None, .. }) && worktree.is_some() {
             bail!("The worktree has no branch of its own checked out");
         }
         // The hooks run in the main checkout, not where a linked worktree's changes are.
@@ -442,62 +762,209 @@ impl Intent for CommitChanges {
             true => hooks_before_commit(ctx, &specs, message)?,
             false => message,
         };
-        let (branch, made, rejected) = run.locked(|ctx, perm| {
-            let unborn = ctx.repo.get()?.head()?.is_unborn();
-            let (branch, new_at) = match to {
-                CommitTo::Branch(branch) if unborn => {
-                    return commit_first(ctx, branch, specs, message);
-                }
-                CommitTo::Branch(branch) => (branch, None),
-                CommitTo::NewBranch => {
-                    refuse_unborn(ctx)?;
-                    let name = but_core::branch::unique_canned_refname(&*ctx.repo.get()?)?;
-                    (name, Some(new_branch_at(ctx)?))
-                }
-            };
-            let linked = (worktree.map(|name| super::checkout(ctx, Some(name)))).transpose()?;
-            let source = match (worktree, &linked) {
-                (Some(name), Some(repo)) => ChangeSource::Worktree { repo, name },
-                _ => ChangeSource::Head,
-            };
-            // Named so undo moves it back, leaving the changes uncommitted there.
-            let worktree_branch = match worktree {
-                Some(name) => ctx.worktree_head(name)?.and_then(|head| head.ref_name),
-                None => None,
-            };
-            // Named so undo deletes it again.
-            let new_branch = new_at.as_ref().map(|_| branch.as_ref());
-            let refs: Vec<&gix::refs::FullNameRef> = (new_branch.into_iter())
-                .chain(worktree_branch.as_ref().map(|name| name.as_ref()))
-                .collect();
-            let details = SnapshotDetails::new(OperationKind::CreateCommit);
-            let (made, rejected) = recorded(ctx, perm, details, &refs, |ctx, perm| {
-                if let Some(NewBranchAt::BesideHead(head)) = &new_at {
-                    start_beside(ctx, perm, branch.as_ref(), head)?;
-                }
-                let made = commit_in_transaction(
+        // The branch it goes on already, which nothing left out builds on.
+        let into = match &to {
+            CommitTo::Branch(branch) | CommitTo::BelowCommit { branch, .. } => Some(branch.clone()),
+            CommitTo::NewBranchAt { .. } => None,
+        };
+        let outcome = run.locked(|ctx, perm| {
+            // What it was tried with when it was offered may have changed since, as by an agent.
+            if let Some(stacking) = &restack
+                && !stacks_cleanly(ctx, perm, stacking, specs.clone())?
+            {
+                let moved: Vec<_> = stacking.branches.iter().map(short_ref).collect();
+                bail!(
+                    "Stacking {} on {} wouldn't take these changes cleanly any more, so nothing \
+                     was changed",
+                    moved.join(", "),
+                    short_ref(&stacking.onto)
+                );
+            }
+            let tried = specs.clone();
+            let made = commit_locked(ctx, perm, to, specs, message, worktree, leave_out, restack);
+            match made.map_err(|err| err.downcast::<Refused>()) {
+                Ok(made) => Ok(Ok(made)),
+                Err(Ok(refused)) => Ok(Err(blocked(
                     ctx,
                     perm,
-                    &branch,
-                    new_at.as_ref(),
-                    specs,
-                    message,
-                    source,
-                );
-                if made.is_err() && matches!(new_at, Some(NewBranchAt::BesideHead(_))) {
-                    leave_beside(ctx, perm, &branch);
-                }
-                made
-            })?;
-            Ok((branch, made, rejected))
+                    refused,
+                    into.as_ref(),
+                    worktree.is_none(),
+                    &tried,
+                ))),
+                Err(Err(err)) => Err(err),
+            }
         })?;
+        let (branch, made, rejected) = match outcome {
+            Ok(made) => made,
+            Err(blocked) => return Ok(CommitOutcome::Blocked(blocked)),
+        };
         let hook_failed = run_hooks.then(|| post_commit(run.ctx())).flatten();
-        Ok(Committed {
+        Ok(CommitOutcome::Committed(Committed {
             branch,
             made,
             left_out: left_out(&rejected),
             hook_failed,
-        })
+        }))
+    }
+}
+
+/// Commit `specs` of the main checkout, or of the linked `worktree`, to `to`, under the lock,
+/// in one oplog entry, stacking first as `restack` says. Changes it can't take refuse it with
+/// [`Refused`], unless `leave_out`.
+#[expect(clippy::too_many_arguments)]
+fn commit_locked(
+    ctx: &mut but_ctx::Context,
+    perm: &mut but_ctx::access::RepoExclusive,
+    to: CommitTo,
+    specs: Vec<DiffSpec>,
+    message: String,
+    worktree: Option<&BStr>,
+    leave_out: bool,
+    restack: Option<Stacking>,
+) -> Result<(FullName, Made, Rejected)> {
+    let unborn = ctx.repo.get()?.head()?.is_unborn();
+    // A new branch, beside one or with `None` of its own, and with `true` first.
+    let (branch, new_at, below) = match to {
+        CommitTo::Branch(branch) if unborn => {
+            return commit_first(ctx, branch, specs, message, leave_out);
+        }
+        CommitTo::Branch(branch) => (branch, None, None),
+        CommitTo::BelowCommit { commit, branch } => (branch, None, Some(commit)),
+        CommitTo::NewBranchAt {
+            beside,
+            first,
+            name,
+        } => {
+            refuse_unborn(ctx)?;
+            let name = match name {
+                Some(name) => branch_ref(&name)?,
+                None => but_core::branch::unique_canned_refname(&*ctx.repo.get()?)?,
+            };
+            (name, Some((beside, first)), None)
+        }
+    };
+    let linked = (worktree.map(|name| super::checkout(ctx, Some(name)))).transpose()?;
+    let source = match (worktree, &linked) {
+        (Some(name), Some(repo)) => ChangeSource::Worktree { repo, name },
+        _ => ChangeSource::Head,
+    };
+    // Named so undo moves it back, leaving the changes uncommitted there.
+    let worktree_branch = match worktree {
+        Some(name) => ctx.worktree_head(name)?.and_then(|head| head.ref_name),
+        None => None,
+    };
+    // Named so undo deletes it again.
+    let new_branch = new_at.as_ref().map(|_| branch.as_ref());
+    let refs: Vec<&gix::refs::FullNameRef> = (new_branch.into_iter())
+        .chain(worktree_branch.as_ref().map(|name| name.as_ref()))
+        .collect();
+    let details = SnapshotDetails::new(OperationKind::CreateCommit);
+    let mut meta = ctx.meta()?;
+    let at = (&branch, below);
+    let outcome = match new_at {
+        // A branch made for it runs as `but commit` makes one.
+        Some((beside, first)) => {
+            let sbm = SingleBranchMode::new(ctx, perm.read_permission(), false)?;
+            let independent = beside.is_none();
+            sbm.transaction_with_workspace_setup(
+                ctx,
+                &mut meta,
+                details,
+                &refs,
+                perm,
+                independent,
+                |mut tx| {
+                    stack_in(&mut tx, restack.as_ref())?;
+                    match &beside {
+                        Some((beside, below)) => sbm.create_stacked_reference(
+                            &mut tx,
+                            branch.as_ref(),
+                            beside.as_ref(),
+                            position(*below),
+                        )?,
+                        // A stack's place is its tip's among the workspace commit's
+                        // parents.
+                        None => sbm.create_unstacked_reference(
+                            &mut tx,
+                            branch.as_ref(),
+                            first.then_some(0),
+                        )?,
+                    }
+                    commit_in(&mut tx, at, specs, message, source, leave_out)
+                },
+            )?
+        }
+        None => but_transaction::with_transaction_with_perm(
+            ctx,
+            &mut meta,
+            perm,
+            details,
+            &refs,
+            DryRun::No,
+            |mut tx| {
+                stack_in(&mut tx, restack.as_ref())?;
+                commit_in(&mut tx, at, specs, message, source, leave_out)
+            },
+        )?,
+    };
+    match outcome {
+        DynamicOutcome::Commit(((made, rejected), _workspace)) => {
+            Ok((branch.clone(), made, rejected))
+        }
+        DynamicOutcome::Rollback((rejected, takes_others)) => Err(refused(rejected, takes_others)),
+    }
+}
+
+/// Stack in `tx` as `restack` says, if it's given, before a commit goes on the branch on top:
+/// each branch moved directly above the one before it, the first above its `onto`.
+fn stack_in<M: RefMetadata>(
+    tx: &mut Transaction<'_, '_, M>,
+    restack: Option<&Stacking>,
+) -> Result<()> {
+    let Some(stacking) = restack else {
+        return Ok(());
+    };
+    let mut below = &stacking.onto;
+    for branch in &stacking.branches {
+        let onto = RelativeTo::Reference(below.clone());
+        tx.move_branch(branch.as_ref(), onto, InsertSide::Above)?;
+        below = branch;
+    }
+    Ok(())
+}
+
+/// Commit `specs` in `tx` on top of `branch`, or right below its commit `below`. Changes it
+/// can't take roll it back, leaving no branch made for it behind, unless `leave_out`; the
+/// rollback says whether it would have taken the rest.
+fn commit_in<M: RefMetadata>(
+    tx: &mut Transaction<'_, '_, M>,
+    (branch, below): (&FullName, Option<CommitId>),
+    specs: Vec<DiffSpec>,
+    message: String,
+    source: ChangeSource<'_>,
+    leave_out: bool,
+) -> Result<DynamicOutcome<(Made, Rejected), (Rejected, bool)>> {
+    let relative_to = match below {
+        Some(commit) => RelativeTo::Commit(commit.0),
+        None => RelativeTo::Reference(branch.clone()),
+    };
+    let made = tx.create_commit(relative_to, InsertSide::Below, specs, message, source)?;
+    let rejected = made.rejected_specs;
+    Ok(match made.new_commit {
+        Some(commit) if leave_out || rejected.is_empty() => {
+            DynamicOutcome::Commit((Made::from(commit), rejected))
+        }
+        commit => DynamicOutcome::Rollback((rejected, commit.is_some())),
+    })
+}
+
+/// Where `below` puts a new branch beside another: right below it, or else right above.
+fn position(below: bool) -> but_workspace::branch::create_reference::Position {
+    use but_workspace::branch::create_reference::Position;
+    match below {
+        true => Position::Below,
+        false => Position::Above,
     }
 }
 
@@ -523,65 +990,10 @@ fn hooks_before_commit(
     }
 }
 
-/// Commit `specs` on top of `branch`, making it first where `new_at` says. A commit that takes
-/// none of them rolls back, leaving no branch made for it behind.
-fn commit_in_transaction(
-    ctx: &mut but_ctx::Context,
-    perm: &mut but_ctx::access::RepoExclusive,
-    branch: &FullName,
-    new_at: Option<&NewBranchAt>,
-    specs: Vec<DiffSpec>,
-    message: String,
-    source: ChangeSource<'_>,
-) -> Result<(Made, Rejected)> {
-    use but_transaction::DynamicOutcome;
-    use but_workspace::branch::create_reference::{Anchor, Position};
-    let mut meta = ctx.meta()?;
-    let (_, outcome) = but_transaction::with_transaction_with_perm_only(
-        ctx,
-        &mut meta,
-        perm,
-        DryRun::No,
-        |mut tx| {
-            match new_at {
-                Some(NewBranchAt::Workspace) => tx.create_reference(branch.as_ref(), None, None)?,
-                Some(NewBranchAt::AboveHead(head)) => {
-                    let above = Anchor::AtReference {
-                        ref_name: Cow::Borrowed(head.as_ref()),
-                        position: Position::Above,
-                    };
-                    tx.create_reference(branch.as_ref(), above, None)?;
-                }
-                Some(NewBranchAt::BesideHead(_)) | None => {}
-            }
-            let made = tx.create_commit(
-                RelativeTo::Reference(branch.clone()),
-                InsertSide::Below,
-                specs,
-                message,
-                source,
-            )?;
-            Ok(match made.new_commit {
-                Some(commit) => DynamicOutcome::Commit((Made::from(commit), made.rejected_specs)),
-                None => DynamicOutcome::Rollback(made.rejected_specs),
-            })
-        },
-    )?;
-    match outcome {
-        DynamicOutcome::Commit((made, _workspace)) => Ok(made),
-        DynamicOutcome::Rollback(rejected) => {
-            bail!(
-                "Nothing could be committed.\n{}",
-                left_out(&rejected).join("\n")
-            )
-        }
-    }
-}
-
-/// Create a new stack, named `name` or with a made-up name, and return its full ref name.
-/// With the default branch checked out on its own, the new branch goes on top of it and is
-/// checked out, as `git checkout -b` would. Beside another branch, both go in GitButler's
-/// workspace, as `but branch new` does.
+/// Create a new stack, named `name` or with a made-up name, and return its full ref name, as
+/// `but branch new` does. With the default branch checked out on its own, the new branch goes
+/// on top of it and is checked out, as `git checkout -b` would. Beside another branch, both go
+/// in GitButler's workspace.
 pub struct CreateBranch {
     pub name: Option<String>,
 }
@@ -590,139 +1002,37 @@ impl Intent for CreateBranch {
     type Done = FullName;
 
     fn apply(self, run: &mut Run) -> Result<FullName> {
-        use but_api::branch::json::BranchCreatePlacement as Placement;
-        let new_ref = self.name.as_deref().map(branch_ref).transpose()?;
+        let name = self.name.as_deref().map(branch_ref).transpose()?;
         run.locked(|ctx, perm| {
             refuse_unborn(ctx)?;
             // A branch made here and checked out couldn't be undone: the oplog takes a detached
             // HEAD for the workspace and would restore that instead.
             refuse_unfinished(&*ctx.repo.get()?, true)?;
-            let placement = match new_branch_at(ctx)? {
-                NewBranchAt::Workspace => Placement::Independent { order: None },
-                NewBranchAt::AboveHead(head) => Placement::Dependent {
-                    relative_to: but_api::commit::json::RelativeTo::Reference(head),
-                    side: InsertSide::Above,
-                },
-                NewBranchAt::BesideHead(head) => {
-                    return create_beside_checkout(ctx, perm, &head, new_ref);
-                }
+            let new_ref = match name {
+                Some(name) => name,
+                None => but_core::branch::unique_canned_refname(&*ctx.repo.get()?)?,
             };
-            let created = but_api::branch::branch_create_with_perm(ctx, new_ref, placement, perm)?;
-            Ok(created.new_ref)
+            // It lists the new branch, so undo deletes it again.
+            let details = SnapshotDetails::new(OperationKind::CreateBranch)
+                .with_trailers([Trailer::Name(new_ref.to_string())]);
+            let sbm = SingleBranchMode::new(ctx, perm.read_permission(), false)?;
+            let mut meta = ctx.meta()?;
+            sbm.transaction_with_workspace_setup(
+                ctx,
+                &mut meta,
+                details,
+                &[new_ref.as_ref()],
+                perm,
+                true,
+                |mut tx| sbm.create_unstacked_reference(&mut tx, new_ref.as_ref(), None),
+            )?;
+            Ok(new_ref)
         })
     }
 }
 
-/// Where a new branch goes, given what is checked out.
-enum NewBranchAt {
-    /// In GitButler's workspace, when it or no local branch is checked out.
-    Workspace,
-    /// On top of the branch checked out alone, the target's or any without a target.
-    AboveHead(FullName),
-    /// Beside the branch checked out alone, which isn't the target's.
-    BesideHead(FullName),
-}
-
-fn new_branch_at(ctx: &but_ctx::Context) -> Result<NewBranchAt> {
-    let head = ctx.repo.get()?.head_name()?;
-    let checked_out = head.filter(|head| {
-        head.as_bstr() != but_core::WORKSPACE_REF_NAME
-            && head.as_ref().category() == Some(gix::refs::Category::LocalBranch)
-    });
-    let Some(head) = checked_out else {
-        return Ok(NewBranchAt::Workspace);
-    };
-    let target = ctx.project_meta()?.target_ref;
-    let beside = target.is_some_and(|target| target.as_local_full_name_ref() != head.as_ref());
-    Ok(match beside {
-        true => NewBranchAt::BesideHead(head),
-        false => NewBranchAt::AboveHead(head),
-    })
-}
-
-/// Make a branch, `new_ref` or with a made-up name, and start it beside `head`, the branch
-/// checked out, in one step to undo. Returns its full name.
-fn create_beside_checkout(
-    ctx: &mut but_ctx::Context,
-    perm: &mut but_ctx::access::RepoExclusive,
-    head: &gix::refs::FullName,
-    new_ref: Option<gix::refs::FullName>,
-) -> Result<FullName> {
-    let new_ref = {
-        let repo = ctx.repo.get()?;
-        match new_ref {
-            // As `branch_create` refuses one taken locally or by a remote's branch, or nesting
-            // with another.
-            Some(new_ref) => {
-                if but_core::branch::find_unique_refname(&repo, new_ref.as_ref())? != new_ref {
-                    bail!("Reference '{}' already exists", new_ref.shorten());
-                }
-                but_core::branch::refuse_colliding_refname(&repo, new_ref.as_ref(), None)?;
-                new_ref
-            }
-            None => but_core::branch::unique_canned_refname(&repo)?,
-        }
-    };
-    // It lists the new branch, so undo deletes it again.
-    let details = SnapshotDetails::new(OperationKind::CreateBranch)
-        .with_trailers([Trailer::Name(new_ref.to_string())]);
-    recorded(ctx, perm, details, &[new_ref.as_ref()], |ctx, perm| {
-        start_beside(ctx, perm, new_ref.as_ref(), head)
-    })?;
-    Ok(new_ref)
-}
-
-/// Make `new_ref` where `head`, the branch checked out, leaves the target, and apply it beside
-/// `head`, which brings in GitButler's workspace for the two. Starting there, as `but branch
-/// new` does, the two merge without conflicts, whatever the target has done since.
-///
-/// A stopgap until `but_api::branch::branch_create` does this itself: it refuses a branch of
-/// its own outside the workspace, and the CLI's way around that lives in the CLI. This is
-/// `branch_checkout_new` with the branch applied rather than checked out.
-fn start_beside(
-    ctx: &mut but_ctx::Context,
-    perm: &mut but_ctx::access::RepoExclusive,
-    new_ref: &gix::refs::FullNameRef,
-    head: &gix::refs::FullName,
-) -> Result<()> {
-    {
-        let repo = ctx.repo.get()?;
-        let target = ctx.project_meta()?.resolve_target_commit(&repo)?;
-        let base = (repo.merge_base(repo.head_id()?, target)?)
-            .with_context(|| format!("{} shares no history with the target", head.shorten()))?;
-        let previous = gix::refs::transaction::PreviousValue::MustNotExist;
-        repo.reference(new_ref, base, previous, "GitButler: new branch")
-            .with_context(|| format!("Couldn't create branch {}", new_ref.shorten()))?;
-    }
-    let applied = but_api::branch::apply_only_with_perm(ctx, new_ref, perm);
-    if !(applied.as_ref()).is_ok_and(|outcome| outcome.status.persisted_mutation()) {
-        ctx.repo.get()?.find_reference(new_ref)?.delete()?;
-        applied?;
-        bail!(
-            "Couldn't start {} beside {}",
-            new_ref.shorten(),
-            head.shorten()
-        );
-    }
-    Ok(())
-}
-
-/// Take away `branch`, started beside the branch checked out for what then failed, which
-/// leaves that one checked out on its own again.
-fn leave_beside(
-    ctx: &mut but_ctx::Context,
-    perm: &mut but_ctx::access::RepoExclusive,
-    branch: &FullName,
-) {
-    if let Err(err) = but_api::branch::branch_remove_only_with_perm(ctx, branch.clone(), perm) {
-        tracing::warn!(
-            ?err,
-            "couldn't take away the branch started for a failed commit"
-        );
-    }
-}
-
-/// Stack a new branch with a made-up name on top of `below`.
+/// Stack a new branch with a made-up name on top of `below`, as `but branch new` does: on top
+/// of the branch checked out on its own, it's checked out.
 pub struct CreateDependentBranch {
     pub below: FullName,
 }
@@ -731,13 +1041,26 @@ impl Intent for CreateDependentBranch {
     type Done = FullName;
 
     fn apply(self, run: &mut Run) -> Result<FullName> {
-        let placement = but_api::branch::json::BranchCreatePlacement::Dependent {
-            relative_to: but_api::commit::json::RelativeTo::Reference(self.below),
-            side: InsertSide::Above,
-        };
         run.locked(|ctx, perm| {
-            let created = but_api::branch::branch_create_with_perm(ctx, None, placement, perm)?;
-            Ok(created.new_ref)
+            let new_ref = but_core::branch::unique_canned_refname(&*ctx.repo.get()?)?;
+            // It lists the new branch, so undo deletes it again.
+            let details = SnapshotDetails::new(OperationKind::CreateBranch)
+                .with_trailers([Trailer::Name(new_ref.to_string())]);
+            let sbm = SingleBranchMode::new(ctx, perm.read_permission(), false)?;
+            let mut meta = ctx.meta()?;
+            sbm.transaction_with_workspace_setup(
+                ctx,
+                &mut meta,
+                details,
+                &[new_ref.as_ref()],
+                perm,
+                false,
+                |mut tx| {
+                    let (new_ref, below) = (new_ref.as_ref(), self.below.as_ref());
+                    sbm.create_stacked_reference(&mut tx, new_ref, below, position(false))
+                },
+            )?;
+            Ok(new_ref)
         })
     }
 }
@@ -753,22 +1076,37 @@ impl Intent for CreateBranchAtCommit {
     type Done = FullName;
 
     fn apply(self, run: &mut Run) -> Result<FullName> {
-        let side = match self.below {
-            true => InsertSide::Below,
-            false => InsertSide::Above,
+        use but_workspace::branch::create_reference::{Anchor, Position};
+        let position = match self.below {
+            true => Position::Below,
+            false => Position::Above,
         };
-        let placement = but_api::branch::json::BranchCreatePlacement::Dependent {
-            relative_to: but_api::commit::json::RelativeTo::Commit(self.commit.0),
-            side,
+        let anchor = Anchor::AtCommit {
+            commit_id: self.commit.0,
+            position,
         };
         run.locked(|ctx, perm| {
-            let created = but_api::branch::branch_create_with_perm(ctx, None, placement, perm)?;
-            Ok(created.new_ref)
+            let new_ref = but_core::branch::unique_canned_refname(&*ctx.repo.get()?)?;
+            // It lists the new branch, so undo deletes it again.
+            let details = SnapshotDetails::new(OperationKind::CreateBranch)
+                .with_trailers([Trailer::Name(new_ref.to_string())]);
+            let sbm = SingleBranchMode::new(ctx, perm.read_permission(), false)?;
+            let mut meta = ctx.meta()?;
+            sbm.transaction_with_workspace_setup(
+                ctx,
+                &mut meta,
+                details,
+                &[new_ref.as_ref()],
+                perm,
+                false,
+                |mut tx| tx.create_reference(new_ref.as_ref(), anchor, None),
+            )?;
+            Ok(new_ref)
         })
     }
 }
 
-/// Stack `branch` on top of `onto`, with the branches above it.
+/// Stack `branch` on top of `onto`. The branches above it stay, on the one it was on.
 pub struct StackBranch {
     pub branch: FullName,
     pub onto: FullName,
@@ -779,7 +1117,7 @@ impl Intent for StackBranch {
 
     fn apply(self, run: &mut Run) -> Result<Self::Done> {
         let onto = RelativeTo::Reference(self.onto);
-        move_branch(run, &self.branch, Some((onto, InsertSide::Above)))
+        move_branch(run, &self.branch, BranchTo::Beside(onto, InsertSide::Above))
     }
 }
 
@@ -795,47 +1133,71 @@ impl Intent for MoveBranchBelow {
 
     fn apply(self, run: &mut Run) -> Result<Self::Done> {
         let below = RelativeTo::Commit(self.commit.0);
-        move_branch(run, &self.branch, Some((below, InsertSide::Below)))
+        move_branch(
+            run,
+            &self.branch,
+            BranchTo::Beside(below, InsertSide::Below),
+        )
     }
 }
 
-/// Take `branch` out of its stack into a stack of its own.
+/// Take `branch` out of its stack into a stack of its own, after the others, or with `first`
+/// before them.
 pub struct TearOffBranch {
     pub branch: FullName,
+    pub first: bool,
 }
 
 impl Intent for TearOffBranch {
     type Done = Vec<(Option<FullName>, usize)>;
 
     fn apply(self, run: &mut Run) -> Result<Self::Done> {
-        move_branch(run, &self.branch, None)
+        let first = self.first;
+        move_branch(run, &self.branch, BranchTo::Apart { first })
     }
 }
 
-/// Move `branch` to `side` of `relative_to`, or into a stack of its own without a place,
-/// saying which branches it left with conflicted commits they didn't have, each with how many.
+/// Where [`move_branch`] puts a branch.
+enum BranchTo {
+    /// To that side of a branch or commit.
+    Beside(RelativeTo, InsertSide),
+    /// Into a stack of its own, after the others, or with `first` before them.
+    Apart { first: bool },
+}
+
+/// Move `branch` where `to` says, saying which branches it left with conflicted commits they
+/// didn't have, each with how many.
 fn move_branch(
     run: &mut Run,
     branch: &FullName,
-    to: Option<(RelativeTo, InsertSide)>,
+    to: BranchTo,
 ) -> Result<Vec<(Option<FullName>, usize)>> {
     let kind = match to {
-        Some(_) => OperationKind::MoveBranch,
-        None => OperationKind::TearOffBranch,
+        BranchTo::Beside(..) => OperationKind::MoveBranch,
+        BranchTo::Apart { .. } => OperationKind::TearOffBranch,
     };
+    // Out of a stack, it's a branch of its own, which a branch checked out on its own only has
+    // beside it in GitButler's workspace, as `but move` sets it up.
+    let independent = matches!(to, BranchTo::Apart { .. });
     run.locked(|ctx, perm| {
         let before = but_api::legacy::workspace::head_info(ctx)?;
+        let sbm = SingleBranchMode::new(ctx, perm.read_permission(), false)?;
         let mut meta = ctx.meta()?;
-        let moved = but_transaction::with_transaction_with_perm(
+        let moved = sbm.transaction_with_workspace_setup(
             ctx,
             &mut meta,
-            perm,
             SnapshotDetails::new(kind),
             &[],
-            DryRun::No,
+            perm,
+            independent,
             |mut tx| match to {
-                Some((relative_to, side)) => tx.move_branch(branch.as_ref(), relative_to, side),
-                None => tx.tear_off_branch(branch.as_ref()),
+                BranchTo::Beside(relative_to, side) => {
+                    tx.move_branch(branch.as_ref(), relative_to, side)
+                }
+                // A stack's place is its tip's among the workspace commit's parents.
+                BranchTo::Apart { first } => {
+                    tx.tear_off_branch(branch.as_ref(), first.then_some(0))
+                }
             },
         )?;
         Ok(super::upstream::newly_conflicted(
@@ -902,18 +1264,19 @@ impl Intent for InsertEmptyCommit {
 
 /// Put copies of `commits`, listed newest first, at `to` in one go, keeping the originals
 /// where they are. The oldest goes in first and each newer one on top, as in their history.
+/// Done is what it rewrote, and the newest copy.
 pub struct CherryPick {
     pub commits: Arc<[CommitId]>,
     pub to: Destination,
 }
 
 impl Intent for CherryPick {
-    type Done = Rewritten;
+    type Done = (Rewritten, Option<CommitId>);
 
-    fn apply(self, run: &mut Run) -> Result<Rewritten> {
+    fn apply(self, run: &mut Run) -> Result<(Rewritten, Option<CommitId>)> {
         let Self { commits, to } = self;
         let (relative_to, side) = to.relative_to();
-        let workspace = run.locked(|ctx, perm| {
+        let (newest, workspace) = run.locked(|ctx, perm| {
             let mut meta = ctx.meta()?;
             but_transaction::with_transaction_with_perm(
                 ctx,
@@ -924,12 +1287,13 @@ impl Intent for CherryPick {
                 DryRun::No,
                 |mut tx| {
                     let oldest_first = commits.iter().rev().map(|id| id.0);
-                    tx.cherry_pick_commits(oldest_first, relative_to, side, false)?;
-                    Ok(())
+                    let copies = tx.cherry_pick_commits(oldest_first, relative_to, side, false)?;
+                    let newest = copies.last().map(|copy| CommitId(copy.id));
+                    Ok(but_transaction::Commit(newest))
                 },
             )
         })?;
-        Ok(rewritten(&workspace))
+        Ok((rewritten(&workspace), newest))
     }
 }
 
@@ -951,7 +1315,7 @@ impl Intent for RenameBranch {
             let moved = super::branches::move_description(
                 &*ctx.repo.get()?,
                 branch.shorten(),
-                Some(outcome.new_ref.shorten()),
+                outcome.new_ref.shorten(),
             );
             if let Err(err) = moved {
                 tracing::warn!(?err, "couldn't move the renamed branch's description");
@@ -986,51 +1350,14 @@ impl Intent for NameBranch {
     }
 }
 
-/// Delete `branch`, keeping its commits, and its description with it. With `tip`, one whose
-/// newest commit moved since stays: its new commits would go with it.
-pub struct RemoveBranch {
-    pub branch: FullName,
-    pub tip: Option<CommitId>,
-}
-
-impl Intent for RemoveBranch {
-    type Done = ();
-
-    fn apply(self, run: &mut Run) -> Result<()> {
-        let Self { branch, tip } = self;
-        run.locked(|ctx, perm| {
-            // Removing a ref that's gone does nothing, so say so rather than that it went, as
-            // after an agent renamed the branch while the confirmation was up.
-            match super::ref_tip(&*ctx.repo.get()?, branch.as_ref()) {
-                None => bail!("{} was renamed or deleted meanwhile", short_ref(&branch)),
-                Some(at) if tip.is_some_and(|tip| tip.0 != at) => {
-                    bail!(
-                        "{} changed since you asked, so it wasn't deleted",
-                        short_ref(&branch)
-                    )
-                }
-                Some(_) => {}
-            }
-            but_api::branch::branch_remove_with_perm(ctx, branch.clone(), perm)?;
-            // So a branch made later under its name starts without its description.
-            let dropped =
-                super::branches::move_description(&*ctx.repo.get()?, branch.shorten(), None);
-            if let Err(err) = dropped {
-                tracing::warn!(?err, "couldn't drop the deleted branch's description");
-            }
-            Ok(())
-        })
-    }
-}
-
 /// Delete `branch` with its commits, in one step that one undo takes back, as `but branch
-/// delete` does: for the only named branch of its stack, as [`RemoveBranch`] keeps the
-/// commits, which need another branch to hold them. A workspace left with one stack checks
-/// that out, as unapplying does. One whose newest commit is no longer `tip` stays: its new
-/// commits would go too.
+/// delete` does. A checkout on it moves to the branch below, or the target. A workspace left
+/// with one stack checks that out, as unapplying does. Outside the workspace only its ref goes,
+/// its commits with it unless another ref has them. One whose newest commit is no longer `tip`,
+/// `None` when it had none, stays: its new commits would go too.
 pub struct DeleteBranchAndCommits {
     pub branch: FullName,
-    pub tip: CommitId,
+    pub tip: Option<CommitId>,
 }
 
 impl Intent for DeleteBranchAndCommits {
@@ -1039,17 +1366,31 @@ impl Intent for DeleteBranchAndCommits {
     fn apply(self, run: &mut Run) -> Result<()> {
         let Self { branch, tip } = self;
         run.locked(|ctx, perm| {
-            let commits: Vec<gix::ObjectId> = {
+            // The target is what a checkout on a deleted branch falls back to.
+            let target = ctx.project_meta()?.target_ref;
+            if target.is_some_and(|target| target.as_local_full_name_ref() == branch.as_ref()) {
+                bail!("{} is the target branch", short_ref(&branch));
+            }
+            let commits: Option<Vec<gix::ObjectId>> = {
                 let (_, ws, _) = ctx.workspace_and_db_with_perm(perm.read_permission())?;
-                // Checked out on its own, HEAD would be left on nothing.
-                if !ws.kind.has_managed_ref() {
-                    bail!("{} is checked out on its own", short_ref(&branch));
-                }
-                let segment = (ws.try_find_segment_by_refname(branch.as_ref()))
-                    .with_context(|| format!("{} isn't applied any more", short_ref(&branch)))?;
-                segment.commits.iter().map(|commit| commit.id).collect()
+                (ws.find_segment_by_refname(branch.as_ref()))
+                    .map(|segment| segment.commits.iter().map(|commit| commit.id).collect())
             };
-            if commits.first() != Some(&tip.0) {
+            let Some(commits) = commits else {
+                // Removing a ref that's gone does nothing, so say so rather than that it went, as
+                // after an agent renamed the branch while the confirmation was up.
+                match super::ref_tip(&*ctx.repo.get()?, branch.as_ref()) {
+                    None => bail!("{} was renamed or deleted meanwhile", short_ref(&branch)),
+                    Some(at) if tip.is_none_or(|tip| tip.0 != at) => bail!(
+                        "{} changed since you asked, so it wasn't deleted",
+                        short_ref(&branch)
+                    ),
+                    Some(_) => {}
+                }
+                but_api::branch::branch_remove_with_perm(ctx, branch, perm)?;
+                return Ok(());
+            };
+            if commits.first().copied() != tip.map(|tip| tip.0) {
                 bail!(
                     "{} changed since you asked, so it wasn't deleted",
                     short_ref(&branch)
@@ -1065,7 +1406,9 @@ impl Intent for DeleteBranchAndCommits {
                 &[branch.as_ref()],
                 DryRun::No,
                 |mut tx| {
-                    tx.discard_commits(commits)?;
+                    if !commits.is_empty() {
+                        tx.discard_commits(commits)?;
+                    }
                     tx.remove_reference(branch.as_ref())?;
                     Ok(())
                 },
@@ -1095,6 +1438,8 @@ pub struct Amend {
     pub into: CommitId,
     pub changes: Arc<[Selected]>,
     pub checkout: Checkout,
+    /// The message it gets instead of its own, if any.
+    pub message: Option<String>,
     pub run_hooks: bool,
 }
 
@@ -1116,6 +1461,7 @@ impl Intent for Amend {
             into,
             changes,
             checkout,
+            message,
             run_hooks,
         } = self;
         let worktree = checkout.linked();
@@ -1153,14 +1499,22 @@ impl Intent for Amend {
                 DryRun::No,
                 |mut tx| {
                     let made = tx.amend_commit(into.0, specs, source)?;
-                    Ok(match made.new_commit {
-                        Some(_) => DynamicOutcome::Commit(made.rejected_specs),
-                        None => DynamicOutcome::Rollback(made.rejected_specs),
-                    })
+                    let Some(amended) = made.new_commit else {
+                        return Ok(DynamicOutcome::Rollback(made.rejected_specs));
+                    };
+                    // In the same transaction, so undo takes both back at once.
+                    let amended = match &message {
+                        Some(message) => tx.reword_commit(into.0, message.as_str().into())?,
+                        None => amended,
+                    };
+                    Ok(DynamicOutcome::Commit((
+                        CommitId(amended.id),
+                        made.rejected_specs,
+                    )))
                 },
             )
         })?;
-        let (rejected, workspace) = match outcome {
+        let ((amended, rejected), workspace) = match outcome {
             DynamicOutcome::Commit(amended) => amended,
             DynamicOutcome::Rollback(rejected) => {
                 bail!(
@@ -1170,8 +1524,10 @@ impl Intent for Amend {
             }
         };
         let hook_failed = run_hooks.then(|| post_commit(run.ctx())).flatten();
+        let mut rewritten = rewritten(&workspace);
+        rewritten.insert(into, amended);
         Ok(Amended {
-            rewritten: rewritten(&workspace),
+            rewritten,
             left_out: left_out(&rejected),
             hook_failed,
         })
@@ -1206,10 +1562,24 @@ impl Intent for MoveCommits {
     }
 }
 
-/// Squash `commits`, newest first as picked, into `into`, keeping every message.
+/// Which messages a squash keeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Messages {
+    /// The target's first, then the others' in the order they were written.
+    #[default]
+    Both,
+    /// Only the target's.
+    Target,
+}
+
+/// Squash `commits`, newest first as picked, into `into`, keeping the messages `keep` says.
+/// With `emptied`, they're all of that branch, which goes with them, as `but squash` takes a
+/// branch squashed into a commit elsewhere.
 pub struct Squash {
     pub commits: Arc<[CommitId]>,
     pub into: CommitId,
+    pub keep: Messages,
+    pub emptied: Option<FullName>,
 }
 
 impl Intent for Squash {
@@ -1217,7 +1587,16 @@ impl Intent for Squash {
 
     fn apply(self, run: &mut Run) -> Result<Rewritten> {
         use but_workspace::commit::squash_commits::MessageCombinationStrategy;
-        let Self { commits, into } = self;
+        let Self {
+            commits,
+            into,
+            keep,
+            emptied,
+        } = self;
+        let strategy = match keep {
+            Messages::Both => MessageCombinationStrategy::KeepBoth,
+            Messages::Target => MessageCombinationStrategy::KeepTarget,
+        };
         let (made, workspace) = run.locked(|ctx, perm| {
             let mut meta = ctx.meta()?;
             but_transaction::with_transaction_with_perm(
@@ -1225,15 +1604,15 @@ impl Intent for Squash {
                 &mut meta,
                 perm,
                 SnapshotDetails::new(OperationKind::SquashCommit),
-                &[],
+                // Named so undo brings the branch back.
+                emptied.as_ref().map(|name| name.as_ref()).as_slice(),
                 DryRun::No,
                 |mut tx| {
+                    if let Some(branch) = &emptied {
+                        tx.remove_reference(branch.as_ref())?;
+                    }
                     let oldest_first = commits.iter().rev().map(|id| id.0);
-                    let made = tx.squash_commits(
-                        oldest_first,
-                        into.0,
-                        MessageCombinationStrategy::KeepBoth,
-                    )?;
+                    let made = tx.squash_commits(oldest_first, into.0, strategy)?;
                     Ok(but_transaction::Commit(CommitId(made.id)))
                 },
             )
@@ -1245,16 +1624,18 @@ impl Intent for Squash {
     }
 }
 
-/// Turn `commits` back into uncommitted changes.
+/// Turn `commits` back into uncommitted changes. With `emptied`, they're all of that branch,
+/// which goes with them, as `but squash` uncommits a branch.
 pub struct Uncommit {
     pub commits: Arc<[CommitId]>,
+    pub emptied: Option<FullName>,
 }
 
 impl Intent for Uncommit {
     type Done = ();
 
     fn apply(self, run: &mut Run) -> Result<()> {
-        let Self { commits } = self;
+        let Self { commits, emptied } = self;
         run.locked(|ctx, perm| {
             refuse_buried_merges(&*ctx.repo.get()?, &commits)?;
             let mut meta = ctx.meta()?;
@@ -1265,9 +1646,16 @@ impl Intent for Uncommit {
                 SnapshotDetails::new(OperationKind::UndoCommit)
                     .with_count(commits.len())
                     .with_trailers(commits.iter().map(|id| Trailer::Sha(id.0))),
-                &[],
+                // Named so undo brings the branch back.
+                emptied.as_ref().map(|name| name.as_ref()).as_slice(),
                 DryRun::No,
-                |mut tx| tx.uncommit_commits(commits.iter().map(|id| id.0)),
+                |mut tx| {
+                    tx.uncommit_commits(commits.iter().map(|id| id.0))?;
+                    if let Some(branch) = &emptied {
+                        tx.remove_reference(branch.as_ref())?;
+                    }
+                    Ok(())
+                },
             )?;
             Ok(())
         })
@@ -1317,7 +1705,7 @@ fn refuse_buried_merges(repo: &gix::Repository, commits: &[CommitId]) -> Result<
             bail!(
                 "{} is a merge with commits above it, which would merge the same changes \
                  instead, so nothing would come back. Take out the commits above it first.",
-                merge.short()
+                super::short_reference(repo, *merge)
             );
         }
     }
@@ -1449,34 +1837,66 @@ impl Intent for SplitOff {
     }
 }
 
-/// Move `commits` into a new branch of their own, beside the other stacks.
+/// Move `commits` into a new branch of their own: beside the other stacks, after them or with
+/// `first` before them, or in the stack of branch `beside`, right above it, or right below it
+/// with `true`. With `copy`, copies of them go there instead, as [`CherryPick`] puts them, and
+/// they stay where they are.
 /// Done is what moved, and the new branch's full name.
 pub struct MoveToNewBranch {
     pub commits: Arc<[CommitId]>,
+    pub beside: Option<(FullName, bool)>,
+    pub first: bool,
+    pub copy: bool,
 }
 
 impl Intent for MoveToNewBranch {
     type Done = (Rewritten, FullName);
 
     fn apply(self, run: &mut Run) -> Result<(Rewritten, FullName)> {
-        let Self { commits } = self;
+        let Self {
+            commits,
+            beside,
+            first,
+            copy,
+        } = self;
+        let details = match copy {
+            true => SnapshotDetails::new(OperationKind::CherryPick).with_count(commits.len()),
+            false => SnapshotDetails::new(OperationKind::MoveCommit),
+        };
         run.locked(|ctx, perm| {
             let name = but_core::branch::unique_canned_refname(&*ctx.repo.get()?)?;
+            let sbm = SingleBranchMode::new(ctx, perm.read_permission(), false)?;
             let mut meta = ctx.meta()?;
-            let workspace = but_transaction::with_transaction_with_perm(
+            let workspace = sbm.transaction_with_workspace_setup(
                 ctx,
                 &mut meta,
-                perm,
-                SnapshotDetails::new(OperationKind::MoveCommit),
+                details,
                 &[name.as_ref()],
-                DryRun::No,
+                perm,
+                beside.is_none(),
                 |mut tx| {
-                    tx.create_reference(name.as_ref(), None, None)?;
-                    tx.move_commits(
-                        commits.iter().map(|commit| commit.0),
-                        RelativeTo::Reference(name.clone()),
-                        InsertSide::Below,
-                    )
+                    match &beside {
+                        Some((branch, below)) => sbm.create_stacked_reference(
+                            &mut tx,
+                            name.as_ref(),
+                            branch.as_ref(),
+                            position(*below),
+                        )?,
+                        // A stack's place is its tip's among the workspace commit's parents.
+                        None => sbm.create_unstacked_reference(
+                            &mut tx,
+                            name.as_ref(),
+                            first.then_some(0),
+                        )?,
+                    }
+                    let to = RelativeTo::Reference(name.clone());
+                    let ids = commits.iter().map(|commit| commit.0);
+                    match copy {
+                        true => tx
+                            .cherry_pick_commits(ids.rev(), to, InsertSide::Below, false)
+                            .map(drop),
+                        false => tx.move_commits(ids, to, InsertSide::Below),
+                    }
                 },
             )?;
             Ok((rewritten(&workspace), name))
@@ -1607,8 +2027,8 @@ fn discard(
     // Hunks that moved since the diff was shown refuse it before anything is recorded.
     let context_lines = ctx.settings.context_lines;
     let specs = current_hunks(repo, selected, taken_specs(selected)?, context_lines)?;
-    // The snapshot is recorded before anything changes, as the but-api discard does: undo
-    // then brings back whatever goes, conflicts included, even when some of it couldn't be
+    // The snapshot is recorded before anything changes: undo then brings back whatever
+    // goes, conflicts included, even when some of it couldn't be
     // discarded. The oplog can't restore a linked worktree, so its discard has none.
     let mut recorded = false;
     if worktree.is_none() {
@@ -1616,6 +2036,7 @@ fn discard(
         let snapshot = but_oplog::UnmaterializedOplogSnapshot::prepare_checkpoint(
             ctx,
             details,
+            &[],
             perm.read_permission(),
         )
         .and_then(|snapshot| snapshot.commit(ctx, perm));
@@ -1846,6 +2267,19 @@ pub(super) mod tests {
             checkout: Checkout::Main,
             message: message.into(),
             run_hooks,
+            leave_out: false,
+            restack: None,
+        }
+    }
+
+    impl CommitOutcome {
+        /// The commit made, which every commit in these tests is.
+        #[track_caller]
+        fn committed(self) -> Committed {
+            match self {
+                CommitOutcome::Committed(committed) => committed,
+                CommitOutcome::Blocked(blocked) => panic!("the commit was blocked: {blocked:?}"),
+            }
         }
     }
 
@@ -1867,6 +2301,7 @@ pub(super) mod tests {
             into,
             changes: changes.into(),
             checkout: Checkout::Main,
+            message: None,
             run_hooks: false,
         }
     }
@@ -1927,6 +2362,36 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_commit_without_a_change_id_is_named_by_its_short_sha() {
+        let dir = repo_with("one\n");
+        let repo = gix::open(dir.path()).unwrap();
+        let id = head(dir.path());
+        assert_eq!(
+            crate::backend::short_reference(&repo, id),
+            id.short(),
+            "plain Git's commit carries no change ID"
+        );
+    }
+
+    #[test]
+    fn a_commit_is_named_by_the_start_of_the_change_id_it_carries() {
+        let dir = repo_with("one\n");
+        let repo = gix::open(dir.path()).unwrap();
+        let plain = repo.find_commit(head(dir.path()).0).unwrap();
+        let mut carrying = plain.decode().unwrap().into_owned().unwrap();
+        carrying.extra_headers.push((
+            "change-id".into(),
+            "vtlrvnlmsxrmrsnrkvqlwrzqokpsoxzk".into(),
+        ));
+        let id = repo.write_object(&carrying).unwrap().detach();
+        assert_eq!(
+            crate::backend::short_reference(&repo, CommitId(id)),
+            "vtlrvnl",
+            "the header it carries, not its sha"
+        );
+    }
+
+    #[test]
     fn a_description_is_listed_and_follows_its_branch() {
         but_testsupport::isolated_app_data_dir(|| {
             use crate::backend::branches::{DescribeBranch, all_branches, move_description};
@@ -1944,6 +2409,7 @@ pub(super) mod tests {
             target_origin_main(path);
             git(path, &["checkout", "-q", "-b", "topic"]);
             git(path, &["commit", "-q", "--allow-empty", "-m", "Topic"]);
+            let topic = head(path);
             git(path, &["checkout", "-q", "main"]);
 
             describe(path, "refs/heads/topic", "  Why it's there \n").unwrap();
@@ -1964,20 +2430,25 @@ pub(super) mod tests {
                     .string(format!("branch.{name}.description").as_str())
                     .map(|d| d.to_string())
             };
-            move_description(&repo, "topic".into(), Some("renamed".into())).unwrap();
+            move_description(&repo, "topic".into(), "renamed".into()).unwrap();
             assert_eq!(
                 (kept("topic"), kept("renamed").as_deref()),
                 (None, Some("Why it's there")),
                 "it moves to the new name, as `git branch -m` moves it"
             );
-            move_description(&repo, "renamed".into(), None).unwrap();
+            move_description(&repo, "renamed".into(), "topic".into()).unwrap();
+            let delete = DeleteBranchAndCommits {
+                branch: full("refs/heads/topic"),
+                tip: Some(topic),
+            };
+            crate::backend::apply(path, delete).unwrap();
             assert_eq!(
-                kept("renamed"),
+                kept("topic"),
                 None,
                 "and goes with the branch, as `git branch -d` drops it"
             );
             assert!(
-                describe(path, "refs/heads/renamed", "Lost?").is_err(),
+                describe(path, "refs/heads/topic", "Lost?").is_err(),
                 "a branch that's gone isn't given one, for a later branch by its name to take up"
             );
         })
@@ -2393,6 +2864,105 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn an_amend_with_a_message_rewrites_both_in_one_undo_step() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let dir = repo_with("one\n");
+            let path = dir.path();
+            target_origin_main(path);
+            git(path, &["checkout", "-q", "-b", "feature"]);
+            git(path, &["commit", "-q", "--allow-empty", "-m", "Work"]);
+            std::fs::write(path.join("file"), "two\n").unwrap();
+            let into = head(path);
+            let before = crate::backend::history::oplog_head(&open(path).unwrap());
+
+            let amend = Amend {
+                message: Some("Better\n\nWith a body".into()),
+                ..amend_main(into, vec![Selected::whole(&uncommitted(path)[0])])
+            };
+            let (amended, ran) = crate::backend::apply(path, amend).unwrap();
+
+            let made = head(path);
+            assert_eq!(
+                amended.rewritten.get(&into),
+                Some(&made),
+                "what it became is the commit at the head, after the message too"
+            );
+            assert_eq!(
+                git(path, &["log", "-1", "--format=%B"]).trim(),
+                "Better\n\nWith a body",
+                "the commit has the new message"
+            );
+            assert_eq!(
+                git(path, &["show", "HEAD:file"]),
+                "two\n",
+                "and the changes"
+            );
+            assert_eq!(
+                entries_since(path, before).trim().lines().count(),
+                1,
+                "both are one entry, for one undo step"
+            );
+
+            undo(path, ran.recorded.unwrap(), None).unwrap();
+            assert_eq!(
+                git(path, &["log", "-1", "--format=%B"]).trim(),
+                "Work",
+                "undo brings the message back"
+            );
+            assert_eq!(
+                uncommitted(path).len(),
+                1,
+                "and leaves the changes uncommitted"
+            );
+        })
+    }
+
+    #[test]
+    fn an_amend_can_empty_the_message() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let dir = repo_with("one\n");
+            let path = dir.path();
+            std::fs::write(path.join("file"), "two\n").unwrap();
+            let amend = Amend {
+                message: Some(String::new()),
+                ..amend_main(head(path), vec![Selected::whole(&uncommitted(path)[0])])
+            };
+
+            crate::backend::apply(path, amend).unwrap();
+
+            assert_eq!(
+                git(path, &["log", "-1", "--format=%B"]).trim(),
+                "",
+                "the box said nothing, as rewording to nothing does"
+            );
+            assert_eq!(
+                git(path, &["show", "HEAD:file"]),
+                "two\n",
+                "and the changes went in"
+            );
+        })
+    }
+
+    #[test]
+    fn an_amend_without_a_message_keeps_the_commits_own() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let dir = repo_with("one\n");
+            let path = dir.path();
+            let message = git(path, &["log", "-1", "--format=%B"]);
+            std::fs::write(path.join("file"), "two\n").unwrap();
+            let changes = vec![Selected::whole(&uncommitted(path)[0])];
+
+            crate::backend::apply(path, amend_main(head(path), changes)).unwrap();
+
+            assert_eq!(
+                git(path, &["log", "-1", "--format=%B"]),
+                message,
+                "the message isn't touched"
+            );
+        })
+    }
+
+    #[test]
     fn a_hunk_of_a_textconv_diff_is_refused_rather_than_spliced_in() {
         but_testsupport::isolated_app_data_dir(|| {
             let mut lines: Vec<String> = twenty_lines();
@@ -2516,6 +3086,7 @@ pub(super) mod tests {
             hook("post-commit", "echo 'notify failed'; exit 1");
             let (committed, _) =
                 crate::backend::apply(path, commit_to_main(changes(), "Two", true)).unwrap();
+            let committed = committed.committed();
             assert_eq!(
                 git(path, &["log", "-1", "--format=%s|%b"]).trim(),
                 "Two|Issue: SHOP-12",
@@ -2562,6 +3133,7 @@ pub(super) mod tests {
             let (committed, _) =
                 crate::backend::apply(path, commit_to_main(vec![], "Mark it reviewed", false))
                     .unwrap();
+            let committed = committed.committed();
             assert_eq!(
                 git(path, &["log", "-1", "--format=%s"]).trim(),
                 "Mark it reviewed",
@@ -2603,10 +3175,15 @@ pub(super) mod tests {
                 let before = crate::backend::history::oplog_head(&open(path).unwrap());
 
                 let commit = CommitChanges {
-                    to: CommitTo::NewBranch,
+                    to: CommitTo::NewBranchAt {
+                        beside: None,
+                        first: false,
+                        name: None,
+                    },
                     ..commit_to_main(vec![Selected::whole(&uncommitted(path)[0])], "Two", false)
                 };
                 let (committed, ran) = crate::backend::apply(path, commit).unwrap();
+                let committed = committed.committed();
                 let new = short_ref(&committed.branch).into_owned();
                 let entries = entries_since(path, before);
                 let head_after = head(path).replace(&new, "<new>");
@@ -2661,13 +3238,23 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
             let last_entry = crate::backend::history::oplog_head(&open(path).unwrap());
 
             let commit = CommitChanges {
-                to: CommitTo::NewBranch,
+                to: CommitTo::NewBranchAt {
+                    beside: None,
+                    first: false,
+                    name: None,
+                },
                 ..commit_to_main(vec![changed], "Two", false)
             };
-            let err = crate::backend::apply(path, commit).unwrap_err();
-            assert!(
-                err.to_string().contains("Nothing could be committed"),
-                "the file changes nothing: {err}"
+            let (outcome, _) = crate::backend::apply(path, commit).unwrap();
+            let CommitOutcome::Blocked(blocked) = outcome else {
+                panic!("the file changes nothing: {outcome:?}");
+            };
+            assert_eq!(
+                (blocked.changes.iter())
+                    .map(|change| (change.path.as_str(), change.why))
+                    .collect::<Vec<_>>(),
+                [("file", "nothing in it would change")],
+                "the user is told why"
             );
             assert_eq!(branches(path), before, "the branch started for it is gone");
             assert_eq!(
@@ -2688,7 +3275,11 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
         but_testsupport::isolated_app_data_dir(|| {
             let dir = repo_with("one\n");
             let commit = CommitChanges {
-                to: CommitTo::NewBranch,
+                to: CommitTo::NewBranchAt {
+                    beside: None,
+                    first: false,
+                    name: None,
+                },
                 checkout: Checkout::Linked("feature".into()),
                 ..commit_to_main(vec![], "Two", false)
             };
@@ -2779,7 +3370,7 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
     }
 
     #[test]
-    fn a_target_without_a_remote_is_its_own_branch_to_update_from_and_land_on() {
+    fn a_target_without_a_remote_is_its_own_branch_to_update_from_and_merge_into() {
         but_testsupport::isolated_app_data_dir(|| {
             let dir = repo_with("one\n");
             let path = dir.path();
@@ -2813,17 +3404,126 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
                 .unwrap()
                 .commits[0]
                 .id;
-            let land = crate::backend::upstream::Land {
+            let merge = crate::backend::upstream::MergeIntoTarget {
                 branch: full("refs/heads/feature"),
                 tip,
                 whole_stack: false,
             };
-            crate::backend::apply(path, land).unwrap();
+            crate::backend::apply(path, merge).unwrap();
             assert!(
                 git(path, &["log", "--format=%s", "main"])
                     .lines()
                     .any(|s| s == "Feature"),
                 "main moved to take the branch in, with no remote to push to"
+            );
+        })
+    }
+
+    #[test]
+    fn a_new_branch_from_the_default_branch_refuses_a_name_thats_taken() {
+        but_testsupport::isolated_app_data_dir(|| {
+            // The default branch checked out at the target, as in a fresh clone.
+            let dir = repo_with("one\n");
+            let path = dir.path();
+            target_origin_main(path);
+            // A teammate's branch on the remote, which a branch of that name would take as its
+            // own, and a packed one a ref edit wouldn't notice under it.
+            git(path, &["update-ref", "refs/remotes/origin/fix", "HEAD"]);
+            git(path, &["branch", "foo"]);
+            git(path, &["pack-refs", "--all"]);
+            let refs = |path: &Path| git(path, &["for-each-ref", "--format=%(refname)"]);
+            let before = refs(path);
+
+            for name in ["fix", "foo/bar"] {
+                let made = crate::backend::apply(path, branch_named(name));
+                assert!(made.is_err(), "{name} is taken");
+                assert_eq!(refs(path), before, "nothing is made for {name}");
+                assert_eq!(
+                    git(path, &["symbolic-ref", "--short", "HEAD"]).trim(),
+                    "main",
+                    "main stays checked out"
+                );
+            }
+        })
+    }
+
+    #[test]
+    fn without_a_target_branches_stack_on_the_checked_out_one_and_move_within_it() {
+        but_testsupport::isolated_app_data_dir(|| {
+            // `top` checked out on its own, stacked on `lower`, in a project with no remote to
+            // take a target from.
+            let dir = repo_with("one\n");
+            let path = dir.path();
+            git(path, &["checkout", "-q", "-b", "lower"]);
+            git(path, &["commit", "-q", "--allow-empty", "-m", "Lower"]);
+            git(path, &["checkout", "-q", "-b", "top"]);
+            git(path, &["commit", "-q", "--allow-empty", "-m", "Top"]);
+            let stack = |path: &Path| {
+                let workspace = crate::backend::load_workspace(path, Default::default()).unwrap();
+                assert!(workspace.target_branch.is_none(), "there's no target");
+                let names: Vec<String> = (workspace.branches_in(&Checkout::Main))
+                    .map(|branch| branch.name.replace("t-branch-1", "<new>"))
+                    .collect();
+                let head = git(path, &["symbolic-ref", "--short", "HEAD"]);
+                format!(
+                    "{} on {}",
+                    names.join(", "),
+                    head.trim().replace("t-branch-1", "<new>")
+                )
+            };
+
+            crate::backend::apply(path, CreateBranch { name: None }).unwrap();
+            let made = stack(path);
+            let lower = full("refs/heads/lower");
+            let onto = full("refs/heads/top");
+            crate::backend::apply(
+                path,
+                StackBranch {
+                    branch: lower,
+                    onto,
+                },
+            )
+            .unwrap();
+            // Top first: a new branch goes on top of the one checked out and is checked out, as
+            // `git checkout -b` would, and a branch moves within the stack, though with no target
+            // the oplog has nothing to record a checkpoint against.
+            snapbox::assert_data_eq!(
+                format!("{made}\n{}\n", stack(path)),
+                snapbox::str![[r#"
+<new>, top, lower, main on <new>
+<new>, lower, top, main on <new>
+
+"#]]
+            );
+        })
+    }
+
+    #[test]
+    fn without_a_target_a_branch_cant_be_torn_off() {
+        but_testsupport::isolated_app_data_dir(|| {
+            // `top` checked out on its own, stacked on `lower`, in a project with no remote to
+            // take a target from, which a stack of its own would start from.
+            let dir = repo_with("one\n");
+            let path = dir.path();
+            git(path, &["checkout", "-q", "-b", "lower"]);
+            git(path, &["commit", "-q", "--allow-empty", "-m", "Lower"]);
+            git(path, &["checkout", "-q", "-b", "top"]);
+            git(path, &["commit", "-q", "--allow-empty", "-m", "Top"]);
+            let before = git(path, &["log", "--oneline", "--all"]);
+
+            let unstack = TearOffBranch {
+                branch: full("refs/heads/lower"),
+                first: false,
+            };
+            let err = crate::backend::apply(path, unstack).unwrap_err();
+            assert!(
+                err.to_string().contains("cutoff"),
+                "the UI offers no tear-off without a target, as this refuses: {err}"
+            );
+            assert_eq!(
+                git(path, &["log", "--oneline", "--all"]),
+                before,
+                "the stack is left as it was"
             );
         })
     }
@@ -3182,6 +3882,9 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
             let path = dir.path();
             let moving = MoveToNewBranch {
                 commits: [commit].into(),
+                beside: None,
+                first: false,
+                copy: false,
             };
             let ((_, name), _) = crate::backend::apply(path, moving).unwrap();
             let moved = newest_entry(path);
@@ -3192,6 +3895,967 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
                 "{name} would be listed beside the commit back in place"
             );
         })
+    }
+
+    /// A workspace whose branch feature has commits "edit" and "second" on top of it, with a
+    /// new file uncommitted, and second.
+    fn feature_with_a_new_file() -> (tempfile::TempDir, CommitId) {
+        let (dir, ..) = workspace_with_an_edit();
+        let path = dir.path();
+        git(path, &["commit", "-q", "--allow-empty", "-m", "second"]);
+        let second = head(path);
+        crate::backend::apply(path, name_at(second, "feature")).unwrap();
+        std::fs::write(path.join("new"), "new\n").unwrap();
+        (dir, second)
+    }
+
+    /// The titles of `branch`'s commits newest first, down to the target.
+    fn titles_on(path: &Path, branch: &str) -> String {
+        let range = format!("origin/main..{branch}");
+        let log = git(path, &["log", "--format=%s", &range]);
+        log.lines().collect::<Vec<_>>().join(", ")
+    }
+
+    #[test]
+    fn a_commit_below_another_goes_right_under_it() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, second) = feature_with_a_new_file();
+            let path = dir.path();
+            let commit = CommitChanges {
+                to: CommitTo::BelowCommit {
+                    commit: second,
+                    branch: full("refs/heads/feature"),
+                },
+                ..commit_to_main(
+                    vec![Selected::whole(&uncommitted(path)[0])],
+                    "Between",
+                    false,
+                )
+            };
+            let (committed, _) = crate::backend::apply(path, commit).unwrap();
+            let committed = committed.committed();
+            assert_eq!(
+                titles_on(path, "feature"),
+                "second, Between, edit",
+                "it goes between second and the commit under it"
+            );
+            assert_eq!(
+                committed.branch,
+                full("refs/heads/feature"),
+                "on the branch that has second"
+            );
+            assert!(uncommitted(path).is_empty(), "the new file went in");
+        })
+    }
+
+    /// A workspace whose branch feature edits `file`, with that edit edited again uncommitted,
+    /// which builds on it, and a new file, which doesn't.
+    fn an_edit_building_on_feature() -> tempfile::TempDir {
+        let (dir, edit, _, mut edited) = workspace_with_an_edit();
+        let path = dir.path();
+        crate::backend::apply(path, name_at(edit, "feature")).unwrap();
+        edited[4] = "five c\n".into();
+        std::fs::write(path.join("file"), edited.concat()).unwrap();
+        std::fs::write(path.join("new"), "new\n").unwrap();
+        dir
+    }
+
+    /// A commit of all of `path`'s uncommitted files to a new stack of its own.
+    fn commit_all_to_a_new_stack(path: &Path) -> CommitChanges {
+        let files = uncommitted(path).iter().map(Selected::whole).collect();
+        CommitChanges {
+            to: CommitTo::NewBranchAt {
+                beside: None,
+                first: false,
+                name: Some("apart".into()),
+            },
+            ..commit_to_main(files, "Apart", false)
+        }
+    }
+
+    #[test]
+    fn a_commit_some_of_whose_changes_build_on_another_branch_isnt_made() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let dir = an_edit_building_on_feature();
+            let path = dir.path();
+            let before = crate::backend::history::oplog_head(&open(path).unwrap());
+            let (outcome, _) =
+                crate::backend::apply(path, commit_all_to_a_new_stack(path)).unwrap();
+            let CommitOutcome::Blocked(blocked) = outcome else {
+                panic!("the edit of feature's edit can't go in a stack of its own: {outcome:?}");
+            };
+            assert_eq!(
+                blocked.builds_on,
+                Some(full("refs/heads/feature")),
+                "everything left out can go on feature"
+            );
+            let left_out: Vec<_> = (blocked.changes.iter())
+                .map(|change| (change.path.as_str(), change.builds_on.clone()))
+                .collect();
+            assert_eq!(
+                left_out,
+                [("file", vec![full("refs/heads/feature")])],
+                "only the edit is left out, as it builds on feature's commit"
+            );
+            let hunks: Vec<_> = (blocked.changes.iter())
+                .flat_map(|change| &change.hunks)
+                .map(|hunk| {
+                    let on: Vec<_> = (hunk.builds_on.iter())
+                        .map(|commit| (commit.title.as_str(), commit.branch.clone()))
+                        .collect();
+                    let lines: Vec<_> = (hunk.lines.iter())
+                        .map(|line| (line.kind, line.old, line.new, &*line.text))
+                        .collect();
+                    ((hunk.new_start, hunk.new_lines), lines, on)
+                })
+                .collect();
+            use crate::backend::LineKind::{Added, Removed};
+            assert_eq!(
+                hunks,
+                [(
+                    (5, 1),
+                    vec![
+                        (Removed, Some(5), None, "five a"),
+                        (Removed, Some(6), None, "five b"),
+                        (Added, None, Some(5), "five c"),
+                    ],
+                    vec![("edit", Some(full("refs/heads/feature")))]
+                )],
+                "the user sees each line numbered as the diff does, and what it builds on"
+            );
+            assert!(
+                blocked.takes_others,
+                "the new file could still be committed"
+            );
+            assert_eq!(
+                git(path, &["branch", "--list", "apart"]),
+                "",
+                "nothing was committed, so no branch was made for it"
+            );
+            assert_eq!(
+                uncommitted(path).len(),
+                2,
+                "both files are still uncommitted"
+            );
+            assert_eq!(
+                crate::backend::history::oplog_head(&open(path).unwrap()),
+                before,
+                "nothing was recorded to undo"
+            );
+        })
+    }
+
+    /// A workspace whose branch alpha edits line 5 and beta, a stack of its own, line 15, with
+    /// both lines edited again uncommitted, so the change builds on both.
+    fn an_edit_building_on_alpha_and_beta() -> tempfile::TempDir {
+        let (dir, edit, _, mut edited) = workspace_with_an_edit();
+        let path = dir.path();
+        crate::backend::apply(path, name_at(edit, "alpha")).unwrap();
+        edited[14] = "fifteen\n".into();
+        std::fs::write(path.join("file"), edited.concat()).unwrap();
+        let beta = CommitChanges {
+            to: CommitTo::NewBranchAt {
+                beside: None,
+                first: false,
+                name: Some("beta".into()),
+            },
+            ..commit_to_main(vec![Selected::whole(&uncommitted(path)[0])], "Beta", false)
+        };
+        crate::backend::apply(path, beta).unwrap().0.committed();
+        edited[4] = "five c\n".into();
+        edited[14] = "fifteen again\n".into();
+        std::fs::write(path.join("file"), edited.concat()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_commit_building_on_three_unstacked_branches_stacks_them_all() {
+        but_testsupport::isolated_app_data_dir(|| {
+            // alpha edits line 5, beta line 12 and gamma line 18, each a stack of its own.
+            let (dir, edit, _, mut edited) = workspace_with_an_edit();
+            let path = dir.path();
+            crate::backend::apply(path, name_at(edit, "alpha")).unwrap();
+            for (line, name) in [(11, "beta"), (17, "gamma")] {
+                edited[line] = format!("{name}\n");
+                std::fs::write(path.join("file"), edited.concat()).unwrap();
+                let commit = CommitChanges {
+                    to: CommitTo::NewBranchAt {
+                        beside: None,
+                        first: false,
+                        name: Some(name.into()),
+                    },
+                    ..commit_to_main(vec![Selected::whole(&uncommitted(path)[0])], name, false)
+                };
+                crate::backend::apply(path, commit).unwrap().0.committed();
+            }
+            edited[4] = "five c\n".into();
+            edited[11] = "beta again\n".into();
+            edited[17] = "gamma again\n".into();
+            std::fs::write(path.join("file"), edited.concat()).unwrap();
+            let all = || commit_to_main(vec![Selected::whole(&uncommitted(path)[0])], "All", false);
+            let before = crate::backend::history::oplog_head(&open(path).unwrap());
+
+            let new_stack = CommitChanges {
+                to: CommitTo::NewBranchAt {
+                    beside: None,
+                    first: false,
+                    name: None,
+                },
+                ..all()
+            };
+            let (outcome, _) = crate::backend::apply(path, new_stack).unwrap();
+            let CommitOutcome::Blocked(blocked) = outcome else {
+                panic!("no one branch takes edits of three: {outcome:?}");
+            };
+            let stacking = blocked.stack.expect("the three stack cleanly");
+            assert_eq!(
+                stacking.branches.len(),
+                2,
+                "two stacks move onto the third: {stacking:?}"
+            );
+
+            let stacked = CommitChanges {
+                to: CommitTo::Branch(stacking.top.clone()),
+                restack: Some(stacking.clone()),
+                ..all()
+            };
+            let (outcome, _) = crate::backend::apply(path, stacked).unwrap();
+            assert_eq!(outcome.committed().branch, stacking.top);
+            let titles = titles_on(path, &stacking.top.shorten().to_string());
+            assert!(
+                titles.starts_with("All, ")
+                    && ["edit", "beta", "gamma"].iter().all(|t| titles.contains(t)),
+                "the top branch takes it, over all three branches' commits: {titles}"
+            );
+            assert!(uncommitted(path).is_empty(), "it took every change");
+            assert_eq!(
+                entries_since(path, before),
+                "CreateCommit\n",
+                "stacking all three and committing are one undo step"
+            );
+        })
+    }
+
+    #[test]
+    fn a_merged_branch_is_only_ever_stacked_on() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let dir = an_edit_building_on_alpha_and_beta();
+            let path = dir.path();
+            // Squash-merged: the target has alpha's changes in a commit of its own.
+            let squash = git(
+                path,
+                &[
+                    "commit-tree",
+                    "alpha^{tree}",
+                    "-p",
+                    "refs/remotes/origin/main",
+                    "-m",
+                    "Squash of alpha",
+                ],
+            );
+            git(
+                path,
+                &["update-ref", "refs/remotes/origin/main", squash.trim()],
+            );
+            let alpha = git(path, &["rev-parse", "alpha"]);
+
+            let commit = CommitChanges {
+                to: CommitTo::NewBranchAt {
+                    beside: None,
+                    first: false,
+                    name: None,
+                },
+                ..commit_to_main(vec![Selected::whole(&uncommitted(path)[0])], "Both", false)
+            };
+            let (outcome, _) = crate::backend::apply(path, commit).unwrap();
+            let CommitOutcome::Blocked(blocked) = outcome else {
+                panic!("a new branch can take neither edit: {outcome:?}");
+            };
+            let stacking = blocked.stack.expect("beta can go on alpha");
+            assert_eq!(
+                (stacking.branches.clone(), stacking.onto.clone()),
+                (vec![full("refs/heads/beta")], full("refs/heads/alpha")),
+                "beta goes on merged alpha, which never moves"
+            );
+
+            let stacked = CommitChanges {
+                to: CommitTo::Branch(stacking.top.clone()),
+                restack: Some(stacking),
+                ..commit_to_main(vec![Selected::whole(&uncommitted(path)[0])], "Both", false)
+            };
+            crate::backend::apply(path, stacked).unwrap().0.committed();
+            assert_eq!(
+                git(path, &["rev-parse", "alpha"]),
+                alpha,
+                "alpha's commits are as they were"
+            );
+            assert!(uncommitted(path).is_empty(), "beta took every change");
+        })
+    }
+
+    #[test]
+    fn a_commit_building_on_two_unstacked_branches_is_offered_stacking_them() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let dir = an_edit_building_on_alpha_and_beta();
+            let path = dir.path();
+            let both = || CommitChanges {
+                to: CommitTo::Branch(full("refs/heads/alpha")),
+                ..commit_to_main(vec![Selected::whole(&uncommitted(path)[0])], "Both", false)
+            };
+            let before = crate::backend::history::oplog_head(&open(path).unwrap());
+
+            let (outcome, _) = crate::backend::apply(path, both()).unwrap();
+            let CommitOutcome::Blocked(blocked) = outcome else {
+                panic!("alpha alone can't take the edit of beta's line: {outcome:?}");
+            };
+            assert_eq!(blocked.builds_on, None, "no one branch takes it all");
+            let stacking = blocked.stack.expect("the two branches stack cleanly");
+            let mut pair = [stacking.top.clone(), stacking.onto.clone()];
+            pair.sort();
+            assert_eq!(
+                pair,
+                [full("refs/heads/alpha"), full("refs/heads/beta")],
+                "one of them goes on the other"
+            );
+            assert!(stacking.pushed.is_empty(), "nothing is pushed");
+            assert_eq!(
+                entries_since(path, before),
+                "",
+                "trying it out changed nothing"
+            );
+            assert_eq!(titles_on(path, "beta"), "Beta", "beta is as it was");
+
+            let stacked = CommitChanges {
+                to: CommitTo::NewBranchAt {
+                    beside: Some((stacking.top.clone(), false)),
+                    first: false,
+                    name: Some("both".into()),
+                },
+                restack: Some(stacking.clone()),
+                ..both()
+            };
+            let (outcome, _) = crate::backend::apply(path, stacked).unwrap();
+            outcome.committed();
+            let titles = titles_on(path, "both");
+            assert!(
+                titles.starts_with("Both, ") && titles.contains("Beta") && titles.contains("edit"),
+                "the new branch sits on both branches' commits: {titles}"
+            );
+            assert!(uncommitted(path).is_empty(), "it took every change");
+            assert_eq!(
+                entries_since(path, before),
+                "CreateCommit\n",
+                "stacking and committing are one undo step"
+            );
+            let step = newest_entry(path);
+            let undone = undo(path, step, None).unwrap();
+            assert!(
+                matches!(undone, crate::backend::history::Undone::Done(_)),
+                "nothing came after it to stop the undo"
+            );
+            assert_eq!(
+                (titles_on(path, "alpha"), titles_on(path, "beta")),
+                ("edit".to_owned(), "Beta".to_owned()),
+                "undo leaves each branch on its own again"
+            );
+            assert_eq!(uncommitted(path).len(), 1, "with the change uncommitted");
+
+            // Or on the branch stacked, which is on top once it's stacked.
+            let on_top = CommitChanges {
+                to: CommitTo::Branch(stacking.top.clone()),
+                restack: Some(stacking.clone()),
+                ..both()
+            };
+            let (outcome, _) = crate::backend::apply(path, on_top).unwrap();
+            assert_eq!(outcome.committed().branch, stacking.top);
+            let titles = titles_on(path, &stacking.top.shorten().to_string());
+            assert!(
+                titles.starts_with("Both, ") && titles.contains("Beta") && titles.contains("edit"),
+                "the branch stacked takes it, over both branches' commits: {titles}"
+            );
+            assert!(uncommitted(path).is_empty(), "it took every change");
+        })
+    }
+
+    #[test]
+    fn a_blocked_commit_goes_where_its_changes_build_on_or_without_them() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let dir = an_edit_building_on_feature();
+            let path = dir.path();
+            let without = CommitChanges {
+                leave_out: true,
+                ..commit_all_to_a_new_stack(path)
+            };
+            let (outcome, _) = crate::backend::apply(path, without).unwrap();
+            let committed = outcome.committed();
+            assert_eq!(
+                titles_on(path, "apart"),
+                "Apart",
+                "the new file went in a stack"
+            );
+            assert_eq!(
+                committed.left_out,
+                [
+                    "file: it builds on changes in a later commit or another branch; put it \
+                     where those are, or move them first"
+                ],
+                "what was left out, as the user agreed, is said"
+            );
+
+            let to_feature = CommitChanges {
+                to: CommitTo::Branch(full("refs/heads/feature")),
+                ..commit_all_to_a_new_stack(path)
+            };
+            let (outcome, _) = crate::backend::apply(path, to_feature).unwrap();
+            outcome.committed();
+            assert_eq!(
+                titles_on(path, "feature"),
+                "Apart, edit",
+                "the edit went on the commit it builds on"
+            );
+            assert!(uncommitted(path).is_empty(), "nothing was left out");
+        })
+    }
+
+    #[test]
+    fn a_commit_to_a_new_branch_above_another_stacks_it_on_top() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, _) = feature_with_a_new_file();
+            let path = dir.path();
+            let commit = CommitChanges {
+                to: CommitTo::NewBranchAt {
+                    beside: Some((full("refs/heads/feature"), false)),
+                    first: false,
+                    name: None,
+                },
+                ..commit_to_main(
+                    vec![Selected::whole(&uncommitted(path)[0])],
+                    "On top",
+                    false,
+                )
+            };
+            let (committed, _) = crate::backend::apply(path, commit).unwrap();
+            let committed = committed.committed();
+            assert_eq!(
+                titles_on(path, &committed.branch.to_string()),
+                "On top, second, edit",
+                "the new branch holds its commit over feature's"
+            );
+            assert_eq!(
+                titles_on(path, "feature"),
+                "second, edit",
+                "feature is as it was"
+            );
+        })
+    }
+
+    #[test]
+    fn a_commit_to_a_new_branch_below_another_stacks_it_underneath() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, _) = feature_with_a_new_file();
+            let path = dir.path();
+            let commit = CommitChanges {
+                to: CommitTo::NewBranchAt {
+                    beside: Some((full("refs/heads/feature"), true)),
+                    first: false,
+                    name: None,
+                },
+                ..commit_to_main(vec![Selected::whole(&uncommitted(path)[0])], "Under", false)
+            };
+            let (committed, _) = crate::backend::apply(path, commit).unwrap();
+            let committed = committed.committed();
+            assert_eq!(
+                titles_on(path, &committed.branch.to_string()),
+                "Under",
+                "the new branch holds only its commit"
+            );
+            assert_eq!(
+                titles_on(path, "feature"),
+                "second, edit, Under",
+                "feature sits on top of it"
+            );
+        })
+    }
+
+    #[test]
+    fn a_commit_to_a_new_branch_takes_the_name_given() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, _) = feature_with_a_new_file();
+            let path = dir.path();
+            let commit = CommitChanges {
+                to: CommitTo::NewBranchAt {
+                    beside: None,
+                    first: false,
+                    name: Some("my feature".into()),
+                },
+                ..commit_to_main(vec![Selected::whole(&uncommitted(path)[0])], "Named", false)
+            };
+            let (committed, _) = crate::backend::apply(path, commit).unwrap();
+            let committed = committed.committed();
+            assert_eq!(
+                committed.branch,
+                full("refs/heads/my-feature"),
+                "named as typed, as Git allows"
+            );
+            assert_eq!(titles_on(path, "my-feature"), "Named", "with its commit");
+        })
+    }
+
+    #[test]
+    fn a_commit_to_a_new_stack_first_goes_before_the_others() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, _) = feature_with_a_new_file();
+            let path = dir.path();
+            let commit = CommitChanges {
+                to: CommitTo::NewBranchAt {
+                    beside: None,
+                    first: true,
+                    name: None,
+                },
+                ..commit_to_main(vec![Selected::whole(&uncommitted(path)[0])], "Apart", false)
+            };
+            let (committed, _) = crate::backend::apply(path, commit).unwrap();
+            let committed = committed.committed();
+            let workspace = crate::backend::load_workspace(path, Default::default()).unwrap();
+            let stacks: Vec<String> = (workspace.lanes_in(&Checkout::Main))
+                .filter_map(|lane| lane.branches.first()?.ref_name.as_ref())
+                .map(|name| match *name == committed.branch {
+                    true => "<new>".to_owned(),
+                    false => short_ref(name).into_owned(),
+                })
+                .collect();
+            assert_eq!(
+                stacks,
+                ["<new>", "feature"],
+                "the stacks top first, as the navigator lists them"
+            );
+            assert_eq!(
+                titles_on(path, &committed.branch.to_string()),
+                "Apart",
+                "its stack holds only its commit"
+            );
+        })
+    }
+
+    /// A repository whose linked worktree "agent", in a folder of its own, has its branch agent
+    /// with commits "one" and "two", and a new file uncommitted: the repository, the worktree's
+    /// folder, which goes with it, and the worktree's path.
+    fn agent_with_a_new_file() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let dir = repo_with("one\n");
+        let path = dir.path();
+        target_origin_main(path);
+        let ctx = open(path).unwrap();
+        (ctx.db.get_cache_mut().unwrap())
+            .worktree_meta_mut()
+            .mark_adopted()
+            .unwrap();
+        drop(ctx);
+        let outside = tempfile::tempdir().unwrap();
+        let at = outside.path().join("agent");
+        let at_str = at.to_str().unwrap();
+        git(
+            path,
+            &["worktree", "add", "-q", "-b", "agent", at_str, "main"],
+        );
+        for (message, file) in [("one", "a"), ("two", "b")] {
+            std::fs::write(at.join(file), message).unwrap();
+            git(&at, &["add", file]);
+            git(&at, &["commit", "-q", "-m", message]);
+        }
+        std::fs::write(at.join("new"), "new\n").unwrap();
+        (dir, outside, at)
+    }
+
+    /// Commit agent's uncommitted file `to` there, with `message`.
+    fn commit_agents(path: &Path, to: CommitTo, message: &str) -> Committed {
+        let workspace = crate::backend::load_workspace(path, Default::default()).unwrap();
+        let agent = Checkout::Linked("agent".into());
+        let files = workspace.uncommitted_in(&agent).unwrap();
+        let commit = CommitChanges {
+            to,
+            changes: Arc::from([Selected::whole(&files[0])]),
+            checkout: agent,
+            message: message.into(),
+            run_hooks: false,
+            leave_out: false,
+            restack: None,
+        };
+        crate::backend::apply(path, commit).unwrap().0.committed()
+    }
+
+    #[test]
+    fn a_linked_worktrees_branches_are_made_with_the_main_checkout_detached() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, _outside, at) = agent_with_a_new_file();
+            let path = dir.path();
+            // All the work is in the linked worktree, with no branch checked out in the main one.
+            git(path, &["checkout", "-q", "--detach"]);
+            let agent = full("refs/heads/agent");
+
+            let to = CommitTo::NewBranchAt {
+                beside: Some((agent.clone(), false)),
+                first: false,
+                name: None,
+            };
+            let committed = commit_agents(path, to, "On top");
+            let on_top = short_ref(&committed.branch).into_owned();
+            let at_one = CreateBranchAtCommit {
+                commit: CommitId(
+                    gix::ObjectId::from_hex(git(&at, &["rev-parse", "agent~"]).trim().as_bytes())
+                        .unwrap(),
+                ),
+                below: false,
+            };
+            let at_one = crate::backend::apply(path, at_one).unwrap().0;
+            assert_eq!(
+                (
+                    titles_on(path, &on_top),
+                    titles_on(path, &at_one.to_string())
+                ),
+                ("On top, two, one".to_owned(), "one".to_owned()),
+                "each is made as with the main checkout on a branch"
+            );
+            let above = crate::backend::apply(path, CreateDependentBranch { below: agent })
+                .unwrap()
+                .0;
+            assert_eq!(
+                titles_on(path, &above.to_string()),
+                "two, one",
+                "and stacked on agent"
+            );
+            assert_eq!(
+                git(path, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+                "HEAD",
+                "the main checkout stays detached"
+            );
+        })
+    }
+
+    #[test]
+    fn a_linked_worktrees_commit_below_another_goes_right_under_it() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, _outside, at) = agent_with_a_new_file();
+            let path = dir.path();
+            let two = head(&at);
+            let to = CommitTo::BelowCommit {
+                commit: two,
+                branch: full("refs/heads/agent"),
+            };
+            commit_agents(path, to, "Between");
+            assert_eq!(
+                titles_on(path, "agent"),
+                "two, Between, one",
+                "it goes between two and the commit under it"
+            );
+            assert_eq!(
+                git(&at, &["symbolic-ref", "--short", "HEAD"]).trim(),
+                "agent",
+                "the worktree stays on its branch"
+            );
+            assert_eq!(
+                git(&at, &["status", "--porcelain"]),
+                "",
+                "and its files are as its branch has them now"
+            );
+        })
+    }
+
+    #[test]
+    fn a_linked_worktrees_commit_to_a_new_branch_above_its_own_checks_that_out() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, _outside, at) = agent_with_a_new_file();
+            let path = dir.path();
+            let to = CommitTo::NewBranchAt {
+                beside: Some((full("refs/heads/agent"), false)),
+                first: false,
+                name: None,
+            };
+            let committed = commit_agents(path, to, "On top");
+            let new = short_ref(&committed.branch).into_owned();
+            assert_eq!(
+                titles_on(path, &new),
+                "On top, two, one",
+                "the new branch holds its commit over agent's"
+            );
+            assert_eq!(titles_on(path, "agent"), "two, one", "agent is as it was");
+            assert_eq!(
+                git(&at, &["symbolic-ref", "--short", "HEAD"]).trim(),
+                new,
+                "the worktree goes on to the new branch, which has its change"
+            );
+            assert_eq!(
+                git(&at, &["status", "--porcelain"]),
+                "",
+                "and its files are as the new branch has them"
+            );
+        })
+    }
+
+    #[test]
+    fn a_linked_worktrees_commit_to_a_new_branch_below_its_own_stacks_it_underneath() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, _outside, at) = agent_with_a_new_file();
+            let path = dir.path();
+            let to = CommitTo::NewBranchAt {
+                beside: Some((full("refs/heads/agent"), true)),
+                first: false,
+                name: None,
+            };
+            let committed = commit_agents(path, to, "Under");
+            let new = short_ref(&committed.branch).into_owned();
+            assert_eq!(
+                titles_on(path, &new),
+                "Under",
+                "the new branch holds only its commit"
+            );
+            assert_eq!(
+                titles_on(path, "agent"),
+                "two, one, Under",
+                "agent sits on top of it"
+            );
+            assert_eq!(
+                git(&at, &["symbolic-ref", "--short", "HEAD"]).trim(),
+                "agent",
+                "the worktree stays on its branch, which has the change under it"
+            );
+            assert_eq!(
+                git(&at, &["status", "--porcelain"]),
+                "",
+                "and its files are as its branch has them now"
+            );
+        })
+    }
+
+    #[test]
+    fn a_move_to_a_new_branch_beside_another_stacks_it_above_or_below() {
+        let mut said = String::new();
+        for below in [false, true] {
+            but_testsupport::isolated_app_data_dir(|| {
+                let (dir, edit, ..) = workspace_with_an_edit();
+                let path = dir.path();
+                git(path, &["commit", "-q", "--allow-empty", "-m", "second"]);
+                let second = head(path);
+                crate::backend::apply(path, name_at(second, "feature")).unwrap();
+                // The commit at the far end from where the new branch goes, so it crosses
+                // feature's other commit to get there.
+                let moved = match below {
+                    true => second,
+                    false => edit,
+                };
+                let moving = MoveToNewBranch {
+                    commits: [moved].into(),
+                    beside: Some((full("refs/heads/feature"), below)),
+                    first: false,
+                    copy: false,
+                };
+                let ((_, new), _) = crate::backend::apply(path, moving).unwrap();
+                let titles = |branch: &str| {
+                    let range = format!("origin/main..{branch}");
+                    let log = git(path, &["log", "--format=%s", &range]);
+                    log.lines().collect::<Vec<_>>().join(", ")
+                };
+                said += &format!(
+                    "below {below}: feature [{}], <new> [{}]\n",
+                    titles("feature"),
+                    titles(&new.to_string()),
+                );
+            });
+        }
+        // Each branch lists its commits newest first, down to the target. Above feature, the
+        // new branch holds feature's commits under its own; below, feature holds the new one's.
+        snapbox::assert_data_eq!(
+            said,
+            snapbox::str![[r#"
+below false: feature [second], <new> [edit, second]
+below true: feature [edit, second], <new> [second]
+
+"#]]
+        );
+    }
+
+    #[test]
+    fn a_cherry_pick_to_a_new_stack_copies_the_commits_and_leaves_them_where_they_are() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, edit, ..) = workspace_with_an_edit();
+            let path = dir.path();
+            git(path, &["commit", "-q", "--allow-empty", "-m", "second"]);
+            let second = head(path);
+            crate::backend::apply(path, name_at(second, "feature")).unwrap();
+            let copying = MoveToNewBranch {
+                commits: [second, edit].into(),
+                beside: None,
+                first: false,
+                copy: true,
+            };
+            let ((_, new), _) = crate::backend::apply(path, copying).unwrap();
+            let said = format!(
+                "feature [{}], <new> [{}]",
+                titles_on(path, "feature"),
+                titles_on(path, &new.to_string()),
+            );
+            // Each branch lists its commits newest first, down to the target: the copies keep
+            // the order the originals have, which stay on feature.
+            snapbox::assert_data_eq!(
+                said,
+                snapbox::str!["feature [second, edit], <new> [second, edit]"]
+            );
+        })
+    }
+
+    #[test]
+    fn a_cherry_pick_says_which_copy_is_newest() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, edit, ..) = workspace_with_an_edit();
+            let path = dir.path();
+            git(path, &["commit", "-q", "--allow-empty", "-m", "second"]);
+            let second = head(path);
+            git(path, &["commit", "-q", "--allow-empty", "-m", "third"]);
+            let third = head(path);
+            crate::backend::apply(path, name_at(third, "feature")).unwrap();
+            let picking = CherryPick {
+                commits: [third, second].into(),
+                to: Destination::AboveCommit(edit),
+            };
+            let ((_, newest), _) = crate::backend::apply(path, picking).unwrap();
+            let newest = newest.expect("two commits were copied");
+            let title = git(path, &["log", "-1", "--format=%s", &newest.0.to_string()]);
+            assert_eq!(
+                title.trim(),
+                "third",
+                "the newer of the two is copied last, on top"
+            );
+            assert_ne!(newest, third, "it's a copy, not the original");
+        })
+    }
+
+    #[test]
+    fn a_move_to_a_new_stack_puts_it_after_the_others_or_first() {
+        let mut said = String::new();
+        for first in [false, true] {
+            but_testsupport::isolated_app_data_dir(|| {
+                let (dir, ..) = workspace_with_an_edit();
+                let path = dir.path();
+                git(path, &["commit", "-q", "--allow-empty", "-m", "second"]);
+                let second = head(path);
+                crate::backend::apply(path, name_at(second, "feature")).unwrap();
+                let moving = MoveToNewBranch {
+                    commits: [second].into(),
+                    beside: None,
+                    first,
+                    copy: false,
+                };
+                let ((_, new), _) = crate::backend::apply(path, moving).unwrap();
+                let workspace = crate::backend::load_workspace(path, Default::default()).unwrap();
+                let stacks: Vec<String> = (workspace.lanes_in(&Checkout::Main))
+                    .filter_map(|lane| lane.branches.first()?.ref_name.as_ref())
+                    .map(|name| match *name == new {
+                        true => "<new>".to_owned(),
+                        false => short_ref(name).into_owned(),
+                    })
+                    .collect();
+                said += &format!("first {first}: {}\n", stacks.join(", "));
+            });
+        }
+        // The stacks top first, as the navigator lists them.
+        snapbox::assert_data_eq!(
+            said,
+            snapbox::str![[r#"
+first false: feature, <new>
+first true: <new>, feature
+
+"#]]
+        );
+    }
+
+    #[test]
+    fn a_move_to_a_new_branch_beside_a_linked_worktrees_stacks_it_in_its_lane() {
+        let mut said = String::new();
+        for managed in [false, true] {
+            for below in [false, true] {
+                but_testsupport::isolated_app_data_dir(|| {
+                    let dir = repo_with("one\n");
+                    let path = dir.path();
+                    target_origin_main(path);
+                    if managed {
+                        crate::backend::apply(path, branch_named("beside")).unwrap();
+                    }
+                    let ctx = open(path).unwrap();
+                    (ctx.db.get_cache_mut().unwrap())
+                        .worktree_meta_mut()
+                        .mark_adopted()
+                        .unwrap();
+                    drop(ctx);
+                    let outside = tempfile::tempdir().unwrap();
+                    let at = outside.path().join("agent");
+                    let at_str = at.to_str().unwrap();
+                    git(
+                        path,
+                        &["worktree", "add", "-q", "-b", "agent", at_str, "main"],
+                    );
+                    for (message, file) in [("one", "a"), ("two", "b")] {
+                        std::fs::write(at.join(file), message).unwrap();
+                        git(&at, &["add", file]);
+                        git(&at, &["commit", "-q", "-m", message]);
+                    }
+                    // The commit at the far end from where the new branch goes, so it crosses
+                    // agent's other commit to get there.
+                    let moved = match below {
+                        true => "agent",
+                        false => "agent~",
+                    };
+                    let moved = git(path, &["rev-parse", moved]);
+                    let moved = CommitId(gix::ObjectId::from_hex(moved.trim().as_bytes()).unwrap());
+                    let moving = MoveToNewBranch {
+                        commits: [moved].into(),
+                        beside: Some((full("refs/heads/agent"), below)),
+                        first: false,
+                        copy: false,
+                    };
+                    let ((_, new), _) = crate::backend::apply(path, moving).unwrap();
+                    let workspace =
+                        crate::backend::load_workspace(path, Default::default()).unwrap();
+                    let lane = workspace.worktree_lane("agent".into()).unwrap();
+                    let branches: Vec<String> = (lane.branches.iter())
+                        .map(|branch| {
+                            let name = match branch.ref_name.as_ref() == Some(&new) {
+                                true => "<new>".to_owned(),
+                                false => branch.name.clone(),
+                            };
+                            let titles: Vec<_> =
+                                branch.commits.iter().map(|c| c.title.as_str()).collect();
+                            format!("{name} [{}]", titles.join(", "))
+                        })
+                        .collect();
+                    let checked_out = git(&at, &["symbolic-ref", "--short", "HEAD"]);
+                    let checked_out = match checked_out.trim() == short_ref(&new) {
+                        true => "<new>".to_owned(),
+                        false => checked_out.trim().to_owned(),
+                    };
+                    let left = git(&at, &["status", "--porcelain"]);
+                    said += &format!(
+                        "managed {managed}, below {below}: {}, {checked_out} checked out{}\n",
+                        branches.join(", "),
+                        match left.is_empty() {
+                            true => String::new(),
+                            false => format!(", left {left:?}"),
+                        },
+                    );
+                });
+            }
+        }
+        // The worktree's lane top first, each branch's commits newest first, whether or not the
+        // main checkout is the workspace. On top of the branch it has checked out, the worktree
+        // checks out the new one, and either way keeps its files as they were.
+        snapbox::assert_data_eq!(
+            said,
+            snapbox::str![[r#"
+managed false, below false: <new> [one], agent [two], <new> checked out
+managed false, below true: agent [one], <new> [two], agent checked out
+managed true, below false: <new> [one], agent [two], <new> checked out
+managed true, below true: agent [one], <new> [two], agent checked out
+
+"#]]
+        );
     }
 
     #[test]
@@ -3665,7 +5329,7 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
             git(path, &["commit", "-q", "--allow-empty", "-m", "an agent's"]);
             git(path, &["branch", "-f", "side", "HEAD"]);
 
-            let remove = RemoveBranch {
+            let remove = DeleteBranchAndCommits {
                 branch: full("refs/heads/side"),
                 tip: Some(asked),
             };
@@ -3704,7 +5368,7 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
 
             let delete = DeleteBranchAndCommits {
                 branch: full("refs/heads/feature"),
-                tip: work,
+                tip: Some(work),
             };
             crate::backend::apply(path, delete).unwrap();
             assert!(
@@ -3744,7 +5408,84 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
     }
 
     #[test]
-    fn a_branch_checked_out_on_its_own_keeps_its_commits() {
+    fn a_linked_worktrees_top_branch_goes_and_leaves_it_on_the_one_below() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let dir = repo_with("one\n");
+            let path = dir.path();
+            target_origin_main(path);
+            let (_outside, linked) = agent_worktree(path);
+            let shown = crate::backend::worktrees::SetArchived {
+                name: "agent".into(),
+                archived: false,
+            };
+            crate::backend::apply(path, shown).unwrap();
+            std::fs::write(linked.join("lower.txt"), "lower\n").unwrap();
+            git(&linked, &["add", "lower.txt"]);
+            git(&linked, &["commit", "-q", "-m", "lower"]);
+            git(&linked, &["checkout", "-q", "-b", "upper"]);
+            std::fs::write(linked.join("upper.txt"), "upper\n").unwrap();
+            git(&linked, &["add", "upper.txt"]);
+            git(&linked, &["commit", "-q", "-m", "upper"]);
+
+            let delete = DeleteBranchAndCommits {
+                branch: full("refs/heads/upper"),
+                tip: Some(head(&linked)),
+            };
+            crate::backend::apply(path, delete).unwrap();
+            assert!(
+                git(path, &["branch", "--list", "upper"]).is_empty(),
+                "the branch is gone"
+            );
+            assert_eq!(
+                git(&linked, &["symbolic-ref", "HEAD"]).trim(),
+                "refs/heads/agent",
+                "the worktree is on the branch below"
+            );
+            assert!(
+                !linked.join("upper.txt").exists() && linked.join("lower.txt").exists(),
+                "only its own commit went"
+            );
+            assert!(
+                git(&linked, &["status", "--porcelain"]).is_empty(),
+                "the worktree's files follow"
+            );
+        })
+    }
+
+    #[test]
+    fn an_empty_branch_checked_out_on_its_own_goes_and_leaves_head_below() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let dir = repo_with("one\n");
+            let path = dir.path();
+            target_origin_main(path);
+            git(path, &["checkout", "-q", "-b", "feature"]);
+            git(
+                path,
+                &["commit", "-q", "--allow-empty", "-m", "feature work"],
+            );
+            let work = head(path);
+            let above = CreateDependentBranch {
+                below: full("refs/heads/feature"),
+            };
+            let (tip, _) = crate::backend::apply(path, above).unwrap();
+            assert_eq!(git(path, &["symbolic-ref", "HEAD"]).trim(), tip.to_string());
+
+            let delete = DeleteBranchAndCommits {
+                branch: tip,
+                tip: None,
+            };
+            crate::backend::apply(path, delete).unwrap();
+            assert_eq!(
+                git(path, &["symbolic-ref", "HEAD"]).trim(),
+                "refs/heads/feature",
+                "HEAD is back on the branch it was made on"
+            );
+            assert_eq!(head(path), work, "whose commit stays");
+        })
+    }
+
+    #[test]
+    fn the_target_branch_isnt_deleted() {
         but_testsupport::isolated_app_data_dir(|| {
             let dir = repo_with("one\n");
             let path = dir.path();
@@ -3754,13 +5495,12 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
 
             let delete = DeleteBranchAndCommits {
                 branch: full("refs/heads/main"),
-                tip,
+                tip: Some(tip),
             };
-            let refused =
-                crate::backend::apply(path, delete).expect_err("main is checked out on its own");
+            let refused = crate::backend::apply(path, delete).expect_err("main is the target");
             assert!(
-                format!("{refused:#}").contains("checked out on its own"),
-                "there's no workspace to leave it for: {refused:#}"
+                format!("{refused:#}").contains("is the target branch"),
+                "a checkout on it would have nothing to fall back to: {refused:#}"
             );
             assert_eq!(head(path), tip, "main and its commit stay");
             assert_eq!(
@@ -3803,6 +5543,81 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
     }
 
     #[test]
+    fn going_apart_outside_the_workspace_sets_it_up_and_keeps_both_branches() {
+        let mut said = String::new();
+        for what in ["unstack top", "unstack lower", "move Top to a new stack"] {
+            but_testsupport::isolated_app_data_dir(|| {
+                // `top` checked out on its own, stacked on `lower`.
+                let dir = repo_with("one\n");
+                let path = dir.path();
+                target_origin_main(path);
+                git(path, &["checkout", "-q", "-b", "lower"]);
+                git(path, &["commit", "-q", "--allow-empty", "-m", "Lower"]);
+                git(path, &["checkout", "-q", "-b", "top"]);
+                git(path, &["commit", "-q", "--allow-empty", "-m", "Top"]);
+                let lanes = |path: &Path| {
+                    let workspace =
+                        crate::backend::load_workspace(path, Default::default()).unwrap();
+                    let mut lanes: Vec<String> = (workspace.lanes_in(&Checkout::Main))
+                        .map(|lane| {
+                            let branches = lane.branches.iter().map(|branch| {
+                                let titles: Vec<_> =
+                                    branch.commits.iter().map(|c| c.title.as_str()).collect();
+                                format!("{} [{}]", branch.name, titles.join(", "))
+                            });
+                            branches.collect::<Vec<_>>().join(" on ")
+                        })
+                        .collect();
+                    lanes.sort();
+                    let head = git(path, &["symbolic-ref", "--short", "HEAD"]);
+                    format!("{} on {}", lanes.join(" | "), head.trim())
+                };
+                let before = lanes(path);
+                match what {
+                    "move Top to a new stack" => {
+                        let moving = MoveToNewBranch {
+                            commits: [head(path)].into(),
+                            beside: None,
+                            first: false,
+                            copy: false,
+                        };
+                        crate::backend::apply(path, moving).unwrap();
+                    }
+                    _ => {
+                        let branch = full(&format!("refs/heads/{}", &what[8..]));
+                        let unstack = TearOffBranch {
+                            branch,
+                            first: false,
+                        };
+                        crate::backend::apply(path, unstack).unwrap();
+                    }
+                }
+                let after = lanes(path).replace("t-branch-1", "<new>");
+                undo(path, newest_entry(path), None).unwrap();
+                said += &format!(
+                    "{what}: {after}; undone: {}\n",
+                    if lanes(path) == before {
+                        "as before"
+                    } else {
+                        "changed"
+                    }
+                );
+            });
+        }
+        // Out of its stack it's a branch of its own, which only GitButler's workspace holds
+        // beside another, as `but move` sets it up: none is left out of the checkout.
+        snapbox::assert_data_eq!(
+            said,
+            snapbox::str![[r#"
+unstack top: lower [Lower] | top [Top] on gitbutler/workspace; undone: as before
+unstack lower: lower [Lower] | top [Top] on gitbutler/workspace; undone: as before
+move Top to a new stack: <new> [Top] | top [] on lower [Lower] on gitbutler/workspace; undone: as before
+
+"#]]
+        );
+    }
+
+    #[test]
     fn unstacking_says_which_branches_it_left_conflicted() {
         but_testsupport::isolated_app_data_dir(|| {
             // `top`, stacked on a branch that adds api.txt, with a commit writing `file`.
@@ -3825,9 +5640,15 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
                 };
                 crate::backend::apply(path, at_api).unwrap();
                 let top = full("refs/heads/top");
-                crate::backend::apply(path, TearOffBranch { branch: top })
-                    .unwrap()
-                    .0
+                crate::backend::apply(
+                    path,
+                    TearOffBranch {
+                        branch: top,
+                        first: false,
+                    },
+                )
+                .unwrap()
+                .0
             };
             assert_eq!(
                 unstacked("api.txt"),
@@ -3990,6 +5811,8 @@ feature: CreateCommit on gitbutler/workspace; undid Created commit: on feature, 
             let squash = Squash {
                 commits: [third, second].into(),
                 into: edit,
+                keep: Messages::Both,
+                emptied: None,
             };
             let (rewritten, ran) = crate::backend::apply(path, squash).unwrap();
             let squashed = rewritten[&edit];
@@ -4017,6 +5840,118 @@ third
 
 
 "#]]
+            );
+        })
+    }
+
+    #[test]
+    fn a_branch_squashed_away_goes_with_its_commits_and_undoes() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, edit, ..) = workspace_with_an_edit();
+            let path = dir.path();
+            git(path, &["commit", "-q", "--allow-empty", "-m", "second"]);
+            let second = head(path);
+            crate::backend::apply(path, name_at(second, "feature")).unwrap();
+            // Edit to a branch of its own, leaving feature with second alone.
+            let moving = MoveToNewBranch {
+                commits: [edit].into(),
+                beside: None,
+                first: false,
+                copy: false,
+            };
+            let ((rewritten, _), _) = crate::backend::apply(path, moving).unwrap();
+            let edit = rewritten.get(&edit).copied().unwrap_or(edit);
+            // Rebased off edit.
+            let feature = git(path, &["rev-parse", "feature"]);
+            let second = CommitId(gix::ObjectId::from_hex(feature.trim().as_bytes()).unwrap());
+            let before = crate::backend::history::oplog_head(&open(path).unwrap());
+
+            let squash = Squash {
+                commits: [second].into(),
+                into: edit,
+                keep: Messages::Both,
+                emptied: Some(full("refs/heads/feature")),
+            };
+            let (rewritten, _) = crate::backend::apply(path, squash).unwrap();
+            assert!(
+                git(path, &["branch", "--list", "feature"]).is_empty(),
+                "the branch its commits went out of goes"
+            );
+            let message = git(
+                path,
+                &["log", "-1", "--format=%B", &rewritten[&edit].0.to_string()],
+            );
+            // One entry, and the commit it went into holding both messages.
+            snapbox::assert_data_eq!(
+                entries_since(path, before) + &message,
+                snapbox::str![[r#"
+SquashCommit
+edit
+
+second
+
+
+"#]]
+            );
+
+            undo(path, newest_entry(path), None).unwrap();
+            assert_eq!(
+                git(path, &["rev-parse", "feature"]).trim(),
+                second.0.to_string(),
+                "one undo brings the branch back with its commit"
+            );
+        })
+    }
+
+    #[test]
+    fn a_squash_keeping_the_targets_message_drops_the_others() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, edit, ..) = workspace_with_an_edit();
+            let path = dir.path();
+            git(path, &["commit", "-q", "--allow-empty", "-m", "second"]);
+            let second = head(path);
+
+            let squash = Squash {
+                commits: [second].into(),
+                into: edit,
+                keep: Messages::Target,
+                emptied: None,
+            };
+            let (rewritten, _) = crate::backend::apply(path, squash).unwrap();
+            let message = git(
+                path,
+                &["log", "-1", "--format=%B", &rewritten[&edit].0.to_string()],
+            );
+            assert_eq!(message.trim(), "edit", "only the target's message is left");
+        })
+    }
+
+    #[test]
+    fn a_branch_uncommitted_goes_and_leaves_its_changes_and_undoes() {
+        but_testsupport::isolated_app_data_dir(|| {
+            let (dir, edit, ..) = workspace_with_an_edit();
+            let path = dir.path();
+            crate::backend::apply(path, name_at(edit, "feature")).unwrap();
+
+            let uncommit = Uncommit {
+                commits: [edit].into(),
+                emptied: Some(full("refs/heads/feature")),
+            };
+            crate::backend::apply(path, uncommit).unwrap();
+            assert!(
+                git(path, &["branch", "--list", "feature"]).is_empty(),
+                "the branch goes"
+            );
+            let left: Vec<String> = (uncommitted(path).into_iter())
+                .map(|file| file.path)
+                .collect();
+            assert_eq!(left, ["file"], "its commit's change is uncommitted");
+
+            undo(path, newest_entry(path), None).unwrap();
+            assert_eq!(
+                git(path, &["rev-parse", "feature"]).trim(),
+                edit.0.to_string(),
+                "one undo brings the branch back with its commit"
             );
         })
     }

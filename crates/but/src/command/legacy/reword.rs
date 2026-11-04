@@ -31,7 +31,7 @@ pub(crate) fn reword_target(
     // Formats without an interactive editor must provide the new message up front.
     if message.is_none() && !format && !out.format().allows_human_ui() {
         return Err(bad_input(
-            "A message must be provided via --message (-m) for this output format",
+            "A message must be provided via --message (-m) or --file (-F) for this output format",
         )
         .into());
     }
@@ -176,7 +176,7 @@ fn edit_branch_name(
             let new_branch_name = {
                 let (repo, ws, _db) = ctx.workspace_and_db_with_perm(perm.read_permission())?;
                 BranchArg(non_validated_new_name)
-                    .resolve_for_creation(&repo, &ws)?
+                    .resolve_unused_local_name(&repo, &ws, Some(branch.reference.as_ref()))?
                     .shorten()
                     .to_string()
             };

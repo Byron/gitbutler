@@ -486,7 +486,7 @@ pub fn get_workspace(
 /// See [`but_workspace::init::set_target_ref_and_init_project()`] for details. The target is always
 /// validated against `HEAD`; an unreachable stored target commit is replaced by their merge-base.
 /// An omitted `push_remote` preserves its current value. It deliberately records no oplog snapshot
-/// because only project metadata changes, not repository state.
+/// because only project metadata and the target's upstream configuration change, not repository state.
 #[but_api]
 #[instrument(err(Debug))]
 pub fn set_target_ref_and_init_project(
@@ -494,13 +494,14 @@ pub fn set_target_ref_and_init_project(
     target_ref: &gix::refs::FullNameRef,
     push_remote: Option<String>,
 ) -> anyhow::Result<()> {
-    let guard = ctx.exclusive_worktree_access();
+    let mut guard = ctx.exclusive_worktree_access();
     {
         let repo = ctx.repo.get()?;
         let target_ref = but_core::ref_metadata::LocalRefName::new(target_ref.to_owned())?;
         but_workspace::init::set_target_ref_and_init_project(&repo, &target_ref, push_remote)?;
     }
-    ctx.invalidate_workspace_cache()?;
+    // The target may now track a remote branch, which the cached repository sees once reloaded.
+    ctx.reload_repo_and_invalidate_workspace(guard.write_permission())?;
     drop(guard);
     Ok(())
 }
@@ -779,13 +780,16 @@ pub fn is_behind_target(
 }
 
 /// The name of the target branch within its remote, like `main` for `refs/remotes/origin/main`.
+/// A target without upstream uses its local name, which is what pushing it creates.
 ///
-/// Errors if no target is set, or if its remote cannot be determined.
+/// Errors if no target is set, or if the upstream's remote cannot be determined.
 pub fn remote_target_short_name(
     project_meta: &but_core::ref_metadata::ProjectMeta,
     repo: &gix::Repository,
 ) -> anyhow::Result<String> {
-    let target_ref = project_meta.remote_target_ref_or_err(repo)?;
+    let Some(target_ref) = project_meta.remote_target_ref(repo)? else {
+        return Ok(project_meta.target_ref_or_err()?.shorten().to_string());
+    };
     but_core::extract_remote_name_and_short_name(target_ref.as_ref(), &repo.remote_names())
         .map(|(_remote_name, short_name)| short_name.to_string())
         .with_context(|| format!("failed to determine remote for branch {target_ref}"))
@@ -1509,6 +1513,24 @@ mod tests {
             super::remote_target_short_name(&project_meta, &repo)?,
             "trunk",
             "review matching uses the upstream branch, not the local name or a shorter remote prefix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_target_short_name_uses_local_name_without_upstream() -> anyhow::Result<()> {
+        let (repo, _tmp) = repo_with_feature_branch()?;
+        let project_meta = but_core::ref_metadata::ProjectMeta {
+            target_ref: Some(but_core::ref_metadata::LocalRefName::new(
+                "refs/heads/feature".try_into()?,
+            )?),
+            push_remote: Some("origin".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::remote_target_short_name(&project_meta, &repo)?,
+            "feature",
+            "a target without upstream is pushed under its local name, so reviews target that name"
         );
         Ok(())
     }

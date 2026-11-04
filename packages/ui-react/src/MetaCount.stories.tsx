@@ -1,8 +1,9 @@
-import preview from "#storybook/preview";
+import { stories } from "../docs/stories.ts";
 import { CiStatus, MetaCount, type MetaCountType } from "./MetaCount.tsx";
 
 const types: Array<MetaCountType> = [
 	"behind",
+	"conflicts",
 	"unpushed",
 	"rebased",
 	"commits",
@@ -21,8 +22,8 @@ const types: Array<MetaCountType> = [
 	"cpu-danger",
 ];
 
-const meta = preview.meta({
-	title: "Sidebar/MetaCount",
+const meta = stories({
+	title: "Content & status/MetaCount",
 	id: "components-metacount",
 	component: MetaCount,
 	parameters: {
@@ -30,9 +31,6 @@ const meta = preview.meta({
 			type: "figma",
 			url: "https://www.figma.com/design/cqdnAotT8n9op8WGYLOHg4/%E2%9A%9B%EF%B8%8F-Lite-Core?node-id=2572-3286",
 		},
-	},
-	argTypes: {
-		type: { control: "select", options: types },
 	},
 	args: { type: "unpushed", children: "4" },
 });
@@ -42,6 +40,7 @@ export const Default = meta.story({ args: { type: "unpushed", children: "4" } })
 
 const sample: Record<MetaCountType, string> = {
 	behind: "3",
+	conflicts: "2",
 	unpushed: "4",
 	rebased: "2",
 	commits: "5",

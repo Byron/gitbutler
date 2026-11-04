@@ -26,11 +26,18 @@ pub(super) mod function {
     ///
     /// `subject_branch_name` - The branch to take out of a stack.
     ///
+    /// `order` - Where the new stack goes among the others: it becomes a parent of the workspace
+    ///     commit at `order`, or its last parent if `order` is `None`, as
+    ///     [`create_reference()`](crate::branch::create_reference()) places an independent branch.
+    ///     Without a workspace commit there's no order to keep, and it's ignored.
+    ///
     /// Returns the in memory rebase that can then used for materialisation.
     pub fn tear_off_branch<'ws, 'meta, M: RefMetadata>(
         editor: Editor<'ws, 'meta, M>,
         subject_branch_name: &FullNameRef,
+        order: impl Into<Option<usize>>,
     ) -> anyhow::Result<SuccessfulRebase<'ws, 'meta, M>> {
+        let order = order.into();
         let successful_rebase = editor.rebase()?;
         let workspace = successful_rebase.overlayed_graph()?.into_workspace()?;
         let mut editor = successful_rebase.into_editor();
@@ -66,14 +73,12 @@ pub(super) mod function {
             None
         };
         let target_selector = if managed {
-            let lower_bound_ref = workspace
-                .lower_bound_segment_id
-                .map(|segment_id| &workspace.graph[segment_id])
-                .and_then(|segment| segment.ref_name())
+            // The commit, not a reference to it: when several refs point at the common base,
+            // like branches checked out in linked worktrees, none owns it.
+            let lower_bound = workspace
+                .lower_bound
                 .context("Tearing off a branch requires a workspace common base")?;
-            editor
-                .select_reference(lower_bound_ref)
-                .context("Failed to find target reference in graph.")?
+            editor.select_commit(lower_bound)?
         } else {
             let target = workspace
                 .target_commit
@@ -105,11 +110,16 @@ pub(super) mod function {
             let selectors = SomeSelectors::new(Vec::from([head_selector]))?;
             editor.insert_segment_into(
                 target_selector,
-                subject_delimiter,
+                subject_delimiter.clone(),
                 but_rebase::graph_rebase::mutate::InsertSide::Above,
                 Some(selectors),
                 but_rebase::graph_rebase::mutate::ParentReparentingOrder::Prepend,
             )?;
+            // It joins the workspace commit as its last parent, so move it to its place.
+            if let Some(order) = order {
+                editor.remove_edges(head_selector, subject_delimiter.child)?;
+                editor.insert_parent(head_selector, subject_delimiter.child, Some(order))?;
+            }
         } else {
             // There is no workspace commit to connect to the torn-off branch. Attach only
             // its first parent at the target, leaving the remaining stack independent.

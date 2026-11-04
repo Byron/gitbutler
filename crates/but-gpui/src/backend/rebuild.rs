@@ -20,18 +20,23 @@ const ASKPASS_BIN: &str = "gitbutler-git-askpass";
 /// modal showing it.
 const PROGRESS_WIDTH: u16 = 100;
 
-/// How this binary was built, to build it again.
+/// How this binary was built, to build it again. A global once the app starts, when `cargo
+/// run` started it.
 #[derive(Clone)]
 pub struct Rebuild {
     /// The `cargo` that ran it, of the toolchain that built it.
     cargo: PathBuf,
     /// The checkout it was built from: the worktree's root.
     checkout: PathBuf,
+    /// The repository's common Git folder, which outlives the checkout when that's deleted.
+    common_dir: PathBuf,
     /// The crate's folder within a checkout, `crates/but-gpui`.
     crate_dir: PathBuf,
     /// The build's profile, by the folder its binary is in: `debug` for `dev`.
     profile: Option<String>,
 }
+
+impl gpui::Global for Rebuild {}
 
 /// A worktree of the repository to build from.
 pub struct Source {
@@ -52,6 +57,7 @@ impl Rebuild {
         }
         let checkout = manifest_dir.ancestors().nth(2)?.to_owned();
         let crate_dir = manifest_dir.strip_prefix(&checkout).ok()?.to_owned();
+        let common_dir = gix::open(&checkout).ok()?.common_dir().to_owned();
         let exe = std::env::current_exe().ok()?;
         let profile = match exe.parent()?.file_name()?.to_str()? {
             "debug" => None,
@@ -60,6 +66,7 @@ impl Rebuild {
         Some(Self {
             cargo,
             checkout,
+            common_dir,
             crate_dir,
             profile,
         })
@@ -70,9 +77,15 @@ impl Rebuild {
         &self.checkout
     }
 
+    /// Whether checkout `dir` has the client to build: it may be deleted without Git, or on a
+    /// branch from before the client.
+    pub fn builds_in(&self, dir: &Path) -> bool {
+        dir.join(&self.crate_dir).join("Cargo.toml").is_file()
+    }
+
     /// The repository's worktrees that have the client to build, the main one first.
     pub fn sources(&self) -> Result<Vec<Source>> {
-        let repo = gix::open(&self.checkout)?;
+        let repo = gix::open(&self.common_dir)?;
         let main = repo.main_repo()?;
         let linked =
             (repo.worktrees()?.into_iter()).filter_map(|worktree| worktree.into_repo().ok());
@@ -81,14 +94,10 @@ impl Rebuild {
             .filter_map(|repo| {
                 let dir = repo.workdir()?.to_owned();
                 let branch = repo.head_name().ok().flatten();
-                // Deleted without Git, or on a branch from before the client.
-                dir.join(&self.crate_dir)
-                    .join("Cargo.toml")
-                    .is_file()
-                    .then(|| Source {
-                        dir,
-                        branch: branch.map(|name| name.shorten().to_string()),
-                    })
+                self.builds_in(&dir).then(|| Source {
+                    dir,
+                    branch: branch.map(|name| name.shorten().to_string()),
+                })
             })
             .collect())
     }
@@ -174,7 +183,9 @@ pub enum Printed {
 
 /// A binary a build made, to restart on.
 pub struct Built {
+    #[cfg_attr(not(unix), expect(dead_code))]
     exe: PathBuf,
+    #[cfg_attr(not(unix), expect(dead_code))]
     crate_dir: PathBuf,
 }
 
@@ -291,27 +302,122 @@ fn built_binary(stdout: impl Read) -> Option<PathBuf> {
     exe
 }
 
+/// How long a new build has to take the terminals over, which it does before it opens its
+/// window. One from before builds started this way never says it did.
+#[cfg(unix)]
+const TAKEN_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Built {
-    /// Run the new binary in this process's place, with this one's arguments and environment,
-    /// so `cargo run` and its terminal keep it. The manifest's folder is the one it was built
-    /// from, as `cargo run` would have set it, so it offers Build and restart too. Returns only
-    /// when that fails.
-    pub fn restart(&self) -> anyhow::Error {
+    /// Start the new binary in this process's place, with this one's arguments and environment,
+    /// handing it `terminals`, and exit once it has them. The manifest's folder is the one it was
+    /// built from, as `cargo run` would have set it, so it offers Build and restart too. A process
+    /// of its own, not this one by exec: macOS goes on drawing a window a process opens after
+    /// exec and sending it clicks, but offers it no drags from other apps. `cargo run` ends with
+    /// this process, so its terminal is back at its prompt while the new build writes on there.
+    /// Returns only when starting it fails.
+    #[cfg(unix)]
+    pub fn restart<T: serde::Serialize>(
+        &self,
+        terminals: Vec<(T, but_tty::Detached)>,
+    ) -> anyhow::Error {
         let mut new = Command::new(&self.exe);
         new.args(std::env::args_os().skip(1))
             .env("CARGO_MANIFEST_DIR", &self.crate_dir)
             .env("CARGO_MANIFEST_PATH", self.crate_dir.join("Cargo.toml"));
-        #[cfg(unix)]
-        let err: anyhow::Error = std::os::unix::process::CommandExt::exec(&mut new).into();
-        #[cfg(not(unix))]
-        let err = anyhow::anyhow!("restarting in place needs exec");
-        err.context(format!("couldn't start {}", self.exe.display()))
+        let handing = (but_tty::hand_over(terminals, &mut new))
+            .inspect_err(|err| tracing::error!("couldn't hand the terminals over: {err:#}"))
+            .ok();
+        close_on_exec(handing.as_ref().map_or(&[], |handing| &handing.keep));
+        if let Err(err) = new.spawn() {
+            let err = anyhow::Error::from(err);
+            return err.context(format!("couldn't start {}", self.exe.display()));
+        }
+        if let Some(handing) = handing
+            && !handing.wait_taken(TAKEN_WITHIN)
+        {
+            tracing::error!("the new build didn't take the terminals over");
+        }
+        std::process::exit(0)
+    }
+
+    #[cfg(not(unix))]
+    pub fn restart(&self) -> anyhow::Error {
+        anyhow::anyhow!("restarting in place needs exec")
+    }
+}
+
+/// Mark the files this process has open, past stdin, stdout and stderr, to close in the new
+/// binary it starts, but for `keep`, which that takes along. Rust opens its own so, but not every framework does: Metal
+/// keeps its shader caches open without, so each restart carried four more into the next
+/// process, until a burst of reads hit the limit on open files and whatever opened one next
+/// failed.
+#[cfg(unix)]
+fn close_on_exec(keep: &[std::os::fd::RawFd]) {
+    let dir = match cfg!(target_os = "macos") {
+        true => "/dev/fd",
+        false => "/proc/self/fd",
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // Listed first, as reading the folder holds a descriptor of its own.
+    let open: Vec<libc::c_int> = entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd > 2)
+        .collect();
+    for fd in open {
+        // SAFETY: `F_GETFD` and `F_SETFD` only read and set a descriptor's flags, and one
+        // closed since it was listed, as the folder's own, makes them fail and change nothing.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                let flags = match keep.contains(&fd) {
+                    true => flags & !libc::FD_CLOEXEC,
+                    false => flags | libc::FD_CLOEXEC,
+                };
+                libc::fcntl(fd, libc::F_SETFD, flags);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Printed, built_binary, read_printed};
+
+    #[test]
+    #[cfg(unix)]
+    fn a_restart_takes_no_file_along_that_was_opened_to_stay_open() {
+        use std::os::fd::AsRawFd as _;
+        let file = tempfile::tempfile().unwrap();
+        let fd = file.as_raw_fd();
+        // SAFETY: only the flags of `file`'s descriptor change, which it keeps open throughout.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        // SAFETY: as above, opened to stay open across an exec, as Metal opens its caches.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+        super::close_on_exec(&[]);
+        // SAFETY: as above.
+        let after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            after & libc::FD_CLOEXEC != 0,
+            "it closes as the new binary starts rather than staying open in it"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_restart_takes_along_what_it_is_told_to_keep() {
+        use std::os::fd::AsRawFd as _;
+        let file = tempfile::tempfile().unwrap();
+        let fd = file.as_raw_fd();
+        super::close_on_exec(&[fd]);
+        // SAFETY: only reads the flags of `file`'s descriptor, which it keeps open throughout.
+        let after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            after & libc::FD_CLOEXEC == 0,
+            "it stays open in the new binary, though Rust opened it to close"
+        );
+    }
 
     /// Whether process `pid` is still running, as `kill -0` says.
     #[cfg(unix)]
@@ -340,6 +446,7 @@ mod tests {
         let rebuild = Rebuild {
             cargo,
             checkout: dir.path().to_owned(),
+            common_dir: dir.path().join(".git"),
             crate_dir: "crate".into(),
             profile: None,
         };
@@ -367,12 +474,54 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_checkout_still_lists_the_worktrees_left() {
+        use super::Rebuild;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (main, linked) = (dir.path().join("main"), dir.path().join("linked"));
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .status;
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "main"]);
+        std::fs::create_dir_all(main.join("crate")).unwrap();
+        std::fs::write(main.join("crate/Cargo.toml"), "").unwrap();
+        git(&["-C", "main", "add", "."]);
+        git(&["-C", "main", "commit", "-qm", "client"]);
+        git(&["-C", "main", "worktree", "add", "-q", "../linked"]);
+        let rebuild = Rebuild {
+            cargo: "cargo".into(),
+            common_dir: gix::open(&linked).unwrap().common_dir().to_owned(),
+            checkout: linked.clone(),
+            crate_dir: "crate".into(),
+            profile: None,
+        };
+        std::fs::remove_dir_all(&linked).unwrap();
+
+        let sources: Vec<_> = (rebuild.sources().unwrap().into_iter())
+            .map(|source| source.dir.canonicalize().unwrap())
+            .collect();
+        assert_eq!(
+            sources,
+            [main.canonicalize().unwrap()],
+            "the main worktree is still there to build from, the deleted one isn't offered"
+        );
+    }
+
+    #[test]
     fn the_build_makes_the_askpass_helper_too() {
         use super::Rebuild;
 
         let rebuild = Rebuild {
             cargo: "cargo".into(),
             checkout: "/checkout".into(),
+            common_dir: "/checkout/.git".into(),
             crate_dir: "crates/but-gpui".into(),
             profile: None,
         };

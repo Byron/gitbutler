@@ -311,7 +311,7 @@ impl StatusContext {
     }
 }
 
-fn show_edit_mode_status(ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
+fn show_edit_mode_status(ctx: &mut Context, out: &mut OutputChannel) -> CliResult<()> {
     // Delegate to the resolve status logic to show actual conflict details
     crate::command::legacy::resolve::show_resolve_status(ctx, out)
 }
@@ -326,7 +326,7 @@ pub(crate) fn worktree(
     let mode = but_api::legacy::modes::operating_mode(ctx)?.operating_mode;
     if let gitbutler_operating_modes::OperatingMode::Edit(_metadata) = mode {
         // In edit mode, show the conflict resolution status
-        return show_edit_mode_status(ctx, out).map_err(Into::into);
+        return show_edit_mode_status(ctx, out);
     }
 
     if let Some(out) = out.for_json() {
@@ -477,11 +477,14 @@ fn build_status_context(
     };
     let head_ref = {
         let repo = ctx.repo.get()?;
-        match &invoked_from {
-            Some(InvokedFrom::LinkedWorktree(name)) => {
+        match invoked_from
+            .as_ref()
+            .and_then(|from| from.linked_worktree.as_ref())
+        {
+            Some(name) => {
                 but_workspace::worktrees::open_worktree_repo(&repo, name.as_ref())?.head_name()?
             }
-            Some(InvokedFrom::MainWorktree) | None => repo.head_name()?,
+            None => repo.head_name()?,
         }
     };
     let (

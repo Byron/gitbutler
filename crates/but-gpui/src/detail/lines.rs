@@ -8,7 +8,7 @@ use gpui::{App, Context, Entity, Modifiers, Pixels, Point, SharedString, WeakEnt
 use super::Detail;
 use crate::backend::{FileDiff, Hunk, HunkKey, LineKind, Selected};
 use crate::state::Cut;
-use crate::transfer::DragPreview;
+use crate::transfer::{Chip, DragPreview};
 
 /// Lines picked in one file of the diff.
 pub(super) struct LinePicks {
@@ -121,7 +121,7 @@ impl Detail {
             };
         // Dragging on over the same line picks nothing new.
         if self.line_picks.as_ref().map(|picks| &picks.lines) != before.as_ref() {
-            self.place_cursor(cursor);
+            self.cursor = cursor;
             self.refresh_grip();
             cx.notify();
         }
@@ -146,16 +146,16 @@ impl Detail {
         self.clear_line_picks(cx);
     }
 
-    /// The preview of a drag of `label` from the diff or its files, which lets the picked
+    /// The preview of a drag of `chip` from the diff or its files, which lets the picked
     /// lines go as it starts unless it `carries_picks`: dragging anything else passes them
     /// over.
     pub(super) fn drag_preview(
         &self,
-        label: SharedString,
+        chip: impl Into<Chip>,
         carries_picks: bool,
         detail: WeakEntity<Detail>,
     ) -> impl Fn(&Cut, Point<Pixels>, &mut Window, &mut App) -> Entity<DragPreview> + 'static {
-        let preview = crate::transfer::drag_preview(self.store.clone(), label);
+        let preview = crate::transfer::drag_preview(self.store.clone(), chip);
         move |payload, offset, window, cx| {
             // Nor does it pick the lines whose numbers it passes over, nor keep the grip it
             // started from, which hears nothing more while dragging.
@@ -169,6 +169,42 @@ impl Detail {
             .ok();
             preview(payload, offset, window, cx)
         }
+    }
+
+    /// The preview of a drag of `chip` from the diff itself, as [`Self::drag_preview`], which
+    /// a terminal it's let go on pastes as the patch of what it carries, as it began
+    /// ([`Store::dragged_patch`](crate::state::Store::dragged_patch)).
+    pub(super) fn patch_drag_preview(
+        &self,
+        chip: impl Into<Chip>,
+        carries_picks: bool,
+        detail: WeakEntity<Detail>,
+    ) -> impl Fn(&Cut, Point<Pixels>, &mut Window, &mut App) -> Entity<DragPreview> + 'static {
+        let preview = self.drag_preview(chip, carries_picks, detail.clone());
+        let store = self.store.clone();
+        move |payload, offset, window, cx| {
+            let patch = (detail.read_with(cx, |detail, _| detail.dragged_patch(payload)))
+                .ok()
+                .flatten();
+            let preview = preview(payload, offset, window, cx);
+            store.update(cx, |store, _| store.dragged_patch = patch);
+            preview
+        }
+    }
+
+    /// What a terminal pastes of `cut` dragged from the diff: the patch of the file, hunks or
+    /// lines it carries, as copying takes them, or else the file's path, as for a binary file.
+    fn dragged_patch(&self, cut: &Cut) -> Option<String> {
+        let Cut::Files { files, .. } = cut else {
+            return None;
+        };
+        let [part] = &**files else {
+            return None;
+        };
+        let diff = self.diff.as_ref()?;
+        let file = (diff.files.iter()).find(|file| file.file.path == part.file.path)?;
+        (file.part_patch(part.hunks.as_deref()))
+            .or_else(|| Some(crate::terminal::shell_quoted([&part.file.path])))
     }
 
     /// Let the picked lines go. Whether any were.

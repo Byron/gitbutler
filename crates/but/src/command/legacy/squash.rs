@@ -1,4 +1,4 @@
-use std::{borrow::Cow, path::Path};
+use std::{borrow::Cow, collections::HashMap, path::Path};
 
 use anyhow::Context as _;
 use bstr::ByteSlice as _;
@@ -17,6 +17,7 @@ use but_workspace::{
 use gitbutler_oplog::entry::{OperationKind, SnapshotDetails};
 use gix::{
     ObjectId,
+    prelude::ObjectIdExt as _,
     refs::{FullName, FullNameRef},
 };
 use itertools::{Either, Itertools};
@@ -42,7 +43,7 @@ use crate::{
         change_source::{self, ChangeSourceId, ChangeSourceRepo, InvokedFrom},
         diff_specs::DiffSpecBuilder,
         merged_upstream::MergedUpstream,
-        rejection,
+        rejection, shorten_object_id,
     },
 };
 
@@ -191,7 +192,7 @@ pub fn squash(
     drop(repo);
     drop(ws);
 
-    Ok(run(ctx, &mut meta, guard.write_permission(), squash_op)?)
+    run(ctx, &mut meta, guard.write_permission(), squash_op)
 }
 
 fn resolve_args(
@@ -672,6 +673,94 @@ fn cannot_uncommit_uncommitted_changes_error() -> CliError {
         .into()
 }
 
+/// Refuse an uncommit if its `dry_run` leaves commits conflicted that are not conflicted now.
+///
+/// These commits depend on the changes being uncommitted, so the hint names them as the ones to
+/// uncommit first. Uncommitting them can leave further commits conflicted, so it names those too,
+/// which means that the hinted command passes this check.
+fn ensure_uncommit_causes_no_conflicts(
+    ctx: &mut Context,
+    perm: &mut RepoExclusive,
+    what: &str,
+    dry_run: &WorkspaceState,
+) -> CliResult<()> {
+    let mut dependents = newly_conflicted_commits(ctx, dry_run)?;
+    if dependents.is_empty() {
+        return Ok(());
+    }
+    loop {
+        let dry_run = dry_run_uncommit(ctx, dependents.clone(), perm)?;
+        let further = newly_conflicted_commits(ctx, &dry_run)?;
+        if further.is_empty() {
+            break;
+        }
+        dependents.extend(further);
+    }
+
+    let id_map = IdMap::new_from_context(ctx, perm.read_permission(), None)?;
+    let repo = ctx.repo.get()?;
+    let dependents = dependents
+        .into_iter()
+        .map(|id| match id_map.change_id_ref(id) {
+            Some(change_id) => change_id.padded_short_id(),
+            None => shorten_object_id(&repo, id),
+        })
+        .join(" ");
+    Err(bad_input(format!(
+        "Cannot uncommit {what} that would result in merge conflicts"
+    ))
+    .hint(format!(
+        "Later commits depend on these changes. Run `but uncommit {dependents}` first, then retry"
+    ))
+    .into())
+}
+
+/// The commits that `dry_run` leaves conflicted and that are not conflicted now, by their current
+/// IDs.
+fn newly_conflicted_commits(
+    ctx: &Context,
+    dry_run: &WorkspaceState,
+) -> anyhow::Result<Vec<ObjectId>> {
+    let repo = ctx.repo.get()?;
+    let originals: HashMap<_, _> = dry_run
+        .replaced_commits
+        .iter()
+        .map(|(original, rewritten)| (*rewritten, *original))
+        .collect();
+    let mut commits = Vec::new();
+    for (rewritten, _) in &dry_run.conflicted_commits {
+        if let Some(&original) = originals.get(rewritten)
+            && !but_core::Commit::from_id(original.attach(&repo))?.is_conflicted()
+        {
+            commits.push(original);
+        }
+    }
+    Ok(commits)
+}
+
+fn dry_run_uncommit(
+    ctx: &mut Context,
+    commits: Vec<ObjectId>,
+    perm: &mut RepoExclusive,
+) -> anyhow::Result<WorkspaceState> {
+    let but_api::commit::types::UncommitResult {
+        workspace,
+        uncommitted_ids: _,
+    } = but_api::commit::uncommit::commit_uncommit_only_with_perm(
+        ctx,
+        commits,
+        None,
+        DryRun::Yes,
+        perm,
+    )?;
+    // The implementation of `commit_uncommit_only_with_perm` requires a write lock on
+    // the workspace even in dry run mode. Ideally, we should change that function
+    // (or better, check for conflicts another way). For now, invalidate the workspace cache
+    // to enable future code to once again take locks.
+    ctx.invalidate_workspace_cache()?;
+    Ok(workspace)
+}
+
 /// Changes how the operation rewords the target to avoid unnecessarily opening the editor.
 ///
 /// For example if none of the sources have a message then we should always pick the target
@@ -916,35 +1005,21 @@ pub fn resolve_target(
             reword,
         }),
         ResolvedCliIdArgRef::Branch(branch_name) => {
-            let branch_name = BranchArg(branch_name.to_owned())
-                .resolve_local_branch_name()
-                .map_err(ResolveTargetError::Other)?;
-
-            for stack in &head_info.stacks {
-                for segment in &stack.segments {
-                    let Some(ref_info) = &segment.ref_info else {
-                        continue;
-                    };
-                    if ref_info.ref_name == branch_name {
-                        let commit = segment
-                            .commits
-                            .first()
-                            .map(|commit| commit.id)
-                            .or(ref_info.commit_id);
-                        return if let Some(commit) = commit {
-                            Ok(SquashTarget::Commit {
-                                commit: CommitId::try_from_commit_id(commit, repo)
-                                    .map_err(ResolveTargetError::Other)?,
-                                reword,
-                            })
-                        } else {
-                            Err(ResolveTargetError::CannotBeEmptyBranch)
-                        };
-                    }
-                }
-            }
-
-            Err(ResolveTargetError::NotFound)
+            let segment = BranchArg(branch_name.to_owned())
+                .try_resolve_segment(head_info)
+                .into_internal_error()
+                .map_err(ResolveTargetError::Other)?
+                .ok_or(ResolveTargetError::NotFound)?;
+            // The commit an empty branch points at isn't its own, so amending it would rewrite
+            // another segment or the target.
+            let commit = segment
+                .tip()
+                .ok_or(ResolveTargetError::CannotBeEmptyBranch)?;
+            Ok(SquashTarget::Commit {
+                commit: CommitId::try_from_commit_id(commit, repo)
+                    .map_err(ResolveTargetError::Other)?,
+                reword,
+            })
         }
         ResolvedCliIdArgRef::Uncommitted(source) => {
             resolve_uncommit_target(source.clone(), sources, reword, head_info)
@@ -1307,7 +1382,7 @@ pub fn run(
     meta: &mut impl RefMetadata,
     perm: &mut RepoExclusive,
     squash_op: SquashOperation,
-) -> anyhow::Result<(SquashOutcome, Option<WorkspaceState>)> {
+) -> CliResult<(SquashOutcome, Option<WorkspaceState>)> {
     // Owned for the whole operation: the `ChangeSource` handed to the transaction
     // below borrows from it. Opened before any workspace handle is taken.
     let source_repo = ChangeSourceRepo::open(ctx, &squash_op.change_source())?;
@@ -1550,27 +1625,8 @@ pub fn run(
         }
         ExecutableSquashOperation::Uncommit(op) => {
             if op.has_commit_sources() {
-                let but_api::commit::types::UncommitResult {
-                    workspace,
-                    uncommitted_ids: _,
-                } = but_api::commit::uncommit::commit_uncommit_only_with_perm(
-                    ctx,
-                    op.commit_sources().collect(),
-                    None,
-                    DryRun::Yes,
-                    perm,
-                )?;
-                // The implementation of `commit_uncommit_only_with_perm` requires a write lock on
-                // the workspace even in dry run mode. Ideally, we should change that function
-                // (or better, remove this whole `if` block and instead check for conflicts another
-                // way). For now, invalidate the workspace cache to enable future code to once
-                // again take locks.
-                ctx.invalidate_workspace_cache()?;
-
-                anyhow::ensure!(
-                    !workspace.is_conflicted(),
-                    "Cannot uncommit commits that would result in merge conflicts"
-                );
+                let workspace = dry_run_uncommit(ctx, op.commit_sources().collect(), perm)?;
+                ensure_uncommit_causes_no_conflicts(ctx, perm, "commits", &workspace)?;
             }
 
             let snapshot_details = SnapshotDetails::new(OperationKind::UndoCommit);
@@ -1638,10 +1694,7 @@ pub fn run(
                 // again take locks.
                 ctx.invalidate_workspace_cache()?;
 
-                anyhow::ensure!(
-                    !workspace.is_conflicted(),
-                    "Cannot uncommit hunks that would result in merge conflicts"
-                );
+                ensure_uncommit_causes_no_conflicts(ctx, perm, "hunks", &workspace)?;
             }
 
             let but_api::commit::types::MoveChangesResult { workspace: _ } =

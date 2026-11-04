@@ -19,10 +19,13 @@ mod metrics;
 mod project;
 
 use crate::app::{AppHandle, AppView, SelectNext, SelectPrevious};
+use crate::backend::InactiveAfter;
 use crate::backend::settings::{self as backend, Program, ProjectSettings};
 use crate::overlays::MenuItem;
-use crate::state::{Prefs, ProjectEntry, ProjectId, ScopeLines, Store};
-use crate::theme::{Appearance, CodeSize, Theme, UiScale};
+use crate::state::{
+    Interface, Prefs, ProjectEntry, ProjectId, ScopeLines, Store, TerminalRuns, TileDragFeel,
+};
+use crate::theme::{Appearance, CodeSize, ColorScheme, Theme, UiScale};
 use crate::ui::fold::{self, Folds};
 use crate::ui::modal::{MODAL_RADIUS, ModalSize, modal};
 use crate::ui::scrollbar::{Scroll, scrolled};
@@ -34,7 +37,7 @@ use crate::ui::{
 
 pub use cli::welcome_card;
 
-actions!(settings, [OpenSettings, OpenKeyboardShortcuts]);
+actions!(settings, [OpenSettings, OpenKeyboardShortcuts, FocusSearch]);
 
 /// " ⌥Z in a diff turns it on and off.", with the keys bound to `action`, or nothing when no key
 /// is, as the user's keymap can leave it.
@@ -247,6 +250,8 @@ pub struct SettingsView {
     name: Entity<TextInput>,
     editors: Vec<Program>,
     terminals: Vec<Program>,
+    /// The command terminals opened here run, as typed until saved.
+    terminal_command: Entity<TextInput>,
     fetch_interval: Option<u64>,
     /// The desktop app opens this client at start: GitButler's `featureFlags.gpui`. `None`
     /// while first read, as the metrics are, and their switches aren't drawn until then: one
@@ -299,6 +304,12 @@ impl SettingsView {
     ) -> Self {
         let search = cx.new(|cx| TextInput::new("Search settings", false, cx));
         let name = cx.new(|cx| TextInput::new("Project name", false, cx));
+        let command = store.read(cx).prefs.terminal_command.clone();
+        let terminal_command = cx.new(|cx| {
+            let mut input = TextInput::new("Command", false, cx);
+            input.load(command, cx);
+            input
+        });
         let ai = ai::Ai::new(window, cx);
         let subscriptions = vec![
             cx.subscribe_in(&search, window, |this, search, event, _, cx| match event {
@@ -323,6 +334,26 @@ impl SettingsView {
                     this.back_to_search(window, cx);
                 }
             }),
+            cx.subscribe_in(
+                &terminal_command,
+                window,
+                |this, _, event, window, cx| match event {
+                    InputEvent::Submit => {
+                        this.save_terminal_command(cx);
+                        this.back_to_search(window, cx);
+                    }
+                    InputEvent::Changed => {}
+                    InputEvent::Cancel => {
+                        this.reset_terminal_command(cx);
+                        this.back_to_search(window, cx);
+                    }
+                },
+            ),
+            // The command saves as the field's left, and as Settings closes with it focused.
+            cx.on_blur(&terminal_command.focus_handle(cx), window, |this, _, cx| {
+                this.save_terminal_command(cx)
+            }),
+            cx.on_release(|this, cx| this.save_terminal_command(cx)),
         ];
         let unwatched = (page
             .project()
@@ -338,6 +369,7 @@ impl SettingsView {
             name,
             editors: Vec::new(),
             terminals: Vec::new(),
+            terminal_command,
             fetch_interval: None,
             open_at_start: None,
             usage_metrics: None,
@@ -511,6 +543,54 @@ impl SettingsView {
         ]
     }
 
+    /// What terminals opened here start, with the command they run under it while it's picked.
+    fn terminal_run_row(&self, window: &Window, cx: &Context<Self>) -> Row {
+        let prefs = &self.store.read(cx).prefs;
+        let store = self.store.clone();
+        let runs = segmented(
+            "terminal-runs",
+            [
+                (TerminalRuns::LoginShell, "Login shell"),
+                (TerminalRuns::Command, "Custom command"),
+            ],
+            prefs.terminal_runs,
+            move |runs, _, cx| {
+                store.update(cx, |store, cx| {
+                    store.set_prefs(|p| p.terminal_runs = runs, cx)
+                });
+            },
+            Theme::get(cx),
+        );
+        let row = Row::new(
+            "New terminals run",
+            "What terminals opened here start. A command runs through your shell, and its \
+             terminal closes when it exits.",
+            runs,
+        )
+        .with_keywords("shell command");
+        if prefs.terminal_runs != TerminalRuns::Command {
+            return row;
+        }
+        let focused = self.terminal_command.focus_handle(cx).is_focused(window);
+        row.with_below(field(&self.terminal_command, focused, Theme::get(cx)))
+    }
+
+    /// Save the command as typed, unless it's what's saved already.
+    fn save_terminal_command(&self, cx: &mut App) {
+        let command = self.terminal_command.read(cx).text().trim().to_owned();
+        if command == self.store.read(cx).prefs.terminal_command {
+            return;
+        }
+        (self.store).update(cx, |store, cx| {
+            store.set_prefs(|p| p.terminal_command = command, cx)
+        });
+    }
+
+    fn reset_terminal_command(&mut self, cx: &mut Context<Self>) {
+        let command = self.store.read(cx).prefs.terminal_command.clone();
+        (self.terminal_command).update(cx, |input, cx| input.set_text(command, cx));
+    }
+
     /// The theme, then how diffs show.
     fn appearance_cards(&self, cx: &Context<Self>) -> Vec<Card> {
         let theme = Theme::get(cx);
@@ -550,9 +630,27 @@ impl SettingsView {
         );
         let appearance = Row::new(
             "Appearance",
-            "Light, dark, or whichever macOS is set to.",
+            match &prefs.color_scheme {
+                ColorScheme::Named(_) => "Your colour scheme is light or dark itself.",
+                ColorScheme::GitButler | ColorScheme::Ghostty => {
+                    "Light, dark, or whichever macOS is set to."
+                }
+            },
             appearance,
         );
+        let app = self.app.clone();
+        let scheme = dropdown("color-scheme", prefs.color_scheme.label().to_owned(), theme)
+            .on_click(move |_, window, cx| {
+                app.update_later(window, cx, |app, window, cx| {
+                    app.pick_color_scheme(window, cx)
+                })
+            });
+        let scheme = Row::new(
+            "Colour scheme",
+            "GitButler's colours, or a Ghostty theme for the app and its terminals alike.",
+            scheme,
+        )
+        .with_keywords("color theme ghostty");
         let percent = |scale: UiScale| format!("{}%", scale.percent());
         let size = self.choice(
             "ui-scale",
@@ -570,14 +668,24 @@ impl SettingsView {
             ),
             size,
         );
+        let app = self.app.clone();
+        let diff_font = (prefs.diff_font.clone()).unwrap_or_else(|| theme.mono_font.to_string());
+        let diff_font = dropdown("diff-font", diff_font, theme).on_click(move |_, window, cx| {
+            app.update_later(window, cx, |app, window, cx| app.pick_diff_font(window, cx))
+        });
+        let app = self.app.clone();
         let mut diff = vec![
             Row::new("Code size", "How large code shows in diffs.", code),
+            Row::new("Font", "The font of code in diffs.", diff_font),
             Row::new(
                 "Font ligatures",
                 "Code joins pairs of characters like != and == into one symbol.",
                 self.pref_switch("ligatures", prefs.ligatures, |p| p.ligatures ^= true, cx)
-                    // The diff is a cached view, which only a refresh draws again.
-                    .on_click(|_, _, cx| cx.refresh_windows()),
+                    .on_click(move |_, window, cx| {
+                        app.update_later(window, cx, |app, window, cx| {
+                            app.apply_appearance(window, cx)
+                        })
+                    }),
             ),
             Row::new(
                 "Wrap long lines",
@@ -673,11 +781,72 @@ impl SettingsView {
                     cx,
                 ),
             ),
+            Row::new(
+                "Worktrees go inactive after",
+                "A linked worktree with nothing uncommitted moves under Inactive worktrees once \
+                 it's gone this long without a commit or checkout.",
+                self.choice(
+                    "inactive-after",
+                    prefs.inactive_after.label(),
+                    InactiveAfter::ALL.map(|after| (after, after.label().to_owned())),
+                    |this, after, _, cx| {
+                        this.store
+                            .update(cx, |store, cx| store.set_inactive_after(after, cx))
+                    },
+                    cx,
+                ),
+            )
+            .with_keywords("stale"),
         ];
+        let folder_counts = Row::new(
+            "Show folders' line counts",
+            "Folders in a file tree always show the lines their files add and remove. Off, they \
+             show them only under the pointer.",
+            self.pref_switch(
+                "folder-line-counts",
+                prefs.folder_line_counts,
+                |p| p.folder_line_counts ^= true,
+                cx,
+            ),
+        );
+        let text_label = |size: Option<u8>| match size {
+            Some(size) => format!("{size} pt"),
+            None => "As Ghostty's".to_owned(),
+        };
+        let sizes = std::iter::once(None).chain((9..=28).map(Some));
+        let terminal_text = self.choice(
+            "terminal-text",
+            text_label(prefs.terminal_text),
+            sizes.map(|size| (size, text_label(size))),
+            |this, size, _, cx| {
+                (this.store).update(cx, |store, cx| store.set_terminal_text(size, cx))
+            },
+            cx,
+        );
+        let terminal_text = Row::new(
+            "Text size",
+            "How large text shows in terminals opened here. Their colours follow the colour scheme.",
+            terminal_text,
+        );
+        let app = self.app.clone();
+        let terminal_font = (prefs.terminal_font.clone()).unwrap_or_else(|| "As Ghostty's".into());
+        let terminal_font =
+            dropdown("terminal-font", terminal_font, theme).on_click(move |_, window, cx| {
+                app.update_later(window, cx, |app, window, cx| {
+                    app.pick_terminal_font(window, cx)
+                })
+            });
+        let terminal_font = Row::new(
+            "Font",
+            "The font of terminals opened here. As Ghostty's follows your Ghostty config.",
+            terminal_font,
+        );
         vec![
-            Card::new(None, vec![appearance, size]),
+            Card::new(None, vec![scheme, appearance, size]),
             Card::new(Some("Navigator"), navigator),
+            Card::new(Some("File list"), vec![folder_counts]),
             Card::new(Some("Diff"), diff),
+            Card::new(Some("Terminal"), vec![terminal_font, terminal_text]),
         ]
     }
 
@@ -758,6 +927,60 @@ impl SettingsView {
         ))
     }
 
+    fn single_file_row(&self, cx: &Context<Self>) -> Row {
+        let on = self.store.read(cx).single_file_diff;
+        let flip = cx.listener(move |this, _, _, cx| {
+            this.store.update(cx, |store, cx| {
+                store.single_file_diff = !on;
+                cx.notify();
+            });
+            this.apply(
+                "Couldn't change the single file diff",
+                move || backend::set_single_file_diff(!on),
+                // What was saved, which a failure leaves as it was.
+                |this, cx| {
+                    let on = backend::single_file_diff();
+                    this.store.update(cx, |store, cx| {
+                        store.single_file_diff = on;
+                        cx.notify();
+                    });
+                },
+                cx,
+            );
+        });
+        Row::new(
+            "Single file diff",
+            "The diff shows only the file selected in the file list, filling the pane, with \
+             its changed lines marked beside the scrollbar. The file list stays beside it.",
+            switch("single-file-diff", on, Theme::get(cx)).on_click(flip),
+        )
+        .with_keywords("all-in-one one file at a time per screen")
+    }
+
+    fn lite_row(&self, cx: &Context<Self>) -> Row {
+        let lite = self.store.read(cx).prefs.interface == Interface::Lite;
+        Row::new(
+            "Lite interface",
+            "Leaves out parts of the window that repeat what's elsewhere or switch what keys \
+             do: the status bar, the location bar while the navigator shows, a branch's \
+             header, a commit's header, whose message lists first among its files instead, \
+             the uncommitted changes' header, the diff's toolbar and the counts and buttons on each file. What's left out may \
+             change from one release to the next.",
+            self.pref_switch(
+                "lite-interface",
+                lite,
+                |p| {
+                    p.interface = match p.interface {
+                        Interface::Full => Interface::Lite,
+                        Interface::Lite => Interface::Full,
+                    }
+                },
+                cx,
+            ),
+        )
+        .with_keywords("minimal compact hide status bar breadcrumbs toolbar header")
+    }
+
     fn fps_row(&self, cx: &Context<Self>) -> Row {
         let on = self.store.read(cx).prefs.show_fps;
         Row::new(
@@ -770,6 +993,172 @@ impl SettingsView {
             self.pref_switch("show-fps", on, |p| p.show_fps ^= true, cx),
         )
         .with_keywords("frames per second performance")
+    }
+
+    /// How dragging a tile by its bar feels, each a few values to try, for this run of the
+    /// app.
+    fn tile_drag_rows(&self, cx: &Context<Self>) -> Vec<Row> {
+        vec![
+            self.tile_drag_row(
+                ("tile-lift", "Lift"),
+                "How far the pointer moves before the tile comes off.",
+                |f| &mut f.lift,
+                [
+                    (2., "2px"),
+                    (4., "4px"),
+                    (8., "8px"),
+                    (12., "12px"),
+                    (20., "20px"),
+                ],
+                cx,
+            ),
+            self.tile_drag_row(
+                ("tile-wait", "Wait"),
+                "How long the pointer rests over a place before the other tiles make room.",
+                |f| &mut f.wait,
+                [
+                    (0., "0ms"),
+                    (50., "50ms"),
+                    (100., "100ms"),
+                    (200., "200ms"),
+                    (350., "350ms"),
+                ],
+                cx,
+            ),
+            self.tile_drag_row(
+                ("tile-bar", "Bar zone"),
+                "How far down a tile its bar's row reaches, where a tile dragged onto it lands \
+                 beside it or in its place, rather than above or below it.",
+                |f| &mut f.bar,
+                [
+                    (32., "32px"),
+                    (48., "48px"),
+                    (64., "64px"),
+                    (96., "96px"),
+                    (128., "128px"),
+                ],
+                cx,
+            ),
+            self.tile_drag_row(
+                ("tile-edge", "Edge zone"),
+                "How far in from the left and bottom of all the tiles the pointer lands one along \
+                 that side.",
+                |f| &mut f.edge,
+                [
+                    (16., "16px"),
+                    (24., "24px"),
+                    (32., "32px"),
+                    (48., "48px"),
+                    (64., "64px"),
+                ],
+                cx,
+            ),
+            self.tile_drag_row(
+                ("tile-right-edge", "Right edge zone"),
+                "How far in from the right of all the tiles the pointer lands one along it.",
+                |f| &mut f.right_edge,
+                [
+                    (32., "32px"),
+                    (64., "64px"),
+                    (96., "96px"),
+                    (128., "128px"),
+                    (192., "192px"),
+                ],
+                cx,
+            ),
+            self.tile_drag_row(
+                ("tile-reflow", "Reflow"),
+                "How long the other tiles take to move out of the way.",
+                |f| &mut f.reflow,
+                [
+                    (80., "80ms"),
+                    (110., "110ms"),
+                    (150., "150ms"),
+                    (220., "220ms"),
+                    (400., "400ms"),
+                ],
+                cx,
+            ),
+            self.tile_drag_row(
+                ("tile-resize", "Resize"),
+                "How long the dragged tile takes to grow or shrink to the room it'd land in.",
+                |f| &mut f.resize,
+                [
+                    (0., "0ms"),
+                    (80., "80ms"),
+                    (110., "110ms"),
+                    (150., "150ms"),
+                    (250., "250ms"),
+                ],
+                cx,
+            ),
+            self.tile_drag_row(
+                ("tile-row-zone", "Row zone"),
+                "How far in from the left and right of all the tiles a row dragged from the \
+                 navigator lands as a tile.",
+                |f| &mut f.row_zone,
+                [
+                    (48., "48px"),
+                    (64., "64px"),
+                    (96., "96px"),
+                    (128., "128px"),
+                    (192., "192px"),
+                ],
+                cx,
+            ),
+            self.tile_drag_row(
+                ("tile-row-wait", "Row wait"),
+                "How long a row rests in one of those zones before its tile starts to slide in.",
+                |f| &mut f.row_wait,
+                [
+                    (0., "0ms"),
+                    (80., "80ms"),
+                    (150., "150ms"),
+                    (250., "250ms"),
+                    (400., "400ms"),
+                ],
+                cx,
+            ),
+            self.tile_drag_row(
+                ("tile-row-peek", "Row peek"),
+                "How far a row's tile slides in while it's held there.",
+                |f| &mut f.row_peek,
+                [
+                    (32., "32px"),
+                    (48., "48px"),
+                    (64., "64px"),
+                    (96., "96px"),
+                    (128., "128px"),
+                ],
+                cx,
+            ),
+        ]
+    }
+
+    /// A row picking one of `choices` for the `field` of how dragging a tile feels.
+    fn tile_drag_row(
+        &self,
+        (id, title): (&str, &'static str),
+        about: &'static str,
+        field: fn(&mut TileDragFeel) -> &mut f32,
+        choices: [(f32, &'static str); 5],
+        cx: &Context<Self>,
+    ) -> Row {
+        let mut feel = self.store.read(cx).tile_drag_feel;
+        let current = *field(&mut feel);
+        let store = self.store.clone();
+        let pick = move |value, _: &mut Window, cx: &mut App| {
+            store.update(cx, |store, cx| {
+                *field(&mut store.tile_drag_feel) = value;
+                cx.notify();
+            })
+        };
+        Row::new(
+            title,
+            about,
+            segmented(id, choices, current, pick, Theme::get(cx)),
+        )
+        .with_keywords("tile drag split")
     }
 
     /// Escape in a field puts it back and goes to the search box, where Escape closes.
@@ -785,6 +1174,7 @@ impl SettingsView {
                     vec![self.gitbutler_row(window, cx), self.mesh_row(cx)],
                 ),
                 Card::new(None, self.program_rows(cx)),
+                Card::new(None, vec![self.terminal_run_row(window, cx)]),
                 // Only once it's been looked for, which only macOS does.
                 Card::new(None, self.cli_row(cx).into_iter().collect()),
                 // Last, out of the way, as the desktop app keeps it on a page of its own.
@@ -801,9 +1191,18 @@ impl SettingsView {
                     .has_global::<crate::Embedded>()
                     .then(|| self.start_row(cx))
                     .flatten();
-                vec![Card::new(None, start.into_iter().collect())]
+                vec![Card::new(
+                    None,
+                    start
+                        .into_iter()
+                        .chain([self.single_file_row(cx), self.lite_row(cx)])
+                        .collect(),
+                )]
             }
-            Page::App(AppPage::Developer) => vec![Card::new(None, vec![self.fps_row(cx)])],
+            Page::App(AppPage::Developer) => vec![
+                Card::new(None, vec![self.fps_row(cx)]),
+                Card::new(Some("Tile dragging"), self.tile_drag_rows(cx)),
+            ],
             Page::Project(project, page) => self.project_cards(project, *page, window, cx),
         };
         // Nothing for a card with no rows yet, as before what it shows has loaded.
@@ -1246,6 +1645,12 @@ impl Render for SettingsView {
             );
         modal(ModalSize::Large, &theme)
             .id("settings")
+            .key_context("Settings")
+            // From a page link or a control, as / goes to the navigator's filter.
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                (this.search).update(cx, |search, cx| search.select_all_text(cx));
+                this.back_to_search(window, cx);
+            }))
             .h(dp(height))
             .flex_row()
             .child(

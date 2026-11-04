@@ -2,6 +2,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod alert;
+pub mod change_marks;
 pub mod conflict;
 pub mod diff;
 pub mod emoji;
@@ -10,6 +11,7 @@ pub mod fold;
 mod format;
 pub mod illustration;
 pub mod markdown;
+pub mod message_editor;
 pub mod modal;
 pub mod person;
 pub mod review;
@@ -22,13 +24,13 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use gpui::{
-    Action, AnyElement, App, AssetSource, ClickEvent, Context, CursorStyle, Div, DragMoveEvent,
-    ElementId, EmptyView, Entity, HighlightStyle, Hsla, MouseButton, MouseDownEvent, Pixels, Point,
-    Rems, Role, SharedString, Stateful, StyledText, Svg, Toggled, UnderlineStyle, Window, div,
-    prelude::*, rems, svg,
+    Action, AnyElement, App, AssetSource, ClickEvent, Context, CursorStyle, DispatchPhase, Div,
+    DragMoveEvent, ElementId, EmptyView, Entity, HighlightStyle, Hsla, MouseButton, MouseDownEvent,
+    Pixels, Point, Rems, Role, SharedString, Stateful, StyledText, Svg, TextLayout, Toggled,
+    UnderlineStyle, Window, div, prelude::*, relative, rems, svg,
 };
 
-use crate::state::{Pane, Store};
+use crate::state::{Area, Pane, Store};
 use crate::theme::Theme;
 pub use format::*;
 use illustration::{Illustration, illustration};
@@ -58,6 +60,14 @@ pub const fn fixed(n: f32) -> Pixels {
 /// menu, as GNOME's title bars do.
 pub fn drags_window(el: Div) -> Div {
     let el = el.window_control_area(gpui::WindowControlArea::Drag);
+    // `holds_back_first_click` lets this one through, so the window drags from here straight
+    // away, as from a title bar.
+    #[cfg(target_os = "macos")]
+    let el = el.capture_any_mouse_down(|event, _, _| {
+        if event.first_mouse {
+            FIRST_CLICK_ON_HEADER.set(true);
+        }
+    });
     #[cfg(not(windows))]
     let el = {
         use std::cell::Cell;
@@ -87,6 +97,50 @@ pub fn drags_window(el: Div) -> Div {
     el
 }
 
+thread_local! {
+    /// The click that brought the window in front landed on a header (`drags_window`).
+    static FIRST_CLICK_ON_HEADER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The window wasn't active when last drawn (`holds_back_first_click`).
+    static DRAWN_INACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `event` is the press that brings the window in front, on macOS, which
+/// `holds_back_first_click` holds back unless it's on a header. GPUI marks it `first_mouse`, but
+/// leaves that on a later press too when a ctrl-click brought the window in front, so it counts
+/// only while the window was last drawn inactive: GPUI hears that the window is active only after
+/// handling the press that made it so.
+pub fn brings_window_in_front(event: &MouseDownEvent) -> bool {
+    cfg!(target_os = "macos") && event.first_mouse && DRAWN_INACTIVE.get()
+}
+
+/// Holds back the click that brings the window in front, as macOS apps do, so it doesn't also
+/// press what's under it: GPUI passes it on (`acceptsFirstMouse`). A header still takes it, to
+/// drag the window. Drawn after everything else, as listeners run in the order they're drawn
+/// while an event is captured, so the headers' run first, as does a menu's that closes it on a
+/// press outside. Other capture listeners see it too, so one that acts checks
+/// `brings_window_in_front`.
+pub fn holds_back_first_click() -> impl IntoElement {
+    gpui::deferred(
+        gpui::canvas(
+            |_, _, _| {},
+            |_, (), window, _| {
+                DRAWN_INACTIVE.set(!window.is_window_active());
+                window.on_mouse_event(|event: &MouseDownEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Capture && event.first_mouse {
+                        let on_header = FIRST_CLICK_ON_HEADER.take();
+                        if brings_window_in_front(event) && !on_header {
+                            cx.stop_propagation();
+                        }
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0(),
+    )
+    .with_priority(usize::MAX)
+}
+
 /// `el`, in a header the window is dragged by, still taking its own clicks: the drag area under
 /// it would take them, and a double click there would zoom the window.
 pub fn above_drag<E: InteractiveElement>(el: E) -> E {
@@ -103,6 +157,12 @@ pub fn draws_window_controls(window: &Window) -> bool {
         )
 }
 
+/// Whether macOS's traffic lights are at the window's top left, where the headers leave room for
+/// them: not in full screen, where they come down with the menu bar, over the app.
+pub fn has_traffic_lights(window: &Window) -> bool {
+    cfg!(target_os = "macos") && !window.is_fullscreen()
+}
+
 /// What "Reveal in Finder" is called where the file manager isn't Finder.
 pub const REVEAL: &str = if cfg!(target_os = "macos") {
     "Reveal in Finder"
@@ -114,8 +174,8 @@ pub const REVEAL: &str = if cfg!(target_os = "macos") {
 
 pub use window_controls::WINDOW_CONTROLS_WIDTH;
 pub const ROW_HEIGHT: f32 = 28.;
-pub const HEADER_HEIGHT: f32 = 44.;
-pub const STATUS_BAR_HEIGHT: f32 = 28.;
+pub const HEADER_HEIGHT: f32 = 40.;
+pub const STATUS_BAR_HEIGHT: f32 = 30.;
 
 /// Every icon: the design system's, compiled in from `packages/ui-react` so they're the ones
 /// Lite and but.dev draw, and a build fails if one goes; then this app's own, under
@@ -132,6 +192,10 @@ macro_rules! icons {
         }
 
         impl Icon {
+            /// Every icon, for the stories' grid.
+            #[cfg(feature = "stories")]
+            pub const ALL: &[Icon] = &[$(Icon::$variant,)* $(Icon::$own,)*];
+
             pub fn path(self) -> &'static str {
                 match self {
                     $(Icon::$variant => concat!("icons/", $name, ".svg"),)*
@@ -192,12 +256,14 @@ icons! {
     FilesSidebar => "files-sidebar",
     Folder => "folder",
     FolderCopy => "folder-copy",
+    Fork => "fork",
     Globe => "globe",
     Hash => "hash",
     Kebab => "kebab",
     Lab => "lab",
     Link => "link",
     Lock => "lock",
+    Minus => "minus",
     Mixer => "mixer",
     Plug => "plug",
     Plus => "plus",
@@ -208,7 +274,6 @@ icons! {
     Repo => "repo",
     Search => "search",
     Settings => "settings",
-    Sidebar => "sidebar",
     SidebarNarrow => "sidebar-narrow",
     Stack => "stack",
     Tag => "tag",
@@ -222,6 +287,11 @@ icons! {
     own: FolderFill => "folder-fill",
     // ui-svelte's keyboard, which ui-react doesn't have.
     Keyboard => "keyboard",
+    // ui-react's sidebar-narrow, with the part a split makes filled in.
+    SplitRight => "split-right",
+    SplitBelow => "split-below",
+    TileZoom => "tile-zoom",
+    TileUnzoom => "tile-unzoom",
     // ui-react's eye, struck through, for a project not watched.
     EyeOff => "eye-off",
     // ui-react's folders with their top right corner cut away, for a dot there while a
@@ -241,21 +311,31 @@ icons! {
 }
 
 /// GitButler's fonts, compiled into the binary so the client looks the same everywhere.
-/// Embedded fonts are as fast as system ones; a user-installed variable font isn't, as
-/// CoreText asks the font daemon about it for every line it lays out.
 pub fn fonts() -> Vec<Cow<'static, [u8]>> {
     macro_rules! fonts {
         ($($name:literal),* $(,)?) => {
-            vec![$(Cow::Borrowed(include_bytes!(concat!("../../assets/fonts/", $name, ".ttf")).as_slice()),)*]
+            vec![$(Cow::Borrowed(include_bytes!(concat!("../../assets/fonts/", $name)).as_slice()),)*]
         };
     }
     fonts!(
-        "Inter-Regular",
-        "Inter-Medium",
-        "Inter-SemiBold",
-        "GeistMono-Regular",
-        "GeistMono-SemiBold",
+        "Inter-Regular.ttf",
+        "Inter-Medium.ttf",
+        "Inter-SemiBold.ttf",
+        "GeistMono-Regular.ttf",
+        "GeistMono-SemiBold.ttf",
+        "GeistMonoNerdFontMono-Regular.otf",
+        "GeistMonoNerdFontMono-SemiBold.otf",
     )
+}
+
+/// How wide a digit of `family` is in ems, or `None` when the machine hasn't got it, as GPUI
+/// would quietly draw it in its own fallback.
+pub fn digit_advance(family: &str, text_system: &gpui::TextSystem) -> Option<f32> {
+    let id = text_system.resolve_font(&gpui::font(family.to_owned()));
+    (text_system.get_font_for_id(id)?.family == family).then_some(())?;
+    let size = fixed(100.);
+    let advance = text_system.advance(id, size, '0').ok()?;
+    Some(advance.width / size)
 }
 
 /// Match each of `fonts`' faces against the installed fonts in the background, as Zed does.
@@ -396,6 +476,52 @@ pub fn segmented(
         )
 }
 
+/// How tall a tile's bar is, which says what it shows, while its row has more than one.
+pub const TILE_BAR: f32 = 30.;
+
+/// How far a tile's card sits in from its area: half the gap between two, as the navigator's
+/// cards are apart.
+pub const TILE_MARGIN: f32 = 4.;
+
+/// How far a tile's content sits in from its card's edge, its border included: as the
+/// navigator's cards hold their rows, and clear of the rounded corners, as GPUI cuts what's
+/// inside to a rectangle.
+pub const TILE_PAD: f32 = 4.;
+
+/// `el` absolutely over the room it's in, `by` in from every side.
+pub fn inset_by(el: Div, by: f32) -> Div {
+    el.absolute()
+        .top(dp(by))
+        .bottom(dp(by))
+        .left(dp(by))
+        .right(dp(by))
+}
+
+/// A tile's card over its area, as the navigator's cards are drawn.
+pub fn tile_card(theme: &Theme) -> Div {
+    inset_by(div(), TILE_MARGIN)
+        .bg(theme.bg_1)
+        .border_1()
+        .border_color(theme.border_3)
+        .rounded(dp(6.))
+}
+
+/// Where a tile's content goes in its area: inside its card, and cut to it, as a header wider
+/// than the tile is.
+pub fn tile_content() -> Div {
+    inset_by(div(), TILE_MARGIN + TILE_PAD).overflow_hidden()
+}
+
+/// A box over `area` of the room it's in, which is `relative`: where a tile goes.
+pub fn placed(area: Area) -> Div {
+    div()
+        .absolute()
+        .left(relative(area.left))
+        .top(relative(area.top))
+        .w(relative(area.width))
+        .h(relative(area.height))
+}
+
 pub fn h_flex() -> Div {
     div().flex().flex_row().items_center()
 }
@@ -434,6 +560,50 @@ pub fn matched(
         ..Default::default()
     };
     StyledText::new(text).with_highlights(found.into_iter().map(|range| (range, underline)))
+}
+
+/// A place in text drawn as rows, as the diff's lines or a description's blocks: the row, and
+/// a byte of its text.
+pub type TextPoint = (usize, usize);
+
+/// Where in `text`, laid out as `layout`, the pointer at `position` is: over a character, the
+/// edge of it nearer the pointer, as text selection goes everywhere; off the text, where the
+/// text stops, as its start above it and a line's end beside or below it.
+pub fn text_index(layout: &TextLayout, text: &str, position: Point<Pixels>) -> usize {
+    let ix = match layout.index_for_position(position) {
+        Ok(ix) => ix,
+        Err(ix) => return ix,
+    };
+    let next = (text.get(ix..))
+        .and_then(|rest| rest.chars().next())
+        .map(|c| ix + c.len_utf8());
+    let edges = next.and_then(|next| {
+        Some((
+            layout.position_for_index(ix)?,
+            layout.position_for_index(next)?,
+            next,
+        ))
+    });
+    match edges {
+        Some((start, end, next)) if position.x > (start.x + end.x) / 2. => next,
+        _ => ix,
+    }
+}
+
+/// What a selection from `start` to `end`, in order, takes of `text`, row `row`'s. Nothing
+/// when the text changed under it so its ends no longer fall in the text, as after an edit.
+pub fn selected_part(
+    text: &str,
+    row: usize,
+    (start, end): (TextPoint, TextPoint),
+) -> Option<Range<usize>> {
+    if row < start.0 || row > end.0 {
+        return None;
+    }
+    let from = if row == start.0 { start.1 } else { 0 };
+    let to = if row == end.0 { end.1 } else { text.len() };
+    let fits = text.is_char_boundary(from) && text.is_char_boundary(to);
+    (from < to && fits).then_some(from..to)
 }
 
 /// The heading over a group of rows.
@@ -539,6 +709,13 @@ pub fn side_row(
 pub fn quiet(el: Div, on: bool, theme: &Theme) -> Div {
     el.flex_none()
         .when(on, |el| el.text_color(theme.muted_on_solid()))
+}
+
+/// Where row `ix` of `list` was last drawn, while some of it shows: where ⇧F10 opens the menu
+/// of the row selected.
+pub fn shown_row(list: &gpui::ListState, ix: usize) -> Option<gpui::Bounds<Pixels>> {
+    let (row, view) = (list.bounds_for_item(ix)?, list.viewport_bounds());
+    (row.bottom() > view.top() && row.top() < view.bottom()).then_some(row)
 }
 
 /// A row of a list or menu, shaded when `selected` and otherwise under the pointer.
@@ -658,12 +835,25 @@ pub struct Switch {
     on: bool,
     el: Stateful<Div>,
     grounds: [gpui::Rgba; 2],
+    disabled: bool,
 }
 
 /// An on/off switch, for a setting that applies at once.
 pub fn switch(id: impl Into<ElementId>, on: bool, theme: &Theme) -> Switch {
     let id = id.into();
-    let el = tab_stop(h_flex().id(id.clone()), theme)
+    Switch {
+        el: tab_stop(switch_track(id.clone(), on), theme).hover(|el| el.opacity(0.9)),
+        id,
+        on,
+        grounds: switch_grounds(theme),
+        disabled: false,
+    }
+}
+
+/// A switch's track, before it takes the keys or the pointer.
+fn switch_track(id: ElementId, on: bool) -> Stateful<Div> {
+    h_flex()
+        .id(id)
         .role(Role::Switch)
         .aria_toggled(if on { Toggled::True } else { Toggled::False })
         .flex_none()
@@ -671,21 +861,28 @@ pub fn switch(id: impl Into<ElementId>, on: bool, theme: &Theme) -> Switch {
         .h(dp(18.))
         .p(dp(2.))
         .rounded_full()
-        .hover(|el| el.opacity(0.9));
-    Switch {
-        id,
-        on,
-        el,
-        grounds: switch_grounds(theme),
-    }
 }
 
 impl Switch {
+    /// Dimmed, out of the tab order and taking no clicks, with `why` in its tooltip, as a
+    /// disabled [`button`] is.
+    pub fn disabled_because(mut self, why: Option<impl Into<SharedString>>) -> Self {
+        if let Some(why) = why {
+            self.el = switch_track(self.id.clone(), self.on)
+                .opacity(0.5)
+                .tooltip(Tooltip::text(why));
+            self.disabled = true;
+        }
+        self
+    }
+
     pub fn on_click(
         mut self,
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.el = self.el.on_click(handler);
+        if !self.disabled {
+            self.el = self.el.on_click(handler);
+        }
         self
     }
 }
@@ -732,9 +929,9 @@ pub fn checkbox(id: impl Into<ElementId>, check: Toggled, theme: &Theme) -> Stat
             Toggled::True => el.child(
                 small_icon(Icon::Tick)
                     .size(dp(10.))
-                    .text_color(gpui::white()),
+                    .text_color(theme.on_pop),
             ),
-            Toggled::Mixed => el.child(div().w(dp(8.)).h(dp(2.)).rounded(dp(1.)).bg(gpui::white())),
+            Toggled::Mixed => el.child(div().w(dp(8.)).h(dp(2.)).rounded(dp(1.)).bg(theme.on_pop)),
             Toggled::False => el,
         })
 }
@@ -765,9 +962,11 @@ pub fn dropdown(
 pub fn field(input: &Entity<text_input::TextInput>, focused: bool, theme: &Theme) -> Div {
     let clicked = input.clone();
     div()
-        // Its padding is part of the field to click.
+        // Its padding is part of the field to click, and keeps the keys from a focusable
+        // parent, which would take them as the press goes on to it.
         .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
-            window.focus(&gpui::Focusable::focus_handle(&clicked, cx), cx)
+            window.focus(&gpui::Focusable::focus_handle(&clicked, cx), cx);
+            window.prevent_default();
         })
         .px(dp(8.))
         .py(dp(5.))
@@ -819,6 +1018,8 @@ pub struct Button {
     /// Why it can't be pressed now, shown in place of its tooltip.
     disabled: Option<SharedString>,
     small: bool,
+    /// At least this wide, its label centred.
+    min_width: Option<Rems>,
     /// On an inverted ground, like a selected row.
     inverted: bool,
     /// The colour of the ground it sits on, as a banner's action takes its banner's.
@@ -830,6 +1031,8 @@ pub struct Button {
     tooltip_action: Option<Box<dyn Action>>,
     /// Which half of a [`dropdown_button`] it is, squared where the halves meet.
     half: Option<Half>,
+    /// Narrower than its label when its row has no room to spare: see [`Button::shrinks`].
+    shrinks: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -848,6 +1051,7 @@ pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Butto
         style: ButtonStyle::Outline,
         disabled: None,
         small: false,
+        min_width: None,
         inverted: false,
         tint: None,
         on_click: None,
@@ -855,6 +1059,7 @@ pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Butto
         tooltip_key: None,
         tooltip_action: None,
         half: None,
+        shrinks: false,
     }
 }
 
@@ -896,6 +1101,20 @@ impl Button {
 
     pub fn small(mut self) -> Self {
         self.small = true;
+        self
+    }
+
+    /// Narrower than its label when its row has no room to spare, which it then cuts short with
+    /// an ellipsis, as a long branch name in it would otherwise push its row past its edge.
+    /// Buttons that shrink share what the row lacks; the rest keep their width.
+    pub fn shrinks(mut self) -> Self {
+        self.shrinks = true;
+        self
+    }
+
+    /// At least `width` wide, so buttons that stand in for each other cover the same place.
+    pub fn min_width(mut self, width: Rems) -> Self {
+        self.min_width = Some(width);
         self
     }
 
@@ -966,7 +1185,7 @@ impl RenderOnce for Button {
                 theme.fill_gray.opacity(0.16),
             ),
             ButtonStyle::Pop => (
-                gpui::white(),
+                theme.on_pop,
                 Some(theme.pop_button),
                 None,
                 theme.pop_button.opacity(0.9),
@@ -993,17 +1212,22 @@ impl RenderOnce for Button {
             false => (dp(28.), dp(28.), dp(16.)),
         };
         let has_label = self.label.is_some();
+        let shrinks = self.shrinks;
         // What a screen reader calls it: its text, or for an icon its tooltip.
         let name = self.label.clone().or_else(|| self.tooltip.clone());
         h_flex()
             .id(self.id)
             .role(Role::Button)
             .when_some(name, |el, name| el.aria_label(name))
-            .flex_none()
+            .map(|el| match shrinks {
+                true => el.min_w_0(),
+                false => el.flex_none(),
+            })
             .h(height)
             .gap(dp(if self.small { 4. } else { 6. }))
             .when(has_label, |el| el.px(dp(if self.small { 6. } else { 10. })))
             .when(!has_label, |el| el.w(width).justify_center())
+            .when_some(self.min_width, |el, width| el.min_w(width).justify_center())
             .text_size(dp(if self.small { 12. } else { 13. }))
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .whitespace_nowrap()
@@ -1028,7 +1252,10 @@ impl RenderOnce for Button {
                 let opacity = if has_label { 0.7 } else { 0.8 };
                 el.child(icon(kind).size(icon_size).text_color(fg.opacity(opacity)))
             })
-            .when_some(self.label, |el, label| el.child(label))
+            .when_some(self.label, |el, label| match shrinks {
+                true => el.child(div().min_w_0().truncate().child(label)),
+                false => el.child(label),
+            })
             .when_some(self.disabled.clone().or(self.tooltip), |el, tooltip| {
                 let enabled = self.disabled.is_none();
                 let key = self.tooltip_key.filter(|_| enabled);
@@ -1190,12 +1417,22 @@ pub fn bindings_of(action: &dyn gpui::Action, cx: &App) -> Vec<(SharedString, Op
 }
 
 /// The keys that run `action` where the keys go now, unless the same keys do something else
-/// there, as [`shortcut`] writes them.
+/// there, as [`shortcut`] writes them. Keys bound to several actions there run the first one
+/// handled, so one with no handler here doesn't take them: r is Reword's on a commit and Rename
+/// branch's on a branch.
 pub fn shortcut_here(action: &dyn gpui::Action, window: &Window, cx: &App) -> Option<SharedString> {
-    let focused = window.focused(cx)?;
-    Some(keys_of(&window.highest_precedence_binding_for_action_in(
-        action, &focused,
-    )?))
+    window.focused(cx)?;
+    let context = window.context_stack();
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let runs = |binding: &gpui::KeyBinding| {
+        let (bound, _) = keymap.bindings_for_input(binding.keystrokes(), &context);
+        (bound.iter())
+            .find(|b| b.action().partial_eq(action) || window.is_action_available(b.action(), cx))
+            .is_some_and(|b| b.action().partial_eq(action))
+    };
+    let binding = keymap.bindings_for_action(action).rev().find(|b| runs(b))?;
+    Some(keys_of(binding))
 }
 
 fn keys_of(binding: &gpui::KeyBinding) -> SharedString {
@@ -1317,6 +1554,19 @@ pub fn dot(color: Hsla) -> Div {
     div().flex_none().size(dp(6.)).rounded_full().bg(color)
 }
 
+/// An unread row's mark: a hairline in `color` in the row's left padding, out of its flow so
+/// nothing moves when it's read. The row must be `relative`.
+pub fn unread_line(color: Hsla) -> Div {
+    div()
+        .absolute()
+        .left(dp(2.))
+        .top_0()
+        .bottom_0()
+        .flex()
+        .items_center()
+        .child(div().w(fixed(1.)).h(dp(14.)).bg(color))
+}
+
 /// How long ago `seconds` (since the epoch) was, faint, in a slot as wide as the longest
 /// ("11mo"), so what sits before it lines up from row to row; empty without a time. It starts
 /// at the slot's left, beside what comes before.
@@ -1340,6 +1590,7 @@ pub fn meta_count(glyph: Icon, n: usize, color: Hsla, tip: String) -> Option<Sta
             .text_color(color)
             .child(small_icon(glyph).text_color(color))
             .child(n.to_string())
+            .aria_label(tip.clone())
             .tooltip(Tooltip::text(tip))
     })
 }
@@ -1373,6 +1624,69 @@ pub fn pulsing<E: IntoElement + Styled + 'static>(el: E) -> impl IntoElement {
     )
 }
 
+/// How long each step of [`spinning`] shows.
+const SPIN_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+/// The dots each step of [`spinning`] shows, as braille's: the low three bits are the left
+/// column's, top down, the next three the right's. The terminal's dots spinner, ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏.
+const SPIN_FRAMES: [u8; 10] = [0x0b, 0x19, 0x39, 0x38, 0x3c, 0x34, 0x26, 0x27, 0x07, 0x0f];
+/// A dot of [`spinning`], and how far apart their centres are, in a `small_icon`'s box.
+const SPIN_DOT: f32 = 2.;
+const SPIN_PITCH: f32 = 3.5;
+
+/// Dots running round, as a terminal's spinner does, while what it stands for is under way,
+/// `turning` only while it shows. It steps 10 times a second, each step drawing the view it's
+/// in, and with it the whole window, again: an agent's spinner turns for minutes, and drawing
+/// the window any more often kept it from going idle and WindowServer busy all that while.
+/// Dots read as stepping on purpose at that rate, where a turning glyph would look choppy.
+pub fn spinning(color: Hsla, turning: bool) -> impl IntoElement {
+    use gpui::canvas;
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(crate::clock::now);
+    let since = crate::clock::now().saturating_duration_since(*START);
+    let steps = since.as_nanos() / SPIN_STEP.as_nanos();
+    #[expect(clippy::indexing_slicing, reason = "taken modulo the length")]
+    let frame = SPIN_FRAMES[(steps % SPIN_FRAMES.len() as u128) as usize];
+    let due = SPIN_STEP
+        - std::time::Duration::from_nanos((since.as_nanos() % SPIN_STEP.as_nanos()) as u64);
+    let left = (12. - SPIN_PITCH - SPIN_DOT) / 2.;
+    let top = (12. - 2. * SPIN_PITCH - SPIN_DOT) / 2.;
+    let dots = (0..6)
+        .filter(|bit| frame & (1 << bit) != 0)
+        .map(move |bit| {
+            let (column, row) = ((bit / 3) as f32, (bit % 3) as f32);
+            div()
+                .absolute()
+                .left(dp(left + column * SPIN_PITCH))
+                .top(dp(top + row * SPIN_PITCH))
+                .size(dp(SPIN_DOT))
+                .rounded_full()
+                .bg(color)
+        });
+    div()
+        .relative()
+        .flex_none()
+        .size(dp(12.))
+        .children(dots)
+        // The next step asked for as this one is drawn, so a spinner that's gone, or one in a
+        // view that isn't drawn, asks for no more.
+        .when(turning, |el| {
+            el.child(
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, cx| {
+                        let view = window.current_view();
+                        (cx.spawn(async move |cx| {
+                            cx.background_executor().timer(due).await;
+                            cx.update(|cx| cx.notify(view));
+                        }))
+                        .detach();
+                    },
+                )
+                .absolute(),
+            )
+        })
+}
+
 /// A faint pop wash over a `list_row`'s ground that fades out once, as for a commit that just
 /// showed up (`Store::glows`), so an agent's commit is noticed where it lands rather than in a
 /// card. Make it the row's first child, of a `relative` row, so the row's text draws over it.
@@ -1391,13 +1705,13 @@ pub fn glow_once(id: impl Into<ElementId>, theme: &Theme) -> impl IntoElement {
 /// How long a row blinks once: see [`blink_once`].
 pub const BLINK: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// A pop wash over what y copied that holds a moment and goes, as the TUI highlights it:
-/// `shape`, an absolute div over the selected row or box, shaped as its ground is. Its first
-/// child, as [`glow_once`] is, where it has a ground of its own for the text to draw over. Give
-/// each blink an `id` of its own, so one right after another starts again.
-pub fn blink_once(id: impl Into<ElementId>, shape: Div, theme: &Theme) -> impl IntoElement {
+/// A `wash` over what y copied that holds a moment and goes, as the TUI highlights it, or over
+/// where a mode would put what it takes, as a click it can't use reminds the user of it:
+/// `shape`, an absolute div over the row or box, shaped as its ground is. Its first child, as
+/// [`glow_once`] is, where it has a ground of its own for the text to draw over. Give each
+/// blink an `id` of its own, so one right after another starts again.
+pub fn blink_once(id: impl Into<ElementId>, shape: Div, wash: Hsla) -> impl IntoElement {
     use gpui::{Animation, AnimationExt as _};
-    let wash = theme.pop;
     shape.with_animation(
         id,
         Animation::new(BLINK).with_easing(gpui::quadratic),
@@ -1504,16 +1818,123 @@ pub fn resize_handle(pane: Pane, store: Entity<Store>, theme: &Theme) -> impl In
         })
 }
 
+/// A strip over the gap between two cards, `axis` saying which way they're beside each other:
+/// drag it to move what's between them. A pill in its middle shows it while the pointer's on
+/// it or, as the store keeps, it's being dragged, `which` it is. Its drag goes on with the
+/// payload the caller gives it and [`mark_dragged`].
+pub fn gap_divider(
+    id: impl Into<ElementId>,
+    axis: crate::state::Axis,
+    which: crate::state::DividerDrag,
+    store: &Entity<Store>,
+    theme: &Theme,
+    cx: &App,
+) -> Stateful<Div> {
+    use crate::state::Axis;
+    let dragged = store.read(cx).dragged_divider.as_ref() == Some(&which);
+    let (cursor, pill) = match axis {
+        Axis::Across => (CursorStyle::ResizeLeftRight, div().w(dp(4.)).h(dp(32.))),
+        Axis::Down => (CursorStyle::ResizeUpDown, div().w(dp(32.)).h(dp(4.))),
+    };
+    let pill = pill
+        .rounded_full()
+        .when(dragged, |el| el.bg(theme.border_1))
+        .group_hover("gap-divider", |el| el.bg(theme.border_1));
+    let let_go = {
+        let store = store.clone();
+        move |_: &gpui::MouseUpEvent, _: &mut Window, cx: &mut App| {
+            store.update(cx, |store, cx| {
+                if store.dragged_divider.take().is_some() {
+                    cx.notify();
+                }
+            })
+        }
+    };
+    div()
+        .id(id)
+        .absolute()
+        .flex()
+        .when(axis == Axis::Down, |el| el.flex_col())
+        .items_center()
+        .justify_center()
+        .group("gap-divider")
+        .cursor(cursor)
+        // Over the cards' own pointer handling, as a terminal's selecting.
+        .block_mouse_except_scroll()
+        .child(pill)
+        .when(dragged, |el| {
+            el.on_mouse_up(MouseButton::Left, let_go.clone())
+                .on_mouse_up_out(MouseButton::Left, let_go)
+        })
+}
+
+/// A handle over where [`gap_divider`]s meet, 16 across, shown by their pills along each line
+/// of `junction` while the pointer's on it or it's dragged, as `which`. The caller places it.
+/// What lets go of it is the room's, as a junction can join another as it's dragged, and so
+/// stop being drawn.
+pub fn gap_junction(
+    id: impl Into<ElementId>,
+    junction: &crate::state::Junction,
+    which: &crate::state::DividerDrag,
+    store: &Entity<Store>,
+    theme: &Theme,
+    cx: &App,
+) -> Stateful<Div> {
+    use crate::state::Side;
+    let dragged = store.read(cx).dragged_divider.as_ref() == Some(which);
+    // From the handle's middle, as long as half a divider's pill.
+    let pill = |side: Side| {
+        let pill = div().absolute().rounded_full();
+        let pill = match side {
+            Side::Top => pill.left(dp(6.)).top(dp(-8.)).w(dp(4.)).h(dp(18.)),
+            Side::Bottom => pill.left(dp(6.)).top(dp(6.)).w(dp(4.)).h(dp(18.)),
+            Side::Left => pill.top(dp(6.)).left(dp(-8.)).h(dp(4.)).w(dp(18.)),
+            Side::Right => pill.top(dp(6.)).left(dp(6.)).h(dp(4.)).w(dp(18.)),
+        };
+        pill.when(dragged, |el| el.bg(theme.border_1))
+            .group_hover("gap-junction", |el| el.bg(theme.border_1))
+    };
+    let pills = [Side::Top, Side::Right, Side::Bottom, Side::Left]
+        .into_iter()
+        .filter(|side| junction.reaches(*side))
+        .map(pill);
+    div()
+        .id(id)
+        .absolute()
+        .group("gap-junction")
+        .cursor(CursorStyle::ResizeUpLeftDownRight)
+        // Over the cards' own pointer handling, as a terminal's selecting.
+        .block_mouse_except_scroll()
+        .children(pills)
+}
+
+/// What starts a [`gap_divider`]'s drag: the store keeps that `which` is dragged, as its pill
+/// shows, and GPUI draws nothing under the pointer for it.
+pub fn mark_dragged<T>(
+    store: &Entity<Store>,
+    which: crate::state::DividerDrag,
+) -> impl Fn(&T, Point<Pixels>, &mut Window, &mut App) -> Entity<EmptyView> + 'static {
+    let store = store.clone();
+    move |_, _, _, cx| {
+        store.update(cx, |store, cx| {
+            store.dragged_divider = Some(which.clone());
+            cx.notify();
+        });
+        cx.new(|_| EmptyView)
+    }
+}
+
 /// Resize `pane` while its handle is dragged, measuring from the left of the element this
-/// listens on.
+/// listens on, the handle's middle `beyond` short of the pane's edge.
 pub fn resize_pane(
     pane: Pane,
+    beyond: f32,
     store: Entity<Store>,
 ) -> impl Fn(&DragMoveEvent<Pane>, &mut Window, &mut App) + 'static {
     move |event, _, cx| {
         if *event.drag(cx) == pane {
             let width = f32::from(event.event.position.x - event.bounds.left());
-            let width = width / Theme::get(cx).scale;
+            let width = width / Theme::get(cx).scale + beyond;
             store.update(cx, |store, cx| store.set_width(pane, Some(width), cx));
         }
     }

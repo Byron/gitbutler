@@ -35,5 +35,32 @@ pub struct Outcome {
     pub conflict_occurred: bool,
 }
 
+/// Why [super::safe_checkout_from_head()] refused: uncommitted changes would be overwritten.
+///
+/// It sits below the [`but_error::Context`] with the message, so callers can tell this refusal
+/// from other preconditions by downcasting to it.
+#[derive(Debug)]
+pub struct UncommittedChangesInTheWay;
+
+impl std::fmt::Display for UncommittedChangesInTheWay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("uncommitted changes are in the way")
+    }
+}
+
+impl UncommittedChangesInTheWay {
+    /// The refusal to overwrite the uncommitted changes at `paths`, quoted and sorted.
+    pub(in crate::worktree::checkout) fn refusal(paths: &[String]) -> anyhow::Error {
+        anyhow::anyhow!(UncommittedChangesInTheWay).context(
+            but_error::Context::new(format!(
+                "Uncommitted files would be overwritten by checkout: {}",
+                paths.join(", ")
+            ))
+            .with_code(but_error::Code::PreconditionFailed),
+        )
+    }
+}
+
 pub(crate) mod function;
 mod utils;
+mod write;

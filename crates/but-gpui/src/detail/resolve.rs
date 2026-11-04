@@ -17,6 +17,7 @@ use crate::backend::conflicts::{self, Keep};
 use crate::backend::{self, Branch, Checkout, Commit, CommitId, Conflict, FullName, Workspace, ai};
 use crate::state::{Overlay, ProjectId, Rereads, Selection, snack};
 use crate::theme::Theme;
+use crate::transfer::{Move, Op};
 use crate::ui::conflict::{self, Actions, Kept, Name, Part, Pick};
 use crate::ui::diff::{DiffRow, Layout, OnToggle};
 use crate::ui::text_input::{InputEvent, TextInput};
@@ -114,9 +115,19 @@ impl Detail {
         self.conflicts().next().is_some()
     }
 
-    /// The key context of the detail: with conflicts to pick, and with picks to apply.
-    pub(super) fn key_context(&self) -> &'static str {
+    /// The key context of the detail: with conflicts to pick, and with picks to apply, while
+    /// the composer's open, or while a commit or an amend is placed without it, as with the
+    /// navigator hidden.
+    pub(super) fn key_context(&self, cx: &App) -> &'static str {
+        let placing = matches!(
+            self.store.read(cx).moving,
+            Some(Move { op: Op::Commit, .. })
+        );
+        let amending = (self.store.read(cx).moving.as_ref()).is_some_and(Move::amending);
         match (self.conflicts().next(), self.resolving.keeping.is_empty()) {
+            (None, _) if self.composing => "Diff Composer",
+            (None, _) if placing => "Diff Committing",
+            (None, _) if amending => "Diff Amending",
             (None, _) => "Diff",
             (Some(_), true) => "Diff Conflicts",
             (Some(_), false) => "Diff Conflicts Picked",
@@ -886,7 +897,7 @@ fn oldest_first(workspace: &Workspace, commit: CommitId) -> Vec<CommitId> {
 
 /// The oldest conflicted commit from branch `ref_name` down the lanes it rests on, and the
 /// branch holding it. None when that's a linked worktree's, as its conflicts resolve in it.
-pub(super) fn oldest_conflict<'a>(
+pub fn oldest_conflict<'a>(
     workspace: &'a Workspace,
     ref_name: &FullName,
 ) -> Option<(&'a Branch, &'a Commit)> {
@@ -990,7 +1001,8 @@ impl AppView {
     /// selected branch or commit's stack.
     fn conflict_to_resolve(&self, cx: &App) -> Option<(ProjectId, CommitId)> {
         let store = self.store.read(cx);
-        let selection = (store.selection.as_ref()).filter(|s| !store.in_linked(s))?;
+        let selection = self.selection(cx).filter(|s| !store.in_linked(s))?;
+        let selection = &selection;
         let workspace = store.workspace(selection.project())?;
         let conflicted =
             |id: CommitId| workspace.find_commit(id).is_some_and(|(_, c)| c.conflicted);
@@ -1089,10 +1101,6 @@ mod tests {
     use crate::backend::model::build::{branch, commit_name, id, workspace, worktree};
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test, and snapbox looks for the file its snapshot is in"
-    )]
     fn conflicts_resolve_oldest_first_down_the_lanes_a_lane_rests_on() {
         let ws = workspace(
             vec![vec![

@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::fmt::Display;
+use std::panic::Location;
 
 use crate::theme::{self, Paint};
 
@@ -19,16 +20,23 @@ pub struct BadInput {
     arg_value: Option<String>,
     /// A hint to guide the user to proper usage of the command
     hint: Option<String>,
+    /// A stable code that telemetry can filter on
+    code: Option<&'static str>,
+    /// Where the bad input was raised, which tells failures apart in telemetry
+    location: &'static Location<'static>,
 }
 
 impl BadInput {
-    /// Create a new [`BadInput`]
+    /// Create a new [`BadInput`] that was raised by the caller.
+    #[track_caller]
     pub fn new<S: AsRef<str>>(message: S) -> Self {
         Self {
             message: message.as_ref().to_string(),
             arg_name: None,
             arg_value: None,
             hint: None,
+            code: None,
+            location: Location::caller(),
         }
     }
 
@@ -50,8 +58,18 @@ impl BadInput {
         self
     }
 
+    /// Add a stable code that telemetry can filter on.
+    pub fn code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
+
     pub(crate) fn argument_name(&self) -> Option<&str> {
         self.arg_name.as_deref()
+    }
+
+    pub(crate) fn error_code(&self) -> Option<&'static str> {
+        self.code
     }
 
     pub(crate) fn has_hint(&self) -> bool {
@@ -59,16 +77,26 @@ impl BadInput {
     }
 }
 
-/// The hint for a remote-tracking `target_ref` that no local branch tracks.
-pub(crate) fn track_remote_target_hint(target_ref: impl Display) -> String {
-    format!(
-        "Make a local branch track {target_ref} with \
-        `git branch --set-upstream-to={target_ref} <branch>`, \
-        or choose a local target branch with `but config target <branch>`"
-    )
+/// The hint for when restoring a snapshot would have to move a branch checked out in a worktree.
+pub(crate) const REVERSE_OPERATION_HINT: &str = "Reverse the operation with its inverse instead, \
+    such as `but move <commit> --branch <branch>`, `but reword <commit>` or `but uncommit <commit>`";
+
+/// The hint for a remote-tracking target that no local branch tracks.
+pub(crate) fn track_remote_target_hint(
+    unresolved: &but_core::ref_metadata::UnresolvedLegacyTargetRefError,
+) -> String {
+    match &unresolved.track_command {
+        Some(command) => format!(
+            "Make a local branch track {} with `{command}`, \
+            or choose a local target branch with `but config target <branch>`",
+            unresolved.target_ref.shorten()
+        ),
+        None => "Choose a local target branch with `but config target <branch>`".to_owned(),
+    }
 }
 
 /// Convenience wrapper around [`BadInput::new`].
+#[track_caller]
 pub(crate) fn bad_input<S: AsRef<str>>(message: S) -> BadInput {
     BadInput::new(message)
 }
@@ -120,10 +148,10 @@ pub enum CliError {
     ExternalCommandNotFound(OsString),
     /// An external subcommand failed with this exit code.
     ExternalCommandFailed(i32),
-    /// Something went wrong internally.
-    Internal(anyhow::Error),
-    /// The command failed before its handler started.
-    Initialization(anyhow::Error),
+    /// Something went wrong internally, at the location that made it a `CliError`.
+    Internal(anyhow::Error, &'static Location<'static>),
+    /// The command failed before its handler started, at the location that made it a `CliError`.
+    Initialization(anyhow::Error, &'static Location<'static>),
     /// The CLI output was a "rejection". See [`CliOutputHuman::is_rejection`] for more details.
     CommandRejection,
 }
@@ -138,6 +166,9 @@ impl<E> From<E> for CliError
 where
     E: Into<anyhow::Error>,
 {
+    /// Errors record the location of this call, so convert with `?`, `.into()` or a direct
+    /// call. Passing `CliError::from` or `Into::into` to `map_err` records a line in `core`.
+    #[track_caller]
     fn from(value: E) -> Self {
         let error = value.into();
         if error.downcast_ref::<but_error::Code>()
@@ -145,6 +176,32 @@ where
         {
             return CliError::BadInput(bad_input("Cannot check out a conflicted commit.").hint(
                 "Run `but switch --workspace` and start conflict resolution with `but resolve`",
+            ));
+        }
+        if error.is::<but_core::worktree::checkout::UncommittedChangesInTheWay>()
+            && let Some(refusal) = error.downcast_ref::<but_error::Context>()
+        {
+            return CliError::BadInput(
+                match error
+                    .downcast_ref::<but_rebase::graph_rebase::materialize::LinkedWorktreeCheckout>()
+                {
+                    Some(worktree) => bad_input(format!("{worktree}: {refusal}"))
+                        .hint("Run `but commit` or `but discard` in that worktree, then retry"),
+                    None => bad_input(refusal.to_string())
+                        .code("PreconditionFailed")
+                        .hint("Run `but commit -b <branch> <file>` to keep those files or `but discard <file>` to drop them, then retry"),
+                },
+            );
+        }
+        #[cfg(feature = "legacy")]
+        if let Some(refusal) = error.downcast_ref::<gitbutler_oplog::BranchInOtherWorktree>() {
+            return CliError::BadInput(bad_input(refusal.to_string()).hint(REVERSE_OPERATION_HINT));
+        }
+        #[cfg(feature = "legacy")]
+        if let Some(reason) = gitbutler_git::remote_failure_reason(&error) {
+            return CliError::BadInput(bad_input(reason).code("RemoteUnavailable").hint(
+                "Check the remote's URL with `git remote -v`, your network connection and your \
+                credentials, then retry",
             ));
         }
         if let Some(unresolved) =
@@ -160,7 +217,7 @@ where
                         "GitButler now requires the target to be a local branch, \
                         but no local branch tracks your current target, {target_ref}"
                     ),
-                    track_remote_target_hint(target_ref),
+                    track_remote_target_hint(unresolved),
                 ),
                 UnresolvedLegacyTargetReason::MultipleTrackingBranches => (
                     format!("Multiple local branches track {target_ref}"),
@@ -169,11 +226,37 @@ where
             };
             return CliError::BadInput(bad_input(message).hint(hint));
         }
-        CliError::Internal(error)
+        // A precondition says why the request can't be done right now. The context around it
+        // names refs and hashes the user didn't type, so only its own message is shown.
+        if let Some(refusal) = error.downcast_ref::<but_error::Context>()
+            && refusal.code == but_error::Code::PreconditionFailed
+        {
+            return CliError::BadInput(bad_input(refusal.to_string()).code("PreconditionFailed"));
+        }
+        CliError::Internal(error, Location::caller())
     }
 }
 
 impl CliError {
+    /// The `file:line` that raised this, with `/` separators on every platform, if it's known.
+    ///
+    /// Lines move between builds, so sites only compare within one version. A failure that
+    /// must be found across versions needs a [code](BadInput::code).
+    pub(crate) fn site(&self) -> Option<String> {
+        let location = match self {
+            Self::BadInput(value) => value.location,
+            Self::Internal(_, location) | Self::Initialization(_, location) => location,
+            Self::ExternalCommandNotFound(_)
+            | Self::ExternalCommandFailed(_)
+            | Self::CommandRejection => return None,
+        };
+        Some(format!(
+            "{}:{}",
+            location.file().replace('\\', "/"),
+            location.line()
+        ))
+    }
+
     /// Add context to internal errors while preserving user-facing bad input messages.
     pub fn context<C>(self, context: C) -> Self
     where
@@ -186,8 +269,10 @@ impl CliError {
             }
             Self::ExternalCommandFailed(code) => Self::ExternalCommandFailed(code),
             Self::CommandRejection => Self::CommandRejection,
-            Self::Internal(value) => Self::Internal(value.context(context)),
-            Self::Initialization(value) => Self::Initialization(value.context(context)),
+            Self::Internal(value, location) => Self::Internal(value.context(context), location),
+            Self::Initialization(value, location) => {
+                Self::Initialization(value.context(context), location)
+            }
         }
     }
 
@@ -199,8 +284,8 @@ impl CliError {
                 Self::ExternalCommandNotFound(command_name)
             }
             Self::ExternalCommandFailed(code) => Self::ExternalCommandFailed(code),
-            Self::Internal(value) => Self::Internal(value),
-            Self::Initialization(value) => Self::Initialization(value),
+            Self::Internal(value, location) => Self::Internal(value, location),
+            Self::Initialization(value, location) => Self::Initialization(value, location),
             Self::CommandRejection => Self::CommandRejection,
         }
     }
@@ -213,8 +298,8 @@ impl CliError {
                 Self::ExternalCommandNotFound(command_name)
             }
             Self::ExternalCommandFailed(code) => Self::ExternalCommandFailed(code),
-            Self::Internal(value) => Self::Internal(value),
-            Self::Initialization(value) => Self::Initialization(value),
+            Self::Internal(value, location) => Self::Internal(value, location),
+            Self::Initialization(value, location) => Self::Initialization(value, location),
             Self::CommandRejection => Self::CommandRejection,
         }
     }
@@ -233,7 +318,7 @@ impl CliError {
             | Self::CommandRejection => {
                 anyhow::anyhow!("{self}")
             }
-            Self::Internal(error) | Self::Initialization(error) => error,
+            Self::Internal(error, _) | Self::Initialization(error, _) => error,
         }
     }
 }
@@ -252,7 +337,7 @@ impl Display for CliError {
             Self::ExternalCommandFailed(code) => {
                 write!(f, "External command exited with status {code}")
             }
-            Self::Internal(value) | Self::Initialization(value) => value.fmt(f),
+            Self::Internal(value, _) | Self::Initialization(value, _) => value.fmt(f),
             Self::CommandRejection => {
                 // The output is printed elsewhere such as by [`OutputChannel::print_cli_output`].
                 f.write_str("Command rejected")

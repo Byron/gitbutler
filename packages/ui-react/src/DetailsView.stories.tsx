@@ -1,4 +1,4 @@
-import preview from "#storybook/preview";
+import { stories } from "../docs/stories.ts";
 import { Toggle, ToggleGroup } from "@base-ui/react";
 import type { FC, ReactNode } from "react";
 import { Breadcrumbs, type Crumb } from "./Breadcrumbs.tsx";
@@ -16,7 +16,7 @@ import { Tab, Tabs } from "./Tabs.tsx";
 import { ToggleGroupStyles, ToggleStyles } from "./ToggleGroup.tsx";
 import { ViewHeader, ViewHeaderButton, ViewHeaderDivider } from "./ViewHeader.tsx";
 
-const meta = preview.meta({
+const meta = stories({
 	title: "Preview/Details view",
 	id: "preview-details-view",
 	parameters: {
@@ -53,7 +53,7 @@ const lines: Array<Line> = [
 
 const lineBackground = { " ": undefined, "+": "var(--bg-safe)", "-": "var(--bg-danger)" };
 
-/** Stands in for the host's diff renderer (Pierre in Lite and but.dev). */
+/** Stands in for the host's diff renderer (Pierre in but.dev). */
 const SampleDiff: FC = () => (
 	<pre
 		className="text-12"

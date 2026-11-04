@@ -45,6 +45,7 @@
 	/* A pull request's state colours its glyph and a merged title. The opposite scheme makes those
 	   light-dark() colours resolve to their inverted values, as Badge and MetaCount do. */
 	.branchGlyph,
+	.conflicted,
 	.title {
 		color-scheme: dark;
 
@@ -68,7 +69,7 @@
 /* The indent: one guide per level, and the chevron of a row that folds in its own step. */
 .steps {
 	display: flex;
-	column-gap: var(--gap-icon-text);
+	column-gap: 4px;
 	flex-shrink: 0;
 	align-self: stretch;
 }
@@ -79,7 +80,7 @@
 	flex-shrink: 0;
 	align-items: center;
 	justify-content: center;
-	width: 14px;
+	width: 12px;
 }
 
 /* Runs the row's full height and on through the pixel between rows, so the guides of the rows
@@ -223,6 +224,12 @@
 	align-items: center;
 }
 
+/* A TargetItem keeps Update beside its count rather than in its place: a step more room tells the
+   button from the count. */
+.target .meta {
+	column-gap: var(--space-lg);
+}
+
 /* compact: the name takes the line and the state sits at the end, where it stays: the menu follows
    it under the pointer, on keyboard focus and on a selected row, and the name gives way. The
    actions, a next step for what the state counts (Update for ↓, Push for ↑), take the state's
@@ -283,13 +290,8 @@
 	}
 }
 
-/* rich, one line: the state and the actions follow the name, which gives way first. */
-.rich .label {
-	flex: 0 1 auto;
-}
-
-/* In either layout the menu takes the row's end only while it shows, so the name keeps the width
-   the rest of the time. */
+/* The menu takes the row's end only while it shows, so the name keeps the width the rest of the
+   time. */
 .menu {
 	display: none;
 	flex-shrink: 0;
@@ -307,96 +309,6 @@
 	}
 }
 
-/* 6px after the last fact, and 4px more, so the buttons don't read as one more count. */
-.actions {
-	display: flex;
-	column-gap: var(--space-sm);
-	flex-shrink: 0;
-	align-items: center;
-	margin-inline-start: var(--space-xs);
-}
-
-/* rich, a pull request: its title over its branch, state and actions. */
-.twoLine {
-	align-items: stretch;
-
-	/* The chevron centres on the title's first line. */
-	.toggle {
-		align-self: flex-start;
-		height: var(--size-control);
-	}
-}
-
-.content {
-	display: flex;
-	row-gap: 6px;
-	flex: 1;
-	flex-direction: column;
-	min-width: 0;
-	/* With the title's 21px line, its first line centres where a one-line row's would. */
-	padding-block: 3.5px 7.5px;
-}
-
-/* Inline, so a wrapped title carries on under the glyph; two lines, then an ellipsis. Its lines
-   sit 4px apart. */
-.line1 {
-	display: -webkit-box;
-	overflow: hidden;
-	line-height: 21px;
-	overflow-wrap: anywhere;
-	-webkit-box-orient: vertical;
-	-webkit-line-clamp: 2;
-}
-
-.lead {
-	--icon-size: 14px;
-
-	display: inline-flex;
-	column-gap: var(--gap-icon-text);
-	align-items: center;
-	height: 21px;
-	margin-inline-end: var(--gap-icon-text);
-	vertical-align: top;
-}
-
-.leadSpinner {
-	display: flex;
-}
-
-.line2 {
-	display: flex;
-	column-gap: var(--space-md);
-	align-items: center;
-	min-height: var(--size-control-sm);
-
-	& > * {
-		flex-shrink: 0;
-	}
-
-	/* The branch's name gives way before the counts and the buttons. */
-	& > .branch {
-		flex-shrink: 1;
-	}
-}
-
-/* The menu sits in the title's corner while it shows; the title steps back from it then. */
-.corner {
-	position: absolute;
-	top: calc((var(--size-control) - var(--size-control-sm)) / 2);
-	right: var(--space-sm);
-}
-
-.twoLine:is(
-		:hover,
-		:focus-visible,
-		:has(:focus-visible),
-		[data-selected],
-		:has([aria-haspopup][aria-expanded="true"])
-	):has(.corner)
-	.line1 {
-	padding-inline-end: calc(22px + var(--space-sm));
-}
-
 /* A pull request's state in its glyph. */
 .branchGlyph.open {
 	color: var(--text-safe);
@@ -408,6 +320,11 @@
 
 .branchGlyph.merged {
 	color: var(--text-purple);
+}
+
+/* A conflicted commit's warning, in its glyph's place. */
+.conflicted {
+	color: var(--text-danger);
 }
 
 .badge {
@@ -492,4 +409,55 @@
 .line {
 	flex-grow: 1;
 	border-top: 1px dashed var(--border-3);
+}
+
+/* A NoticeItem says what its rows would have, in the quiet grey of a hint. */
+.notice {
+	color: var(--text-2);
+}
+
+/* Its way out reads as a link, as TextLink does, though it stays in the app. */
+.noticeAction {
+	padding: 0;
+	border: none;
+	background: none;
+	color: inherit;
+	font: inherit;
+	text-decoration: underline;
+	text-decoration-color: color-mix(in srgb, currentcolor 40%, transparent);
+	text-underline-position: from-font;
+	cursor: pointer;
+
+	&:hover {
+		color: var(--text-1);
+		text-decoration-color: currentcolor;
+	}
+
+	&:focus-visible {
+		border-radius: var(--radius-control);
+		outline: var(--focus-ring);
+	}
+}
+
+/* A group's name and its chevron, quieter than the pages they head. A button when it folds, reset
+   as MoreItem's is, keeping the row's tint. */
+.groupLabel {
+	width: 100%;
+	border: none;
+	background: none;
+	color: var(--text-3);
+	font: inherit;
+	text-align: start;
+
+	&:is(button):hover {
+		background-color: var(--bg-hover);
+	}
+
+	&:not(button) {
+		cursor: default;
+
+		&:hover {
+			background-color: transparent;
+		}
+	}
 }

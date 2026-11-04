@@ -3,8 +3,8 @@
 //! that for the selected one, then the files it changed; and a way back to before any of them.
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, MouseButton, MouseDownEvent, Pixels, Point, Window, div,
-    prelude::*,
+    AnyElement, App, Bounds, ClickEvent, Context, MouseButton, MouseDownEvent, Pixels, Point,
+    Window, actions, div, prelude::*,
 };
 
 use super::Detail;
@@ -12,9 +12,12 @@ use super::panes::{
     list_empty, list_filtered_out, list_heading, meta_item, meta_row, page_title, reveal_side_row,
     side_list, step_from, title_text,
 };
+use crate::app::CopySnapshotId;
+
+actions!(history, [RestoreOperation]);
 use crate::backend::history::{Change, Operation, Recorded};
 use crate::backend::{self, CommitId, DiffSource, SnapshotId};
-use crate::overlays::MenuItem;
+use crate::overlays::{MenuItem, has_keys};
 use crate::state::{Overlay, ProjectId, Selection};
 use crate::theme::Theme;
 use crate::ui::illustration::Illustration;
@@ -23,7 +26,8 @@ use but_oplog::legacy::OperationKind;
 
 use crate::ui::{
     Icon, Tooltip, commit_title, day_label, dp, error_summary, faint, h_flex, icon, icon_button,
-    list_row, loading_state, local_clock, local_day, plural, side_row, small_icon, v_flex,
+    list_row, loading_state, local_clock, local_day, plural, shown_row, side_row, small_icon,
+    v_flex,
 };
 
 /// How many of an operation's changes its header lists; the rest it counts.
@@ -112,7 +116,7 @@ fn describe(kind: Option<OperationKind>) -> (Icon, Group) {
         | K::GenericBranchUpdate => (Icon::Branch, Group::Branches),
         K::SetBaseBranch => (Icon::Branch, Group::Updates),
         K::MergeUpstream | K::UpdateWorkspaceBase => (Icon::ArrowLineDown, Group::Updates),
-        // A branch landed on the target, as a land onto a target without a remote records.
+        // A branch merged into the target, as merging into a target without a remote records.
         K::MergeBranch => (Icon::BranchMerge, Group::Updates),
         K::SyncWorkspace => (Icon::Refresh, Group::Updates),
         // A restore picked here wears the history's clock, apart from ⌘Z and ⇧⌘Z's steps.
@@ -379,8 +383,8 @@ impl Detail {
 
     /// The operations of the History page selected.
     fn page_history(&self, cx: &App) -> Option<&History> {
-        match &self.store.read(cx).selection {
-            Some(Selection::History(project)) => self.history_for(project),
+        match self.selection(cx) {
+            Some(Selection::History(project)) => self.history_for(&project),
             _ => None,
         }
     }
@@ -470,7 +474,7 @@ impl Detail {
             && history.operations.len() < READ_FOR_FILTER
             && self.history_hidden.len() < Group::ALL.len()
             && self.shown_operations(history, cx).is_empty();
-        match (reads, self.store.read(cx).selection.clone()) {
+        match (reads, self.selection(cx)) {
             (true, Some(Selection::History(project))) => {
                 self.load_history(&project, true, cx);
                 true
@@ -544,7 +548,7 @@ impl Detail {
     /// Return on the list: restore to before the selected operation, after asking, as its
     /// menu's Restore does.
     fn restore_selected_operation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Selection::History(project)) = self.store.read(cx).selection.clone() else {
+        let Some(Selection::History(project)) = self.selection(cx) else {
             return;
         };
         if let Some(id) = self.selected_operation(&project).map(|op| op.id) {
@@ -589,45 +593,56 @@ impl Detail {
     }
 
     /// Select operation `id` and offer what its page's header does for it, and its ID.
-    fn operation_menu(
-        &mut self,
-        project: &ProjectId,
-        id: SnapshotId,
-        at: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
+    fn operation_menu(&mut self, id: SnapshotId, at: Point<Pixels>, cx: &mut Context<Self>) {
         self.select_operation(id, cx);
-        let project = project.clone();
-        self.open_menu(
-            at,
-            move |_, cx| Self::operation_menu_items(&project, id, cx),
-            cx,
-        );
+        self.open_menu(at, move |_, cx| Self::operation_menu_items(cx), cx);
     }
 
-    /// What Operations history offers for the operation before snapshot `id`, as
-    /// right-clicking it does.
-    pub(crate) fn operation_menu_items(
+    /// Register Restore and copying the snapshot ID while an operation is selected, from the
+    /// list or its header.
+    pub(super) fn history_actions(
+        &self,
+        el: gpui::Stateful<gpui::Div>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let selected = match self.selection(cx) {
+            Some(Selection::History(project)) => self.selected_operation(&project).map(|op| op.id),
+            _ => None,
+        };
+        el.when_some(selected, |el, id| {
+            let el = el.on_action(cx.listener(|this, _: &RestoreOperation, window, cx| {
+                this.restore_selected_operation(window, cx)
+            }));
+            Self::copy_on::<CopySnapshotId>(el, id.0.to_string(), cx)
+        })
+    }
+
+    /// What right-clicking the selected operation offers, and where its row is while it shows.
+    pub(super) fn operation_page_menu(
+        &self,
         project: &ProjectId,
-        id: SnapshotId,
         cx: &App,
-    ) -> Vec<MenuItem> {
-        let project = project.clone();
+    ) -> Option<(Vec<MenuItem>, Option<Bounds<Pixels>>)> {
+        let history = self.history_for(project)?;
+        let selected = self.selected_operation(project)?.id;
+        let shown = self.shown_operations(history, cx);
+        let is_selected = |ix: usize| {
+            history
+                .operations
+                .get(ix)
+                .is_some_and(|op| op.id == selected)
+        };
+        let row = (rows(history, &shown).iter())
+            .position(|row| matches!(row, Row::Operation(ix) if is_selected(*ix)));
+        let row = row.and_then(|row| shown_row(&self.history_scroll, row));
+        Some((Self::operation_menu_items(cx), row))
+    }
+
+    /// What Operations history offers for the selected operation, as right-clicking it does.
+    pub(crate) fn operation_menu_items(cx: &App) -> Vec<MenuItem> {
         vec![
-            MenuItem::keyed(
-                "Restore to before this…",
-                &crate::app::Confirm,
-                cx,
-                move |app, window, cx| {
-                    (app.detail).update(cx, |detail, cx| {
-                        detail.restore_operation(&project, id, window, cx)
-                    })
-                },
-            ),
-            MenuItem::new("Copy snapshot ID", move |app, _, cx| {
-                app.copy_text(id.0.to_string(), cx)
-            })
-            .separated(),
+            MenuItem::command(&RestoreOperation, cx),
+            MenuItem::command(&CopySnapshotId, cx).separated(),
         ]
     }
 
@@ -659,6 +674,9 @@ impl Detail {
         );
         let meta = meta_row(theme)
             .child(meta_item(Icon::Clock, theme).child(when))
+            .when_some(operation.agent.clone(), |el, agent| {
+                el.child(meta_item(Icon::Ai, theme).child(agent))
+            })
             .when_some(operation.detail.clone().filter(|_| undone), |el, what| {
                 el.child(meta_item(Icon::Undo, theme).child(what))
             })
@@ -685,10 +703,12 @@ impl Detail {
                     el.child(faint(format!("and {more} more"), theme))
                 }))
             });
-        let (id, menu_project) = (operation.id, project.clone());
+        let id = operation.id;
+        // Its commands are the detail's, as a right-click on its row gives the list the keys.
         let menu = icon_button("operation-menu", Icon::Kebab).on_click(cx.listener(
-            move |this, event: &gpui::ClickEvent, _, cx| {
-                this.operation_menu(&menu_project, id, event.position(), cx)
+            move |this, event: &gpui::ClickEvent, window, cx| {
+                window.focus(&this.focus, cx);
+                this.operation_menu(id, event.position(), cx)
             },
         ));
         Some(
@@ -805,7 +825,7 @@ impl Detail {
                     .tooltip(Tooltip::text("Show this commit"))
                     .on_click(move |_, _, cx| {
                         let selection = Selection::Commit(project.clone(), id);
-                        store.update(cx, |store, cx| store.select(Some(selection), cx))
+                        store.update(cx, |store, cx| store.select_by_hand(selection, cx));
                     })
             })
             .into_any_element()
@@ -916,14 +936,15 @@ impl Detail {
                         Row::Operation(op) => {
                             let operation = history.operations.get(*op)?;
                             let selected = history.selected == Some(operation.id);
-                            let on = selected && this.side_focus.is_focused(window);
+                            let on = selected && has_keys(&this.side_focus, window, cx);
                             let quiet = |color: gpui::Hsla| match on {
                                 true => theme.muted_on_solid(),
                                 false => color,
                             };
                             let id = operation.id;
                             // What it did as a glyph, named on hover, then what it was done
-                            // to, or its name, faint, when nothing says; then when.
+                            // to, or its name, faint, when nothing says; then whether an
+                            // agent did it, named on hover, and when.
                             let (text, said) = match summary(operation) {
                                 Some(text) => (text, true),
                                 None => (operation.title.clone(), false),
@@ -945,6 +966,17 @@ impl Detail {
                                         .when(!said, |el| el.text_color(quiet(theme.text_3)))
                                         .child(text),
                                 )
+                                .when_some(operation.agent.clone(), |el, agent| {
+                                    el.child(
+                                        div()
+                                            .id(("operation-agent", ix))
+                                            .flex_none()
+                                            .tooltip(Tooltip::text(format!(
+                                                "Done by an AI agent: {agent}"
+                                            )))
+                                            .child(icon(Icon::Ai).text_color(quiet(theme.text_3))),
+                                    )
+                                })
                                 .child(
                                     faint(local_clock(operation.time), theme)
                                         .flex_none()
@@ -955,12 +987,12 @@ impl Detail {
                                         this.select_operation(id, cx)
                                     }),
                                 )
-                                .on_mouse_down(MouseButton::Right, {
-                                    let project = project.clone();
+                                .on_mouse_down(
+                                    MouseButton::Right,
                                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                        this.operation_menu(&project, id, event.position, cx)
-                                    })
-                                })
+                                        this.operation_menu(id, event.position, cx)
+                                    }),
+                                )
                         }
                         Row::More => {
                             let project = project.clone();

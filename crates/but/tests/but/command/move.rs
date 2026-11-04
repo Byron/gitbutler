@@ -3988,6 +3988,82 @@ Hint: run `but help` for all commands
 }
 
 #[test]
+fn unstack_branch_with_worktree_branch_at_common_base() {
+    let env =
+        Sandbox::init_scenario_with_target_and_default_settings("one-stack-two-dependent-branches");
+    env.setup_metadata(&["A", "B"]);
+    env.but("worktree new wt").assert().success();
+
+    env.but("status")
+        .assert()
+        .success()
+        .stdout_eq(snapbox::str![[r#"
+╭┄ @ [uncommitted] (no changes)
+┊
+┊╭┄ g0 [B]
+┊●   wwm add B
+┊│
+┊├┄ h0 [A]
+┊●   tpm add A
+├╯
+┊
+┊╭┄ wt:@ [uncommitted] {wt} (no changes)
+┊├┄ wt [wt] (no commits)
+├╯
+┊
+┴ 0dc3733 (common base, main, origin/main) 2000-01-02 add M
+
+Hint: run `but help` for all commands
+
+"#]]);
+
+    env.but("move B --unstack")
+        .assert()
+        .success()
+        .stderr_eq(snapbox::str![])
+        .stdout_eq(snapbox::str![[r#"
+Unstacked branch 'B'
+
+"#]]);
+
+    env.but("status")
+        .assert()
+        .success()
+        .stdout_eq(snapbox::str![[r#"
+╭┄ @ [uncommitted] (no changes)
+┊
+┊╭┄ g0 [A]
+┊●   tpm add A
+├╯
+┊
+┊╭┄ h0 [B]
+┊●   wwm add B
+├╯
+┊
+┊╭┄ wt:@ [uncommitted] {wt} (no changes)
+┊├┄ wt [wt] (no commits)
+├╯
+┊
+┴ 0dc3733 (common base, main, origin/main) 2000-01-02 add M
+
+Hint: run `but help` for all commands
+
+"#]]);
+    snapbox::assert_data_eq!(
+        env.git_log(),
+        snapbox::str![[r#"
+*   e2a1cc0 (HEAD -> gitbutler/workspace) GitButler Workspace Commit
+|/  
+| * 05d3df1 (B) add B
+* | 9477ae7 (A) add A
+|/  
+* 0dc3733 (origin/main, origin/HEAD, wt, main, gitbutler/target) add M
+
+"#]]
+    );
+}
+
+#[test]
 fn unstack_file() {
     let env = Sandbox::init_scenario_with_target_and_default_settings("one-stack-two-commits");
     env.setup_metadata(&["A"]);
@@ -4249,6 +4325,8 @@ Hint: run `but help` for all commands
         .failure()
         .stderr_eq(snapbox::str![[r#"
 Error: A branch named 'B' exists but is not applied
+
+Hint: Pick another name, or run `but apply B` if you meant that branch
 
 "#]]);
 }
@@ -4851,6 +4929,47 @@ Moved zqt to the tip of branch 'feature'
 "#]]
         .raw()
     );
+}
+
+/// A commit moved onto the branch a linked worktree has checked out would overwrite that
+/// worktree's uncommitted change to the same file. The move is refused as bad input naming
+/// the worktree, and the worktree and the history stay as they were.
+#[test]
+fn move_onto_a_worktree_branch_refuses_to_overwrite_its_uncommitted_changes() {
+    let env = Sandbox::open_with_default_settings("single-branch-mode");
+    env.but("status").assert().success();
+    let wt = env.app_data_dir().join("worktrees").join("wt-dirty");
+    but_testsupport::invoke_bash_at_dir(
+        &format!(
+            r#"
+        git checkout -q -b feature
+        echo feature >init && git commit -q -am "change init"
+        git worktree add -q -b wt-dirty "{wt}" main
+        echo dirty >"{wt}/init"
+        "#,
+            wt = wt.display()
+        ),
+        env.projects_root(),
+    );
+    let log_before = env.git_log();
+
+    env.but(format!("move {} -b wt-dirty", env.invoke_git("rev-parse feature")))
+        .assert()
+        .failure()
+        .stdout_eq(snapbox::str![])
+        .stderr_eq(snapbox::str![[r#"
+Error: Could not update worktree 'wt-dirty' at [..]wt-dirty: Uncommitted files would be overwritten by checkout: "init"
+
+Hint: Run `but commit` or `but discard` in that worktree, then retry
+
+"#]]);
+
+    assert_eq!(
+        std::fs::read_to_string(wt.join("init")).unwrap(),
+        "dirty\n",
+        "the worktree keeps its uncommitted change"
+    );
+    assert_eq!(env.git_log(), log_before, "a refused move rewrites nothing");
 }
 
 /// `--below` a worktree heading moves the commit to the tip of the branch that worktree has

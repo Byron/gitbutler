@@ -24,8 +24,13 @@ pub enum Keymap {
     /// GitButler's own, after macOS's and vim's.
     #[default]
     GitButler,
-    /// Like the `but` TUI's. So far its keys for moving around, copying, undoing, renaming and
-    /// adding an empty commit, and Return to fold and unfold.
+    /// Like the `but` TUI's. So far its keys for moving around, copying, undoing, renaming,
+    /// moving, squashing and cherry-picking commits and adding an empty commit, Return to fold
+    /// and unfold, f to
+    /// show and hide the files, ⌘B and ⌥⌘B the navigator and the details, / to filter or find,
+    /// ⌘K for the command palette, ⌘P to go to anything and ⌘J to a terminal, ⌘T to open a
+    /// terminal, ⌘R and ⇧⌘R to fetch and pull, and ⌘D, ⇧⌘D, ⌘] and ⌘[ to split and go between
+    /// tiles, or Ghostty's keys for them on Linux.
     Tui,
 }
 
@@ -165,6 +170,42 @@ mod tests {
             .collect()
     }
 
+    fn in_context(entry: &Entry, context: &str) -> bool {
+        entry.context.as_deref() == Some(context)
+    }
+
+    /// Whether every key on the drawer's bar does there what it does in the navigator.
+    fn drawer_bar_keys_are_the_navigators(keymap: Keymap) -> bool {
+        let entries = bound(keymap, "macos");
+        let mut bar = (entries.iter())
+            .filter(|entry| in_context(entry, "DrawerBar && !TextInput"))
+            .peekable();
+        bar.peek().is_some()
+            && bar.all(|entry| {
+                entries.iter().any(|other| {
+                    in_context(other, "Navigator && !TextInput")
+                        && other.keys == entry.keys
+                        && other.action == entry.action
+                })
+            })
+    }
+
+    #[test]
+    fn the_drawer_bars_keys_are_the_navigators_in_the_gitbutler_keymap() {
+        assert!(
+            drawer_bar_keys_are_the_navigators(Keymap::GitButler),
+            "a key means the same on the bar as on a row"
+        );
+    }
+
+    #[test]
+    fn the_drawer_bars_keys_are_the_navigators_in_the_tui_keymap() {
+        assert!(
+            drawer_bar_keys_are_the_navigators(Keymap::Tui),
+            "a key means the same on the bar as on a row"
+        );
+    }
+
     #[test]
     fn keymaps_bind_on_every_platform() {
         let actions: HashSet<&str> = gpui::generate_list_of_all_registered_actions()
@@ -186,9 +227,12 @@ mod tests {
                     for keystroke in entry.keys.split_whitespace() {
                         Keystroke::parse(keystroke).expect(&at);
                     }
+                    // A key bound to several actions in one place runs the first of them that's
+                    // handled, as r rewords a commit and renames a branch; bound to the same one
+                    // twice, the first is never shown.
                     assert!(
-                        keys.insert((entry.context, entry.keys)),
-                        "{at}: bound twice, so the first does nothing"
+                        keys.insert((entry.context, entry.keys, name.to_owned())),
+                        "{at}: bound twice to {name:?}"
                     );
                 }
             }
@@ -259,8 +303,11 @@ mod tests {
                         let kept = ["super", "win", "cmd"]
                             .iter()
                             .any(|m| modifiers.contains(*m));
+                        // Linux desktops take Super with a letter, but Ctrl+Super chords are
+                        // apps' too there, as Ghostty's Ctrl+Super+] goes to the next split.
+                        let shared = os == "linux" && modifiers.contains("ctrl");
                         assert!(
-                            os == "macos" || !kept,
+                            os == "macos" || shared || !kept,
                             "{at} needs a modifier Windows and Linux keep for the system"
                         );
                     }
@@ -279,8 +326,9 @@ mod tests {
                     ("app::CommandPalette", "secondary-k"),
                     ("app::ToggleNavigator", "secondary-b"),
                     ("palette::GoTo", "secondary-p"),
-                    ("palette::ShowActions", "m"),
-                    ("navigator::RenameSelection", "r"),
+                    ("edits::Reword", "r"),
+                    ("edits::RenameBranch", "r"),
+                    ("edits::RenameTerminal", "r"),
                     ("navigator::CopySelection", "secondary-c"),
                     ("palette::CopyMore", "secondary-shift-c"),
                     ("diff::NextHunk", "down"),
@@ -289,7 +337,13 @@ mod tests {
                 // The TUI's letters, which come after the arrows.
                 Keymap::Tui => &[
                     ("app::CommandPalette", ":"),
-                    ("palette::GoTo", "/"),
+                    // ⌘ chords, as a terminal takes the letters.
+                    ("palette::GoTo", "secondary-p"),
+                    ("palette::GoToTerminal", "secondary-j"),
+                    ("terminal::NewTerminal", "secondary-t"),
+                    ("app::ToggleNavigator", "secondary-b"),
+                    ("app::ToggleDetail", "secondary-alt-b"),
+                    ("navigator::CopySelection", "y"),
                     ("navigator::SelectNext", "j"),
                     ("navigator::SelectPrevious", "k"),
                     ("diff::NextHunk", "j"),

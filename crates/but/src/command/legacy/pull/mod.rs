@@ -88,7 +88,7 @@ pub async fn handle(
         handle_check(ctx, out, update).await?;
         Ok(None)
     } else {
-        Ok(handle_pull(ctx, out, update).await?)
+        handle_pull(ctx, out, update).await
     }
 }
 
@@ -117,6 +117,33 @@ fn is_behind(
 fn target_has_upstream(ctx: &Context) -> anyhow::Result<bool> {
     let repo = ctx.repo.get()?;
     Ok(ctx.project_meta()?.remote_target_ref(&repo)?.is_some())
+}
+
+/// A hint for a target that tracks nothing although the remote has its branch, like a `main`
+/// pushed without `-u`. A pull doesn't fetch for such a target, and choosing it as the target
+/// again makes it track that branch.
+fn untracked_target_hint(ctx: &Context, has_upstream: bool) -> anyhow::Result<Option<String>> {
+    if has_upstream {
+        return Ok(None);
+    }
+    let Some(target_ref) = ctx.project_meta()?.target_ref else {
+        return Ok(None);
+    };
+    let repo = ctx.repo.get()?;
+    let Some(mut target) = repo.try_find_reference(target_ref.as_local_full_name_ref())? else {
+        return Ok(None);
+    };
+    let target_head = target.peel_to_id()?.detach();
+    let Some((remote, merge, _)) =
+        but_workspace::init::upstream_to_track(&repo, &target_ref, target_head)?
+    else {
+        return Ok(None);
+    };
+    let name = target_ref.as_local_full_name_ref().shorten();
+    let upstream = format!("{remote}/{}", merge.shorten());
+    Ok(Some(format!(
+        "Hint: {name} tracks no remote branch, so `but pull` doesn't fetch {upstream}; run `but config target {name}` to make it track {upstream}"
+    )))
 }
 
 /// Read the target branch, after fetching from the remotes if it has an upstream. Without one,
@@ -178,7 +205,7 @@ async fn handle_check(
     ctx: &Context,
     out: &mut OutputChannel,
     update: &[PullUpdate],
-) -> anyhow::Result<()> {
+) -> CliResult<()> {
     let t = theme::get();
     let mut progress = out.progress_channel();
 
@@ -289,6 +316,9 @@ async fn handle_check(
                 )?;
             }
         }
+        if let Some(hint) = untracked_target_hint(ctx, has_upstream)? {
+            writeln!(out, "{}", t.hint.paint(hint))?;
+        }
 
         if up_to_date {
             writeln!(out, "\n{}", t.success.paint("Up to date"))?;
@@ -328,7 +358,7 @@ async fn handle_pull(
     ctx: &mut Context,
     out: &mut OutputChannel,
     update: &[PullUpdate],
-) -> anyhow::Result<Option<WorkspaceState>> {
+) -> CliResult<Option<WorkspaceState>> {
     let t = theme::get();
     let mut pull_result = PullResult {
         status: String::new(),
@@ -428,6 +458,9 @@ async fn handle_pull(
                     "No new upstream commits found"
                 })
             )?;
+        }
+        if let Some(hint) = untracked_target_hint(ctx, has_upstream)? {
+            writeln!(out, "{}", t.hint.paint(hint))?;
         }
 
         if !incoming.is_empty() {
@@ -599,16 +632,14 @@ async fn handle_pull(
                         tracing::warn!(?err, "could not tell whether a branch is checked out");
                         false
                     });
-                // The lookup above doesn't walk linked worktrees' lanes, so their conflicted
-                // branches get the commit-ID route instead of the steps below.
+                // Resolution mode can't check out a linked worktree's commit, so those
+                // branches get the `conflicts` and `apply` route instead of the steps below.
                 let worktree_conflicts: Vec<&String> = conflicted_rebases
                     .iter()
                     .filter(|branch| {
-                        !conflicted_commits.contains_key(*branch)
-                            && crate::command::legacy::resolve::is_worktree_branch(
-                                &current_head_info,
-                                branch,
-                            )
+                        conflicted_commits.get(*branch).is_some_and(|commits| {
+                            commits.iter().any(|c| c.worktree_lane.is_some())
+                        })
                     })
                     .collect();
                 let workspace_conflicts = conflicted_rebases.is_empty()
@@ -717,10 +748,10 @@ async fn handle_pull(
                         writeln!(out)?;
                         writeln!(out, "{}", t.important.paint("To resolve conflicts:"))?;
                         for branch in &worktree_conflicts {
+                            let arg = shell_words::quote(branch);
                             writeln!(
                                 out,
-                                "  `{branch}` is checked out in a worktree. {}",
-                                crate::command::legacy::resolve::WORKTREE_CONFLICT_ROUTE
+                                "  `{branch}` is in a worktree. Run `but resolve conflicts {arg}`, then `but resolve apply <path>:<N> --commit {arg}`"
                             )?;
                         }
                         if workspace_conflicts {
@@ -789,7 +820,7 @@ async fn handle_pull(
                 if let Some(out) = out.for_json() {
                     out.write_value(&pull_result)?;
                 }
-                return Err(e);
+                return Err(e.into());
             }
         }
     }

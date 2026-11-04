@@ -1,4 +1,4 @@
-import preview from "#storybook/preview";
+import { stories } from "../docs/stories.ts";
 import { useState } from "react";
 import { DiffFile } from "./DiffFile.tsx";
 import { DiffFileHeader, type DiffFileReviewState } from "./DiffFileHeader.tsx";
@@ -23,7 +23,7 @@ const sampleLines: Array<Line> = [
 const lineBackground = { " ": undefined, "+": "var(--bg-safe)", "-": "var(--bg-danger)" };
 
 /**
- * Stands in for the host's diff renderer (Pierre in Lite and but.dev), which
+ * Stands in for the host's diff renderer (Pierre in but.dev), which
  * the library doesn't depend on.
  */
 const SampleDiff = ({ lines = sampleLines }: { lines?: Array<Line> }) => (
@@ -43,7 +43,7 @@ const SampleDiff = ({ lines = sampleLines }: { lines?: Array<Line> }) => (
 	</pre>
 );
 
-const meta = preview.meta({
+const meta = stories({
 	title: "Content & status/DiffFile",
 	id: "components-difffile",
 	component: DiffFile,

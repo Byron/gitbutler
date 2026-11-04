@@ -20,8 +20,8 @@ import {
 } from "react";
 
 /**
- * The container every overlay in Lite is built from: modals, dropdowns and the toolbox all wear
- * this one surface. Use it directly only for something that floats without opening — a toolbox, a
+ * The container every overlay in the library is built from: modals, dropdowns and the toolbox all
+ * wear this one surface. Use it directly only for something that floats without opening — a toolbox, a
  * hover card. Anything that opens over the app wants {@link Modal} or {@link Dropdown}, which wrap
  * this in the Base UI primitive carrying the focus and dismissal behaviour.
  *
@@ -198,7 +198,7 @@ export const ModalHeader: FC<
 	} & ComponentProps<"div">
 > = ({ title, description, onBack, className, ...props }) => {
 	const titleElement = (
-		<Dialog.Title className={classes("text-14", "text-semibold", styles.modalTitle)}>
+		<Dialog.Title className={classes("text-15", "text-semibold", styles.modalTitle)}>
 			{title}
 		</Dialog.Title>
 	);
@@ -211,10 +211,10 @@ export const ModalHeader: FC<
 				<div className={styles.modalTitleRow}>
 					<Button
 						variant="ghost"
-						size="small"
 						iconOnly
 						aria-label="Back"
 						onClick={onBack}
+						className={styles.modalBack}
 						// oxlint-disable-next-line jsx_a11y/no-autofocus -- The pick that opened this step unmounted with focus on it.
 						autoFocus
 					>
@@ -464,8 +464,7 @@ export const PopupSearch: FC<{ onClear?: () => void } & useRender.ComponentProps
  * filtered on — the deferred one, where the caller defers — so the block and the rows it stands in
  * for agree.
  *
- * Both lines are one short line, no full stop, like every other line of their length in Lite:
- * "No hotkeys found", "Nothing to restore yet".
+ * Both lines are one short line, no full stop: "No hotkeys found", "Nothing to restore yet".
  *
  * For a popup as wide as a picker. A dropdown no wider than its trigger — the commit target
  * combobox — keeps a plain line.

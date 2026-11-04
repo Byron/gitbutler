@@ -55,6 +55,9 @@ pub struct Platform {
     /// If `BRANCH` is a worktree or a branch checked out in one, the commit is placed
     /// on the tip of that worktree's branch.
     ///
+    /// Run from a linked worktree with a detached HEAD, a new `BRANCH` starts at that HEAD
+    /// and is checked out there before the commit is placed on it.
+    ///
     /// Attempting to place a commit on a branch that exists but is not applied is an error.
     #[clap(short, long, value_name = "BRANCH")]
     pub branch: Option<Option<CliIdArg>>,
@@ -102,7 +105,7 @@ pub struct Platform {
     #[clap(short, long, group = "changes_to_commit", help_heading = "Interactive")]
     pub interactive: bool,
 
-    /// The files or hunks to commit, by CLI ID from `but diff`.
+    /// The files or hunks to commit, by CLI ID from `but diff` or by path.
     ///
     /// If omitted, everything uncommitted in the checkout `but` runs in is committed.
     #[clap(group = "changes_to_commit")]

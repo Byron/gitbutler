@@ -1594,6 +1594,8 @@ Hint: run `but help` for all commands
         .stderr_eq(snapbox::str![[r#"
 Error: Cannot uncommit commits that would result in merge conflicts
 
+Hint: Later commits depend on these changes. Run `but uncommit qon xnw` first, then retry
+
 "#]]);
 
     env.but("squash lrm:q -t @")
@@ -1601,6 +1603,8 @@ Error: Cannot uncommit commits that would result in merge conflicts
         .failure()
         .stderr_eq(snapbox::str![[r#"
 Error: Cannot uncommit hunks that would result in merge conflicts
+
+Hint: Later commits depend on these changes. Run `but uncommit qon xnw` first, then retry
 
 "#]]);
 }
@@ -3458,6 +3462,41 @@ Squashed branch 'wt-feature' into nsn
     );
 }
 
+/// `--target` takes a linked worktree's branch the way it takes that branch's tip commit.
+#[test]
+fn squash_into_a_worktree_branch_by_name() {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("one-stack");
+    env.setup_metadata(&["A"]);
+    env.but("status").assert().success();
+    let wt_dir = super::util::add_worktree_with_commit(&env, "wt-feature", "A");
+    env.invoke_bash(format!(
+        r#"cd "{}" && echo more >more.txt && git add more.txt && git commit -q -m 'more W'"#,
+        wt_dir.display()
+    ));
+    let bottom = env.invoke_git("rev-parse wt-feature^");
+
+    env.but(format!("squash {bottom} -t wt-feature -m 'add W'"))
+        .current_dir(&wt_dir)
+        .assert()
+        .success()
+        .stderr_eq(str![])
+        .stdout_eq(str![[r#"
+Squashed [..] into [..]
+
+"#]]);
+
+    assert_eq!(
+        env.invoke_git("rev-list --count A..wt-feature"),
+        "1",
+        "the bottom commit folded into the tip of the branch"
+    );
+    assert_eq!(
+        env.invoke_git("show --format=%s --name-only wt-feature"),
+        "add W\n\nmore.txt\nwt-file.txt",
+        "the tip holds the files of both commits under the new message"
+    );
+}
+
 /// A worktree's commit uncommits into that worktree's area, so `@` is refused for it and its
 /// own area is the target; a workspace commit cannot target a worktree's area either.
 #[test]
@@ -3637,7 +3676,7 @@ Hint: run `but diff` to see uncommitted changes and `but commit -b <branch> -m "
 fn squash_without_sources_in_an_unmanaged_worktree_is_refused() {
     let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks");
     env.setup_metadata(&["A", "B"]);
-    let wt_dir = super::util::add_dirty_worktree(&env, "wt-feature", "A");
+    let wt_dir = super::util::add_unmanaged_worktree(&env, "wt-feature");
     env.file("main-file.txt", "main change");
 
     env.but("squash --target lrm")

@@ -1,10 +1,9 @@
-import preview from "#storybook/preview";
+import { stories } from "../docs/stories.ts";
 import { Avatar } from "./Avatar.tsx";
 import { Badge } from "./Badge.tsx";
 import { Button } from "./Button.tsx";
 import { CopyableId } from "./CopyableId.tsx";
 import { DropdownButton } from "./DropdownButton.tsx";
-import { EntityAvatar } from "./EntityAvatar.tsx";
 import { machinePictures } from "./story-assets/machines.ts";
 import { Icon } from "./Icon.tsx";
 import { SwitchButton } from "./SwitchButton.tsx";
@@ -13,7 +12,7 @@ import { ViewHeader, ViewHeaderButton, ViewHeaderDivider } from "./ViewHeader.ts
 import { MetaCount } from "./MetaCount.tsx";
 import type { FC } from "react";
 
-const meta = preview.meta({
+const meta = stories({
 	title: "Preview/ViewHeader",
 	id: "components-viewheader",
 	component: ViewHeader,
@@ -200,7 +199,7 @@ export const BranchWithButtons = meta.story({
 });
 
 /**
- * Lite in full-window mode: the window's controls lead the title's line, after the room the
+ * A desktop window in full-window mode: the window's controls lead the title's line, after the room the
  * traffic lights take. The meta line and the toolbar still start at the header's edge.
  */
 export const BranchFullWindow = meta.story({
@@ -359,7 +358,7 @@ export const Machine = meta.story({
 		},
 	},
 	args: {
-		avatar: <EntityAvatar value={{ _tag: "Picture", src: machinePictures[0].src }} />,
+		avatar: <img src={machinePictures[0].src} alt="" width={38} height={38} />,
 		title: "pave--macbook-pro",
 		meta: "macOS · but 0.19 · connected since 3 Sep",
 		actions: <SendAndMenu />,
@@ -375,7 +374,7 @@ export const CloudSession = meta.story({
 		},
 	},
 	args: {
-		avatar: <EntityAvatar value={{ _tag: "Emoji", emoji: "☁️" }} />,
+		avatar: <Icon name="cloud" size={32} />,
 		title: "Panel incoming commits count",
 		meta: "Claude Code · started from your phone · works on feature/JIRA-404-search-filters · 4 commits · 3 uncommitted",
 		toolbar: <BranchTabs />,

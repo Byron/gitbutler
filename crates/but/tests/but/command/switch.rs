@@ -363,7 +363,7 @@ fn rejects_remote_branch() {
         .failure()
         .stdout_eq(str![])
         .stderr_eq(str![[r#"
-Error: Can only switch to local branches, got 'origin/main'
+Error: Can only use local branches, got 'origin/main'
 
 "#]]);
 }
@@ -874,6 +874,8 @@ Hint: run `but branch new` to create a new branch to work on
         .failure()
         .stderr_eq(str![[r#"
 Error: Uncommitted files would be overwritten by checkout: "one"
+
+Hint: Run `but commit -b <branch> <file>` to keep those files or `but discard <file>` to drop them, then retry
 
 "#]]);
 

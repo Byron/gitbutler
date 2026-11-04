@@ -9,9 +9,9 @@ use std::time::Instant;
 
 use gpui::{
     Action, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, DispatchPhase, Div, Entity,
-    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollHandle, SharedString,
-    Stateful, Subscription, WeakEntity, Window, anchored, canvas, deferred, div, list, point,
-    prelude::*,
+    HitboxBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, SharedString, Stateful, Subscription, WeakEntity, Window,
+    anchored, canvas, deferred, div, list, point, prelude::*,
 };
 
 use super::blame::Blamed;
@@ -19,23 +19,25 @@ use super::file_list::At;
 use super::find::Spot;
 use super::lines::Pick;
 use super::{
-    Copied, Cursor, Detail, FILES_POPOVER_DELAY, FileLines, FoldRows, Glide, LoadedDiff, Stop,
-    TextPoint, ToggleFiles, TogglePlainLines, ToggleSplit, ToggleWrap,
+    Copied, Cursor, Detail, Entry, FILES_POPOVER_DELAY, FileLines, FoldRows, Glide, LoadedDiff,
+    Stop, TextPoint, ToggleFiles, TogglePlainLines, ToggleSplit, ToggleWrap,
 };
 use crate::backend::{
     self, Branch, ChangeKind, DiffBody, DiffLine, DiffSource, Drawing, FileDiff, HunkKey, LineKind,
     PushState, Workspace,
 };
-use crate::overlays::MenuItem;
-use crate::state::{Cut, Prefs, Selection};
+use crate::overlays::{MenuItem, has_keys};
+use crate::state::{Cut, Part, Prefs, Selection};
 use crate::theme::Theme;
+use crate::ui::change_marks::{RAIL, change_marks};
 use crate::ui::diff::{self, DiffRow, HeaderDecor, LineDecor, LineSelect};
 use crate::ui::fold::{MOVING_ROWS, clipped, curtain};
 use crate::ui::illustration::Illustration;
-use crate::ui::scrollbar::{Scroll, scrollbar};
+use crate::ui::scrollbar::{Scroll, scrollbar, shown_scrollbar};
 use crate::ui::{
     Icon, Tooltip, blink_once, checkbox, commit_title, count_badge, dp, empty_state, fixed, h_flex,
-    icon, icon_button, icon_toggle, segmented, shortcut, small_icon, toggle_group, v_flex,
+    icon, icon_button, icon_toggle, segmented, selected_part, shortcut, small_icon, toggle_group,
+    v_flex,
 };
 
 /// The diff, drawn by a view of its own over the space [`Detail`] leaves for it. A scrolled
@@ -103,14 +105,10 @@ impl Render for DiffPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let drawn = self.detail.update(cx, |detail, cx| {
-            let rebuilt = detail.follow_folds(window, cx);
+            detail.follow_alone(cx);
+            detail.follow_folds(window, cx);
             detail.follow_glide(window, cx);
-            // Rows just rebuilt have no place on screen yet, so the cursor's would count as
-            // scrolled out of sight, as when a fold settles while a press in the diff has let
-            // the cursor go: it would flash to the file at the top until the click placed it.
-            if !rebuilt {
-                detail.follow_scroll(cx);
-            }
+            detail.follow_scroll(cx);
             detail.follow_drag(window, cx);
             let top = detail.list.logical_scroll_top();
             (
@@ -128,18 +126,13 @@ impl Render for DiffPane {
             self.top = top;
             window.request_animation_frame();
         }
-        // A press in the diff, as on its scrollbar, hands the cursor back to its scroll, and
-        // stops a glide, which would move the diff from under the pointer; what was pressed
-        // may then place the cursor again.
-        let unpin = self.detail.clone();
+        // A press in the diff, as on its scrollbar, stops a glide, which would move the diff
+        // from under the pointer.
+        let stop_glide = self.detail.clone();
         v_flex()
             .size_full()
             .capture_any_mouse_down(move |_, _, cx| {
-                (unpin.update(cx, |detail, _| {
-                    detail.pinned = false;
-                    detail.glide = None;
-                }))
-                .ok();
+                (stop_glide.update(cx, |detail, _| detail.glide = None)).ok();
             })
             // Keys go to the detail, as when the diff was drawn inside it.
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
@@ -223,6 +216,7 @@ impl Detail {
     /// hunk where it has one, and the first row of a hunk's changes.
     pub(super) fn stop_at(&self, row: usize, entry: DiffRow) -> Option<Stop> {
         match entry {
+            DiffRow::Message => Some(Stop::Message),
             DiffRow::File(_) => Some(Stop::File),
             DiffRow::Hunk { file, hunk } => {
                 let file_diff = self.diff.as_ref()?.files.get(file)?;
@@ -257,6 +251,10 @@ impl Detail {
             }
         };
         match cursor.at {
+            Stop::Message => {
+                let row = rows.iter().position(|row| *row == DiffRow::Message)?;
+                Some((row, row))
+            }
             Stop::File => {
                 let first = rows.iter().position(|row| *row == DiffRow::File(file))?;
                 let card = (rows.iter().skip(first)).take_while(|row| **row != DiffRow::Gap);
@@ -327,6 +325,7 @@ impl Detail {
             wrap: prefs.wrap,
             plain: prefs.plain_lines,
             split: prefs.split,
+            flat: self.single_file_shown(),
             ..Default::default()
         };
         let DiffBody::Hunks {
@@ -384,18 +383,9 @@ impl Detail {
         (start != end).then_some((start, end))
     }
 
-    /// The selected part of the line at `row`. Nothing when the line changed under the
-    /// selection so its ends no longer fall in the text, as after an edit in place.
+    /// The selected part of the line at `row`.
     fn selected_in_row(&self, row: usize) -> Option<Range<usize>> {
-        let (start, end) = self.text_range()?;
-        if row < start.0 || row > end.0 {
-            return None;
-        }
-        let text = &self.line_at(row)?.text;
-        let from = if row == start.0 { start.1 } else { 0 };
-        let to = if row == end.0 { end.1 } else { text.len() };
-        let fits = text.is_char_boundary(from) && text.is_char_boundary(to);
-        (from < to && fits).then_some(from..to)
+        selected_part(&self.line_at(row)?.text, row, self.text_range()?)
     }
 
     /// The selected text, one line per diff line, without the `+` and `-` signs.
@@ -420,25 +410,9 @@ impl Detail {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (row, ix) = at;
+        let row = at.0;
         let text = self.line_at(row).map_or("", |line| line.text.as_ref());
-        // The text may have changed since the line was drawn.
-        let ix = (0..=ix.min(text.len()))
-            .rev()
-            .find(|ix| text.is_char_boundary(*ix))
-            .unwrap_or(0);
-        let at = (row, ix);
-        self.text_selection = match clicks {
-            2 => {
-                let word = word_at(text, ix);
-                Some(((row, word.start), (row, word.end)))
-            }
-            3.. => Some(((row, 0), (row, text.len()))),
-            _ => match self.text_selection {
-                Some((anchor, _)) if extend => Some((anchor, at)),
-                _ => Some((at, at)),
-            },
-        };
+        self.text_selection = Some(pressed(self.text_selection, at, text, clicks, extend));
         self.selecting = true;
         // The keys then act on what was pressed: its hunk, or an unchanged line's file.
         let cursor = match (self.diff.as_ref()).and_then(|diff| diff.rows.get(row)) {
@@ -447,7 +421,7 @@ impl Detail {
             _ => None,
         };
         if let Some(cursor) = cursor {
-            self.place_cursor(cursor);
+            self.cursor = cursor;
         }
         window.focus(&self.focus, cx);
         cx.notify();
@@ -479,11 +453,9 @@ impl Detail {
     }
 
     /// Draw the files folding or unfolding as far as they've got, and once one's there, the
-    /// rows it has then: its header alone, or all its lines. Whether that rebuilt the rows,
-    /// which the list knows no place on screen for until it lays them out.
-    pub(super) fn follow_folds(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let arrived = self.file_folds.frame();
-        if arrived {
+    /// rows it has then: its header alone, or all its lines.
+    pub(super) fn follow_folds(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_folds.frame() {
             // A file that turned back open gets the rows it left out back above the lines
             // that stayed, which stay where they are.
             let back = self.reopened();
@@ -500,13 +472,13 @@ impl Detail {
             }
         }
         if !self.file_folds.any() {
-            return arrived;
+            return;
         }
         window.request_animation_frame();
         // How far the diff shows below each header, as last drawn, here, as a row can't ask
         // the list while it draws.
         let (Some(diff), view) = (&self.diff, self.list.viewport_bounds()) else {
-            return arrived;
+            return;
         };
         for (path, rows) in &mut self.fold_rows {
             let file = diff.files.iter().position(|f| f.file.path == *path);
@@ -515,7 +487,6 @@ impl Detail {
             rows.room = (header.and_then(|row| self.list.bounds_for_item(row)))
                 .map(|header| (view.bottom() - header.bottom()).max(Pixels::ZERO));
         }
-        arrived
     }
 
     /// The rows under file `file`'s header past the first `passed`, as many as move when it
@@ -548,7 +519,6 @@ impl Detail {
     /// stay where they are. None while neither the file's header nor its lines show.
     pub(super) fn close_from(&self, file: usize, cx: &App) -> Option<(usize, Option<Pixels>)> {
         let diff = self.diff.as_ref()?;
-        let theme = Theme::get(cx);
         let view = self.list.viewport_bounds();
         let header = (diff.rows.iter()).position(|row| *row == DiffRow::File(file))?;
         if let Some(bounds) = self.list.bounds_for_item(header)
@@ -556,11 +526,11 @@ impl Detail {
         {
             return (bounds.top() < view.bottom()).then_some((0, None));
         }
-        let (stuck, lift) = self.sticky_header(diff, theme)?;
+        let (stuck, lift) = self.sticky_header(diff, cx)?;
         if stuck != header {
             return None;
         }
-        let tall = theme.scaled(diff::FILE_HEADER_HEIGHT);
+        let tall = self.file_header_height(cx);
         // The first line that shows below it, as the rows above the list's top have no place.
         let under = view.top() + tall + lift;
         let from = self.list.logical_scroll_top().item_ix.max(header + 1);
@@ -730,10 +700,13 @@ impl Detail {
             });
     }
 
-    /// Drop the text selection, saying whether there was one.
+    /// Drop the text selection, the diff's or the pull request's, saying whether there was one
+    /// in sight.
     pub fn clear_text_selection(&mut self, cx: &mut Context<Self>) -> bool {
-        let had = self.text_range().is_some();
+        let had =
+            self.text_range().is_some() || (self.showing_review(cx) && self.note_range().is_some());
         self.text_selection = None;
+        self.note_selection = None;
         cx.notify();
         had
     }
@@ -752,7 +725,7 @@ impl Detail {
         }
         let Some(diff) = self.shown_diff() else {
             // Another machine's branch, until it's here.
-            if let Some(Selection::Mesh(project, id, pick)) = &self.store.read(cx).selection
+            if let Some(Selection::Mesh(project, id, pick)) = &self.selection(cx)
                 && !self.loading.is_some()
             {
                 let message = self.machine_placeholder(project, id, pick, theme, cx);
@@ -770,7 +743,8 @@ impl Detail {
             };
             return ground().child(message).into_any_element();
         };
-        if diff.files.is_empty() {
+        let message = diff.rows.first() == Some(&DiffRow::Message);
+        if diff.files.is_empty() && !message {
             // A clean worktree is good news, as but.dev greets it; a commit with nothing in
             // it is a list with nothing in it.
             let (drawing, title, detail): (_, _, SharedString) = match diff.key.source {
@@ -788,7 +762,8 @@ impl Detail {
                 .child(empty_state(drawing, title, detail, theme, cx))
                 .into_any_element();
         }
-        if diff.rows.is_empty() && self.filtering {
+        let no_files = !diff.rows.iter().any(|row| matches!(row, DiffRow::File(_)));
+        if no_files && !diff.files.is_empty() && self.filtering {
             let filter = self.file_filter.read(cx).text();
             let title = format!("No files match \"{}\"", filter.trim());
             return ground()
@@ -804,13 +779,14 @@ impl Detail {
         let entity = cx.entity().downgrade();
         // A copy of the header of the file at the top, while the file scrolls under it. It's
         // clipped to the list, so the next file can push it out the top.
-        let sticky = self.sticky_header(diff, theme).map(|(ix, lift)| {
+        let header_height = self.file_header_height(cx);
+        let sticky = self.sticky_header(diff, cx).map(|(ix, lift)| {
             div()
                 .absolute()
                 .top_0()
                 .left_0()
                 .right_0()
-                .h(dp(diff::FILE_HEADER_HEIGHT))
+                .h(header_height)
                 .overflow_hidden()
                 .child(
                     div()
@@ -826,7 +802,47 @@ impl Detail {
                         .child(self.render_diff_row(ix, entity.clone(), window, cx)),
                 )
         });
-        let scrollbar = scrollbar("diff-scrollbar", Scroll::List(self.list.clone()), theme);
+        // Beside the marks, the thumb shows where among them the diff is.
+        let scroll = Scroll::List(self.list.clone());
+        let scrollbar = match diff.marks {
+            Some(_) => {
+                shown_scrollbar("diff-scrollbar", scroll, theme).map(|bar| bar.into_any_element())
+            }
+            None => scrollbar("diff-scrollbar", scroll, theme).map(|bar| bar.into_any_element()),
+        };
+        let marks = (diff.marks.clone()).map(|marks| change_marks(marks, theme));
+        // One file at a time, a wheel's notch scrolls three lines, as deltoids does. Laid out
+        // after the list, its listener runs before the list's, which takes what this leaves.
+        let wheel = self.single_file_shown().then(|| {
+            let entity = entity.clone();
+            canvas(
+                |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                move |_, hitbox, window, _| {
+                    // Only the diff's pane redraws, as for the list's own scrolling: the file
+                    // list and the rest of the detail stay as they are.
+                    let pane = window.current_view();
+                    window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Bubble || !hitbox.should_handle_scroll(window) {
+                            return;
+                        }
+                        let Some(lines) = wheel_lines(event) else {
+                            return;
+                        };
+                        (entity.update(cx, |detail, cx| detail.scroll_diff_lines(lines, cx))).ok();
+                        cx.notify(pane);
+                        cx.stop_propagation();
+                    });
+                },
+            )
+            .absolute()
+            .inset_0()
+        });
+        // One file's header holds the top, there or stuck, so the marks and the scrollbar run
+        // beside its lines, below it.
+        let rail_top = match diff.alone {
+            Some(Entry::File(_)) => header_height,
+            Some(Entry::Message) | None => Pixels::ZERO,
+        };
         // A drag that selects past the edge, out of the window too, draws the pane again,
         // which scrolls toward the pointer.
         let past_edge = (self.selecting.then(|| self.drag_area(cx)).flatten()).map(|(area, _)| {
@@ -846,9 +862,39 @@ impl Detail {
             )
             .absolute()
         });
+        // gpui forgets every row's height when the list's width changes, its first layout
+        // too, and counts the rows it hasn't drawn since as nothing, so the scrollbar took the
+        // diff for what had been drawn. Laid out after the list, this counts them a line tall
+        // again. That also takes the drawn rows' bounds, which reveals and the sticky header
+        // read: the next frame lays the rows out again, after its sticky header was worked out
+        // without them, so the one after draws it from them.
+        let estimate = {
+            let (list, width, line) = (
+                self.list.clone(),
+                self.estimated_width.clone(),
+                super::code_line(cx),
+            );
+            canvas(
+                move |_, window, _| {
+                    let drawn = list.viewport_bounds().size.width;
+                    if width.get() != Some(drawn) {
+                        width.set(Some(drawn));
+                        list.with_uniform_item_height(line);
+                        let pane = window.current_view();
+                        window.on_next_frame(move |window, cx| {
+                            cx.notify(pane);
+                            window.on_next_frame(move |_, cx| cx.notify(pane));
+                        });
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+        };
         ground()
-            // With the bar above it, as far down as but.dev starts its first card.
-            .pt(dp(7.))
+            // With the bar above it, as far down as but.dev starts its first card. A title
+            // starts at the pane's top, beside the file list's heading.
+            .when(!self.titled_header(cx), |el| el.pt(dp(7.)))
             // A press anywhere ends the last drag; one on a line starts a new one after this.
             .capture_any_mouse_down(cx.listener(|this, _, _, _| this.selecting = false))
             .on_mouse_up(
@@ -901,8 +947,19 @@ impl Detail {
                         })
                         .size_full(),
                     )
+                    .child(estimate)
+                    .children(wheel)
                     .children(sticky)
-                    .children(scrollbar),
+                    .child(
+                        div()
+                            .absolute()
+                            .top(rail_top)
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .children(marks)
+                            .children(scrollbar),
+                    ),
             )
             .children(past_edge)
             .into_any_element()
@@ -911,17 +968,18 @@ impl Detail {
     /// For a selected branch or stack with no commits, what but.dev's branch page says.
     fn nothing_committed(&self, cx: &App) -> Option<SharedString> {
         let store = self.store.read(cx);
-        let selection = store.selection.as_ref()?;
-        nothing_committed_in(store.workspace(selection.project())?, selection)
+        let selection = self.selection(cx)?;
+        nothing_committed_in(store.workspace(selection.project())?, &selection)
     }
 
     /// What a diff of commits with no changes in it says, as but.dev's branch page does: a
     /// branch the target already has changes nothing against it.
     fn changes_nothing(&self, cx: &App) -> SharedString {
         let store = self.store.read(cx);
-        let Some(selection) = store.selection.as_ref() else {
+        let Some(selection) = self.selection(cx) else {
             return "No changes".into();
         };
+        let selection = &selection;
         let workspace = store.workspace(selection.project());
         let branches: Vec<_> = match selection {
             // As when a merge's rename detection conflicts with no file to show for it.
@@ -991,10 +1049,28 @@ impl Detail {
         cx.notify();
     }
 
+    /// Whether the diff shows one file, filling the pane without a card around it.
+    pub(super) fn single_file_shown(&self) -> bool {
+        self.diff.as_ref().is_some_and(|diff| diff.alone.is_some())
+    }
+
+    /// Whether the one file shown alone has its header as the pane's title, as Lite has it.
+    pub(super) fn titled_header(&self, cx: &App) -> bool {
+        let alone = self.diff.as_ref().and_then(|diff| diff.alone);
+        matches!(alone, Some(Entry::File(_)))
+            && !(self.store.read(cx).prefs).shows(Part::FileHeaderControls)
+    }
+
+    /// How tall a file's header draws, as [`diff::file_header_height`] says for this diff.
+    pub(super) fn file_header_height(&self, cx: &App) -> Pixels {
+        Theme::get(cx).scaled(diff::file_header_height(self.titled_header(cx)))
+    }
+
     /// The bar over the diff, as but.dev's: the file list's toggle, which counts the files and
     /// their lines while the list isn't beside the diff and lists them on hover, then how
     /// long lines show and where the sides go. A page whose column is its own list toggles the
     /// files beside it, when it has any; else it has only the count and the list on hover.
+    /// Files pinned beside the diff go without the toggle.
     fn render_diff_tools(&self, theme: &Theme, cx: &Context<Self>) -> Option<AnyElement> {
         let diff = self.shown_diff()?;
         let prefs = &self.store.read(cx).prefs;
@@ -1013,6 +1089,12 @@ impl Detail {
             true => !self.beside_files_shown(cx),
             false => !self.files_shown(cx),
         };
+        // Lite leaves the bar out once the files it'd toggle are beside the diff, as keys
+        // switch the rest.
+        let controls = prefs.shows(Part::DiffTools);
+        if !controls && !hidden {
+            return None;
+        }
         let files_key = shortcut(&ToggleFiles, cx);
         let glyph = match (toggles, hidden) {
             (false, _) => Icon::FileDiff,
@@ -1052,7 +1134,9 @@ impl Detail {
                 .with_priority(1),
             )
         });
-        let files = div().relative().child(toggle).children(list);
+        // Pinned, the files show beside the diff and nothing toggles them.
+        let files = (hidden || !self.single_file_diff(cx))
+            .then(|| div().relative().child(toggle).children(list));
         let flag = |id: &'static str, glyph, tip, on, action: &'static dyn Action| {
             icon_toggle(id, glyph, tip, shortcut(action, cx), on, theme).on_click(act(action))
         };
@@ -1075,48 +1159,50 @@ impl Detail {
                 .px(dp(12.))
                 .gap(dp(8.))
                 .bg(theme.bg_1)
-                .child(files)
+                .children(files)
                 .child(div().flex_1())
-                .child(toggle_group(
-                    theme,
-                    [
-                        flag(
-                            "diff-wrap",
-                            Icon::TextWrap,
-                            "Wrap long lines",
-                            wrap,
-                            &ToggleWrap,
-                        ),
-                        flag(
-                            "diff-backgrounds",
-                            Icon::TextBlock,
-                            "Toggle diff backgrounds",
-                            !plain,
-                            &TogglePlainLines,
-                        ),
-                    ],
-                ))
-                .child(segmented(
-                    false,
-                    theme,
-                    [
-                        layout("diff-split", "Split", "Side by side", split, &ToggleSplit),
-                        layout(
-                            "diff-unified",
-                            "Unified",
-                            "One above the other",
-                            !split,
-                            &ToggleSplit,
-                        ),
-                    ],
-                ))
+                .when(controls, |el| {
+                    el.child(toggle_group(
+                        theme,
+                        [
+                            flag(
+                                "diff-wrap",
+                                Icon::TextWrap,
+                                "Wrap long lines",
+                                wrap,
+                                &ToggleWrap,
+                            ),
+                            flag(
+                                "diff-backgrounds",
+                                Icon::TextBlock,
+                                "Toggle diff backgrounds",
+                                !plain,
+                                &TogglePlainLines,
+                            ),
+                        ],
+                    ))
+                    .child(segmented(
+                        false,
+                        theme,
+                        [
+                            layout("diff-split", "Split", "Side by side", split, &ToggleSplit),
+                            layout(
+                                "diff-unified",
+                                "Unified",
+                                "One above the other",
+                                !split,
+                                &ToggleSplit,
+                            ),
+                        ],
+                    ))
+                })
                 .into_any_element(),
         )
     }
 
     /// The header to keep at the top of the diff while its file scrolls under it, by row, and
     /// how far the file's end has pushed it up. Nothing while a header is at the top itself.
-    fn sticky_header(&self, diff: &LoadedDiff, theme: &Theme) -> Option<(usize, Pixels)> {
+    fn sticky_header(&self, diff: &LoadedDiff, cx: &App) -> Option<(usize, Pixels)> {
         let top = self.list.logical_scroll_top();
         let row = *diff.rows.get(top.item_ix)?;
         let file = row.file()?;
@@ -1135,7 +1221,7 @@ impl Detail {
             .bounds_for_item(last)
             .map_or(Pixels::ZERO, |last| {
                 let room = last.top() - self.list.viewport_bounds().top();
-                (room - theme.scaled(diff::FILE_HEADER_HEIGHT)).min(Pixels::ZERO)
+                (room - self.file_header_height(cx)).min(Pixels::ZERO)
             });
         Some((header, lift))
     }
@@ -1155,10 +1241,12 @@ impl Detail {
             return div().into_any_element();
         };
         let file_diff = row.file().and_then(|file| diff.files.get(file));
-        // A folded file's header ends its card too.
-        let last = diff::ends_card(&diff.rows, ix);
+        let flat = self.single_file_shown();
+        // A folded file's header ends its card too. A flat file has no card to end.
+        let ends = diff::ends_card(&diff.rows, ix);
+        let last = ends && !flat;
         // The file list's and the message's keys don't act on the diff's cursor.
-        let solid = self.focus.is_focused(window);
+        let solid = has_keys(&self.focus, window, cx);
         let store = self.store.read(cx);
         // Every file has its path to copy, even where nothing can change it.
         let menu = |menu: Option<Cut>,
@@ -1170,13 +1258,19 @@ impl Detail {
             move |position: Point<Pixels>, cx: &mut App| {
                 let at = At::File(path.clone(), line);
                 (entity.update(cx, |detail, cx| {
-                    detail.changes_menu(menu.clone(), at, hunk.map(Blamed::Hunk), position, cx)
+                    let blamed = hunk.map(Blamed::Hunk);
+                    detail.changes_menu(menu.clone(), at, blamed, false, position, cx)
                 }))
                 .ok();
             }
         };
-        // The margin between the cards and the sides of the pane.
-        let padded = div().w_full().px(dp(12.));
+        // The margin between the cards and the sides of the pane. A flat file runs from side
+        // to side, its lines clear of the marks and the scrollbar, which start below its header.
+        let padded = match (flat, row) {
+            (false, _) => div().w_full().px(dp(12.)),
+            (true, DiffRow::Message | DiffRow::File(_)) => div().w_full(),
+            (true, _) => div().w_full().pr(fixed(RAIL)),
+        };
         match (row, file_diff) {
             (DiffRow::File(file), Some(file_diff)) => {
                 // Not while one of its hunks is, so one mark says what the keys act on.
@@ -1186,15 +1280,30 @@ impl Detail {
                 let whole = self.whole_button(ix, file, file_diff, on, entity.clone());
                 let drawn = self.drawing_button(ix, file, file_diff, on, entity.clone());
                 let toggle = entity.clone();
-                // What right-clicking the header offers, behind a ⋯ as well.
+                // What right-clicking the header offers, behind a ⋯ as well, for the file alone,
+                // which the cursor goes to and the diff takes the keys for, as the commands act
+                // there.
                 let cut = self.diff_cut(file, None, cx);
-                let open = menu(cut, file_diff, None, entity.clone());
+                let carried = cut.clone();
+                let open = {
+                    let (open, entity) =
+                        (menu(cut, file_diff, None, entity.clone()), entity.clone());
+                    move |position: Point<Pixels>, window: &mut Window, cx: &mut App| {
+                        (entity.update(cx, |detail, cx| {
+                            detail.right_click_on(Cursor::on_file(file), cx);
+                            window.focus(&detail.focus, cx);
+                        }))
+                        .ok();
+                        open(position, cx)
+                    }
+                };
+                let open = std::rc::Rc::new(open);
                 let more = icon_button(("file-more", ix), Icon::Kebab)
                     .small()
                     .inverted(on)
                     .on_click({
                         let open = open.clone();
-                        move |event, _, cx| open(event.position(), cx)
+                        move |event, window, cx| open(event.position(), window, cx)
                     });
                 // Of commits shown one after another, which one it's from.
                 let from = (file_diff.commit).and_then(|id| {
@@ -1212,24 +1321,30 @@ impl Detail {
                             .child(commit_title(&commit.title)),
                     )
                 });
+                // Lite leaves the counts and buttons to the menu and the keys.
+                let controls = store.prefs.shows(Part::FileHeaderControls);
+                let has_trailing = controls || from.is_some();
                 let trailing = h_flex()
                     .flex_none()
                     .gap(dp(4.))
                     .children(from)
                     // The toggle last but one: showing text adds the whole-file button, which
                     // mustn't move it from under the pointer.
-                    .children(whole)
-                    .children(drawn)
-                    .child(more);
+                    .when(controls, |el| {
+                        el.children(whole).children(drawn).child(more)
+                    });
                 let header = diff::file_header(
                     file,
                     file_diff,
                     theme,
                     HeaderDecor {
-                        trailing: Some(trailing.into_any_element()),
+                        trailing: has_trailing.then(|| trailing.into_any_element()),
                         current,
                         solid,
-                        folded: last,
+                        folded: ends,
+                        flat,
+                        uncounted: !controls,
+                        titled: self.titled_header(cx),
                         closing: self.file_folds.closing(&file_diff.file.path),
                         blink: (current && solid)
                             .then(|| self.blink(Copied::Cursor))
@@ -1238,17 +1353,22 @@ impl Detail {
                     },
                     cx,
                 );
+                let dragged = entity.clone();
                 padded
                     .id(("file-header", ix))
                     .child(header)
                     .on_mouse_down(MouseButton::Left, press_off(entity, None))
-                    .on_mouse_down(MouseButton::Right, move |event, _, cx| {
-                        open(event.position, cx)
+                    .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                        open(event.position, window, cx)
                     })
                     .on_click(move |_, _, cx| {
                         toggle
                             .update(cx, |detail, cx| detail.toggle_fold(file, cx))
                             .ok();
+                    })
+                    .when_some(carried, |el, carried| {
+                        let label: SharedString = carried.describe(store).into();
+                        el.on_drag(carried, self.patch_drag_preview(label, false, dragged))
                     })
                     .into_any_element()
             }
@@ -1292,6 +1412,7 @@ impl Detail {
                         excluded: composing && !self.checks.hunk_checked(path, key),
                         current,
                         solid,
+                        flat,
                         blink: (current && solid)
                             .then(|| self.blink(Copied::Cursor))
                             .flatten(),
@@ -1309,11 +1430,7 @@ impl Detail {
                         let cut = self.diff_cut(file, None, cx);
                         let open = menu(cut, file_diff, None, entity.clone());
                         move |event, _, cx| {
-                            (entity.update(cx, |detail, cx| {
-                                detail.place_cursor(at);
-                                cx.notify();
-                            }))
-                            .ok();
+                            (entity.update(cx, |detail, cx| detail.right_click_on(at, cx))).ok();
                             open(event.position, cx)
                         }
                     })
@@ -1332,7 +1449,7 @@ impl Detail {
                     .when_some(carried, |el, carried| {
                         let lines: Vec<_> = (0..found.lines.len()).map(|l| (hunk, l)).collect();
                         let label = self.lines_label(file, &lines);
-                        el.on_drag(carried, self.drag_preview(label, false, dragged))
+                        el.on_drag(carried, self.patch_drag_preview(label, false, dragged))
                     })
                     .into_any_element()
             }
@@ -1452,9 +1569,18 @@ impl Detail {
             }
             (DiffRow::Note(_), Some(file_diff)) => padded
                 .child(match self.drawing_of(file_diff) {
-                    Some(drawn) => diff::drawing(drawn.before.clone(), drawn.after.clone(), theme),
-                    None => diff::note(file_diff, theme),
+                    Some(drawn) => {
+                        diff::drawing(drawn.before.clone(), drawn.after.clone(), flat, theme)
+                    }
+                    None => diff::note(file_diff, flat, theme),
                 })
+                .into_any_element(),
+            (DiffRow::Message, _) => padded
+                .on_mouse_down(
+                    MouseButton::Left,
+                    press_off(entity.clone(), Some(Cursor::on_message())),
+                )
+                .child(self.render_message(flat, entity, theme, cx))
                 .into_any_element(),
             (DiffRow::Gap, _) => padded.h(dp(10.)).into_any_element(),
             // A row whose file is gone draws nothing.
@@ -1667,7 +1793,7 @@ impl Detail {
         // rather than typing into the message.
         let toggle = Rc::new(move |window: &mut Window, cx: &mut App| {
             (entity.update(cx, |detail, cx| {
-                detail.place_cursor(cursor);
+                detail.cursor = cursor;
                 window.focus(&detail.focus, cx);
                 detail.toggle_line(&path, key, line, cx)
             }))
@@ -1770,7 +1896,7 @@ impl Detail {
                 .ok();
             })
             .when_some(drag, |el, (cut, label)| {
-                el.on_drag(cut, self.drag_preview(label, picked, entity.clone()))
+                el.on_drag(cut, self.patch_drag_preview(label, picked, entity.clone()))
             })
             .into_any_element();
         Some(diff::Gutter {
@@ -1792,7 +1918,7 @@ fn press_off(
         (entity.update(cx, |detail, cx| {
             detail.press_off_picks(cx);
             if let Some(cursor) = cursor {
-                detail.place_cursor(cursor);
+                detail.cursor = cursor;
                 cx.notify();
             }
         }))
@@ -1835,7 +1961,7 @@ fn row_blink(n: usize, last: bool, theme: &Theme) -> impl IntoElement {
         .left(dp(12.))
         .right(dp(12.))
         .when(last, |el| el.rounded_b(dp(6.)));
-    blink_once(("blink", n), shape, theme)
+    blink_once(("blink", n), shape, theme.pop)
 }
 
 /// Right-clicking the line at row `ix`: see [`Detail::line_menu`].
@@ -1925,12 +2051,17 @@ impl Detail {
             let blamed = added.map(Blamed::Line).or(key.map(Blamed::Hunk));
             let at = At::File(file_diff.file.path.clone(), line);
             self.clear_text_selection(cx);
-            // So the hunk shows marked as what the menu acts on.
-            self.place_cursor(Cursor {
+            // So the hunk shows marked as what the menu acts on, without picks elsewhere,
+            // which its commands would act on instead.
+            let cursor = Cursor {
                 file,
                 at: hunk.map_or(Stop::File, Stop::Hunk),
-            });
-            self.changes_menu(menu, at, blamed, position, cx);
+            };
+            match picked {
+                true => self.cursor = cursor,
+                false => self.right_click_on(cursor, cx),
+            }
+            self.changes_menu(menu, at, blamed, false, position, cx);
             return;
         };
         let (project, worktree) = (diff.key.project.clone(), diff.key.files_checkout());
@@ -1963,6 +2094,34 @@ impl Detail {
             items
         };
         self.open_menu(position, items, cx);
+    }
+}
+
+/// The selection a press at `at` on `text`, its row's, makes: from there, the word around it
+/// on a double click and the whole row on a triple, or with `extend`, as shift held, on from
+/// where `old` started.
+pub(super) fn pressed(
+    old: Option<(TextPoint, TextPoint)>,
+    (row, ix): TextPoint,
+    text: &str,
+    clicks: usize,
+    extend: bool,
+) -> (TextPoint, TextPoint) {
+    // The text may have changed since it was drawn.
+    let ix = (0..=ix.min(text.len()))
+        .rev()
+        .find(|ix| text.is_char_boundary(*ix))
+        .unwrap_or(0);
+    match clicks {
+        2 => {
+            let word = word_at(text, ix);
+            ((row, word.start), (row, word.end))
+        }
+        3.. => ((row, 0), (row, text.len())),
+        _ => match old {
+            Some((anchor, _)) if extend => (anchor, (row, ix)),
+            _ => ((row, ix), (row, ix)),
+        },
     }
 }
 
@@ -2025,7 +2184,7 @@ pub(super) fn files_toggle(
         .child(icon(glyph).text_color(theme.text_2))
         .when_some(counts, |el, (n, added, removed)| {
             el.child(count_badge(n, theme))
-                .child(diff::stats(added, removed, theme))
+                .child(diff::stats(added, removed, false, theme))
         })
 }
 
@@ -2059,7 +2218,7 @@ fn nothing_committed_in(workspace: &Workspace, selection: &Selection) -> Option<
     let base = below.map_or_else(
         || target.to_owned(),
         |(branch, from)| match from {
-            Some(id) => format!("{} at {}", branch.name, id.short()),
+            Some(id) => format!("{} at {}", branch.name, workspace.short_reference(id)),
             None => branch.name.clone(),
         },
     );
@@ -2067,18 +2226,140 @@ fn nothing_committed_in(workspace: &Workspace, selection: &Selection) -> Option<
         .then(|| format!("No commits above {base} on {what}").into())
 }
 
+/// How a platform counts a notch of a mouse's wheel in the lines of its scroll events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WheelLines {
+    /// One event a notch, of a tenth of a line turned slowly and more turned fast, as macOS
+    /// accelerates it.
+    Accelerated,
+    /// A line a notch, or fractions of one over several events from a wheel that reports finer
+    /// steps, as Linux sends them.
+    PerNotch,
+    /// The lines the system's own setting gives a notch, three unless changed, as Windows
+    /// counts them.
+    Set,
+}
+
+impl WheelLines {
+    const HERE: WheelLines = if cfg!(target_os = "macos") {
+        WheelLines::Accelerated
+    } else if cfg!(target_os = "windows") {
+        WheelLines::Set
+    } else {
+        WheelLines::PerNotch
+    };
+}
+
+/// How many lines a wheel's `event` scrolls the single file diff, down from positive: three
+/// for a notch, as deltoids and terminals scroll. None for what the list scrolls by itself: a
+/// trackpad's or a smooth wheel's pixels, which have no notches, a sideways scroll, which long
+/// lines take, and a scroll with a modifier held.
+fn wheel_lines(event: &ScrollWheelEvent) -> Option<f32> {
+    wheel_lines_on(event, WheelLines::HERE)
+}
+
+fn wheel_lines_on(event: &ScrollWheelEvent, counted: WheelLines) -> Option<f32> {
+    let ScrollDelta::Lines(delta) = event.delta else {
+        return None;
+    };
+    if delta.x != 0. || delta.y == 0. || event.modifiers.modified() {
+        return None;
+    }
+    let lines = match counted {
+        // Each event is a notch: a slow one's tenth of a line is three lines too, and a fast
+        // spin's acceleration still counts.
+        WheelLines::Accelerated => 3. * delta.y.abs().max(1.),
+        WheelLines::PerNotch => 3. * delta.y.abs(),
+        WheelLines::Set => delta.y.abs(),
+    };
+    // The wheel turned toward the user, up, moves the content down.
+    Some(-delta.y.signum() * lines)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::nothing_committed_in;
+    use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, point};
+
+    use super::WheelLines::{Accelerated, PerNotch, Set};
+    use super::{nothing_committed_in, wheel_lines, wheel_lines_on};
     use crate::backend::FullName;
     use crate::backend::model::build::{branch, full, workspace, worktree};
     use crate::state::{ProjectId, Selection};
 
+    fn wheel(delta: ScrollDelta, modifiers: Modifiers) -> ScrollWheelEvent {
+        ScrollWheelEvent {
+            delta,
+            modifiers,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test, and snapbox looks for the file its snapshot is in"
-    )]
+    fn a_wheel_notch_scrolls_three_lines_however_the_platform_counts_it() {
+        let notch = |y, counted| {
+            let event = wheel(ScrollDelta::Lines(point(0., y)), Modifiers::default());
+            wheel_lines_on(&event, counted)
+        };
+        // macOS: a notch turned slowly, as a mouse sent it, and a fast spin's accelerated ones.
+        assert_eq!(
+            notch(-0.1, Accelerated),
+            Some(3.),
+            "turned away, the content moves up"
+        );
+        assert_eq!(
+            notch(0.1, Accelerated),
+            Some(-3.),
+            "turned toward the user, it moves down"
+        );
+        assert_eq!(notch(-0.9996, Accelerated), Some(3.));
+        assert_eq!(
+            notch(-4., Accelerated),
+            Some(12.),
+            "a fast spin's acceleration counts"
+        );
+        // Linux: a line a notch, or a quarter of one from a finer wheel's four events.
+        assert_eq!(notch(-1., PerNotch), Some(3.));
+        assert_eq!(
+            notch(-0.25, PerNotch),
+            Some(0.75),
+            "four of them make a notch"
+        );
+        // Windows: the lines its setting gives a notch.
+        assert_eq!(notch(-3., Set), Some(3.));
+        assert_eq!(notch(0., Accelerated), None, "nothing to scroll");
+    }
+
+    #[test]
+    fn the_list_scrolls_what_isnt_a_notch() {
+        let plain = Modifiers::default();
+        let sideways = wheel(ScrollDelta::Lines(point(1., 0.)), plain);
+        assert_eq!(
+            wheel_lines(&sideways),
+            None,
+            "long lines scroll sideways themselves"
+        );
+        let pixels = wheel(
+            ScrollDelta::Pixels(point(crate::ui::fixed(0.), crate::ui::fixed(-30.))),
+            plain,
+        );
+        assert_eq!(
+            wheel_lines(&pixels),
+            None,
+            "a trackpad scrolls as the list does"
+        );
+        let held = Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        let modified = wheel(ScrollDelta::Lines(point(0., -1.)), held);
+        assert_eq!(
+            wheel_lines(&modified),
+            None,
+            "a modifier leaves it to the list"
+        );
+    }
+
+    #[test]
     fn an_empty_lane_bottom_starts_on_what_its_lane_rests_on() {
         let ws = workspace(
             vec![
@@ -2111,11 +2392,11 @@ mod tests {
             said,
             snapbox::str![[r#"
 Branch(upper): Some("No commits above lower on this branch")
-Branch(wt): Some("No commits above middle at 0303030 on this branch")
+Branch(wt): Some("No commits above middle at key3 on this branch")
 Branch(outside): Some("No commits above the target on this branch")
 Branch(on-top): Some("No commits above top on this branch")
 Stack(lower): Some("No commits above the target on these branches")
-Stack(wt): Some("No commits above middle at 0303030 on these branches")
+Stack(wt): Some("No commits above middle at key3 on these branches")
 
 "#]]
         );

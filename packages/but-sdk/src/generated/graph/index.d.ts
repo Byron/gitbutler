@@ -962,11 +962,17 @@ export type FeatureFlags = {
    * starts, on macOS builds that include it.
    */
   gpui: boolean;
+  /**
+   * In the native client (GPUI), the single file diff: show only the selected file of a
+   * diff, filling the pane, rather than every file one after another.
+   */
+  gpuiSingleFileDiff: boolean;
 };
 
 /** Update request for [`crate::app_settings::FeatureFlags`]. */
 export type FeatureFlagsUpdate = {
   gpui?: boolean | null;
+  gpuiSingleFileDiff?: boolean | null;
 };
 
 export type Fetch = {
@@ -1424,10 +1430,6 @@ export type GixTime = {
 export type HeadAndMode = {
   head: string | null;
   operatingMode: OperatingMode;
-};
-
-export type HeadSha = {
-  headSha: string;
 };
 
 /**
@@ -2403,42 +2405,6 @@ export type Stack = {
    * This array is never empty.
    */
   segments: Array<Segment>;
-};
-
-/**
- * **Temporary type to help transitioning to the optional version of stack-entry** and ultimately, to [`crate::RefInfo`].
- * WARNING: for use by parts in the code that can rely on having a non-optional `stack_id`. The goal is to have none of these.
- */
-export type StackEntryNoOpt = {
-  /** The ID of the stack. */
-  id: string;
-  /**
-   * The list of the branch information that are part of the stack.
-   * The list is never empty.
-   * The first entry in the list is always the most recent branch on top the stack.
-   */
-  heads: Array<StackHeadInfo>;
-  /** The tip of the top-most branch, i.e., the most recent commit that would become the parent of new commits of the topmost stack branch. */
-  tip: string;
-  /** The zero-based index for sorting stacks. */
-  order: number | null;
-  /** If `true`, then any head in this stack is checked directly so `HEAD` points to it, and this is only ever `true` for a single stack. */
-  isCheckedOut: boolean;
-};
-
-/** The information about the branch inside a stack */
-export type StackHeadInfo = {
-  /** The name of the branch. */
-  name: string;
-  /** The tip of the branch. */
-  tip: string;
-  /** The associated forge review with this branch, e.g. GitHub PRs or GitLab MRs */
-  reviewId: number | null;
-  /**
-   * If `true`, then this head is checked directly so `HEAD` points to it, and this is only ever `true` for a single head.
-   * This is `false` if the worktree is checked out.
-   */
-  isCheckedOut: boolean;
 };
 
 /** Represents a reference to an associated virtual branch */
