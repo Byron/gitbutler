@@ -5830,6 +5830,7 @@ dependencies = [
  "gix-path 0.14.1",
  "gix-utils",
  "gix-validate 0.13.1",
+ "libc",
  "memmap2",
  "serde",
 ]
