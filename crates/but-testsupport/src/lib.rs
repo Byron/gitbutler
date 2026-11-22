@@ -652,7 +652,7 @@ pub fn id_at<'repo>(
         .find_reference(name)
         .expect("statically known reference exists");
     let id = rn.peel_to_id().expect("must be valid reference");
-    (id, rn.inner.name)
+    (id, rn.detach().name)
 }
 
 pub fn id_by_rev<'repo>(repo: &'repo gix::Repository, revspec: &str) -> gix::Id<'repo> {

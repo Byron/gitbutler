@@ -304,9 +304,12 @@ impl<'repo> OverlayRepo<'repo> {
                 let (id, name) =
                     if matches!(r.name().category(), Some(gix::reference::Category::Tag)) {
                         // TODO: also make use of the tag name (the tag object has its own name)
-                        (id.object().ok()?.peel_tags_to_end().ok()?.id, r.inner.name)
+                        (
+                            id.object().ok()?.peel_tags_to_end().ok()?.id,
+                            r.detach().name,
+                        )
                     } else {
-                        (id.detach(), r.inner.name)
+                        (id.detach(), r.detach().name)
                     };
                 // This is only for overrides.
                 seen.insert(name.clone()).then_some((id, name))

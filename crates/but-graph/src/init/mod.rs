@@ -583,7 +583,7 @@ impl Graph {
             gix::head::Kind::Symbolic(existing_reference) => {
                 let mut existing_reference = existing_reference.attach(repo);
                 let tip = existing_reference.peel_to_id()?;
-                (tip, Some(existing_reference.inner.name))
+                (tip, Some(existing_reference.detach().name))
             }
         };
 

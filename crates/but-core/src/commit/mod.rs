@@ -635,12 +635,8 @@ pub fn conflict_entries_from_merge_outcome(
 ) -> anyhow::Result<ConflictEntries> {
     use gix::index::entry::Stage;
 
-    let mut index = repo.index_from_tree(&merged_tree_id.attach(repo))?;
-    merge_result.index_changed_after_applying_conflicts(
-        &mut index,
-        treat_as_unresolved,
-        gix::merge::tree::apply_index_entries::RemovalMode::Mark,
-    );
+    let merged_index = repo.index_from_tree(&merged_tree_id.attach(repo))?;
+    let index = merge_result.index(treat_as_unresolved, Some(&merged_index))?;
 
     let (mut ancestor_entries, mut our_entries, mut their_entries) =
         (Vec::new(), Vec::new(), Vec::new());

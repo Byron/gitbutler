@@ -2408,7 +2408,7 @@ fn target_current_follows_the_recording_not_workspace_content() -> anyhow::Resul
     let mut entrypoint = repo.find_reference("A")?;
     let graph = but_graph::Graph::from_commit_traversal(
         entrypoint.peel_to_id()?,
-        entrypoint.inner.name,
+        entrypoint.detach().name,
         &*meta,
         opts.project_meta.clone(),
         &mut db,

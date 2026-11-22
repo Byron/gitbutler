@@ -2294,7 +2294,7 @@ fn record_index_stat_with_mtime(
         .expect("tracked");
     index.entries_mut()[position].stat =
         gix::index::entry::Stat::from_fs(&gix::index::fs::Metadata::from_path_no_follow(&path)?)?;
-    index.write(Default::default())?;
+    index.write(Default::default(), gix::fs::SharedPermissions::Umask)?;
     Ok(())
 }
 

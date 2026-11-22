@@ -559,7 +559,7 @@ pub fn workspace(
     let (seen_from_ref, seen_from_commit) = match seen_from {
         Some(mut reference) => {
             let id = reference.peel_to_id()?.detach();
-            (Some(reference.inner.name), Some(id))
+            (Some(reference.detach().name), Some(id))
         }
         None => {
             let head = repo.head()?;
